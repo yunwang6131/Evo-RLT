@@ -1,0 +1,41 @@
+{
+  "robot_id": "my_bimanual_so101",
+  "datasets": {
+    "root": "/home/wangyun/lerobot_data/bimanual"
+  },
+  "arms": [
+    {
+      "alias": "left_follower",
+      "type": "follower",
+      "port": "/dev/ttyACM3",
+      "calibration_dir": "/home/wangyun/.cache/huggingface/lerobot/calibration/robots/so_follower",
+      "calibration_file": "/home/wangyun/.cache/huggingface/lerobot/calibration/robots/so_follower/left_follower_arm.json"
+    },
+    {
+      "alias": "right_follower",
+      "type": "follower",
+      "port": "/dev/ttyACM2",
+      "calibration_dir": "/home/wangyun/.cache/huggingface/lerobot/calibration/robots/so_follower",
+      "calibration_file": "/home/wangyun/.cache/huggingface/lerobot/calibration/robots/so_follower/right_follower_arm.json"
+    },
+    {
+      "alias": "left_leader",
+      "type": "leader",
+      "port": "/dev/ttyACM1",
+      "calibration_dir": "/home/wangyun/.cache/huggingface/lerobot/calibration/teleoperators/so_leader",
+      "calibration_file": "/home/wangyun/.cache/huggingface/lerobot/calibration/teleoperators/so_leader/left_leader_arm.json"
+    },
+    {
+      "alias": "right_leader",
+      "type": "leader",
+      "port": "/dev/ttyACM0",
+      "calibration_dir": "/home/wangyun/.cache/huggingface/lerobot/calibration/teleoperators/so_leader",
+      "calibration_file": "/home/wangyun/.cache/huggingface/lerobot/calibration/teleoperators/so_leader/right_leader_arm.json"
+    }
+  ],
+  "cameras": [
+    {"alias": "left_wrist",  "port": 6, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"},
+    {"alias": "right_wrist", "port": 2, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"},
+    {"alias": "right_front", "port": 0, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"}
+  ]
+}
