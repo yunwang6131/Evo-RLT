@@ -118,7 +118,7 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
   --policy.vla_pretrained_path=pretrained/pi05_full_ft/pretrained_model \
   --policy.vla_dtype=bfloat16 \
   --policy.rl_token_num_rl_tokens=4 \
-  --policy.tokenizer_path=~/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
+  --policy.tokenizer_path=/home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --policy.token_pool_size=0 \
   --policy.device=cuda \
   --batch_size=8 \
@@ -135,7 +135,7 @@ evo-rlt-build-transition-cache-v2 \
   --demo-dataset-root data/bimanual/merged_screw_v1 \
   --rl-token-policy-path outputs/bimanual_rl_token/checkpoints/last/pretrained_model \
   --vla-pretrained-path pretrained/pi05_full_ft/pretrained_model \
-  --tokenizer-path ~/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
+  --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --output-dir outputs/bimanual_cache \
   --task-instruction "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area." \
   --chunk-length 10 \
@@ -148,14 +148,14 @@ evo-rlt-build-transition-cache-v2 \
 
 # 训练 chunk actor-critic
 python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerobot.scripts.lerobot_train import main; main()' \
-  --dataset.repo_id=/outputs/bimanual_cache \
+  --dataset.repo_id=outputs/bimanual_cache \
   --policy.type=rlt_ac \
   --policy.repo_id=local/bimanual_rlt_ac \
   --policy.push_to_hub=false \
   --policy.vla_pretrained_path=pretrained/pi05_full_ft/pretrained_model \
   --policy.rl_token_pretrained_path=outputs/bimanual_rl_token/checkpoints/last/pretrained_model \
   --policy.vla_dtype=bfloat16 \
-  --policy.tokenizer_path=~/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
+  --policy.tokenizer_path=/home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --policy.rl_token_num_rl_tokens=4 \
   --policy.actor_hidden_dim=512 --policy.actor_num_layers=4 \
   --policy.actor_fixed_std=0.01 --policy.actor_ref_dropout_p=0.7 \
@@ -167,7 +167,7 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
   --policy.chunk_exec_steps=25 \
   --policy.phase_mode=always_rl \
   --policy.device=cuda \
-  --batch_size=64 \
+  --batch_size=8 \
   --steps=50000 \
   --save_freq=5000 \
   --eval_freq=0 \
