@@ -29,6 +29,7 @@ from evo_rlt.adapters.lerobot.policies.configuration_rlt_token import RLTokenPol
 from evo_rlt.adapters.lerobot.policies.modeling_rlt_token import RLTokenPolicy
 from evo_rlt.adapters.lerobot.policies.processor_rlt_token import make_rlt_token_pre_post_processors
 from evo_rlt.adapters.lerobot.offline_dataset import build_overlap_frame_indices
+from evo_rlt.core.rewards import build_reward_seq
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,6 +67,22 @@ def _log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
+def _get_episode_success(dataset: LeRobotDataset, episode_idx: int) -> bool:
+    """Per-episode success flag, matching RLTDemoDataset.get_episode_success semantics."""
+    raw = dataset.meta.episodes["episode_success"][episode_idx]
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized == "success":
+            return True
+        if normalized == "failure":
+            return False
+    elif isinstance(raw, bool):
+        return raw
+    elif isinstance(raw, (int, float)) and raw in (0, 1):
+        return bool(raw)
+    raise ValueError(f"Unrecognized episode_success value for episode {episode_idx}: {raw!r}")
+
+
 def _encode_episode(
     pi05,
     rl_token,
@@ -82,6 +99,7 @@ def _encode_episode(
     empty_cache_every: int,
     task_str: str,
     ep_id: int,
+    episode_success: bool,
 ) -> list[dict[str, Tensor]]:
     """Encode every base frame in `frame_indices`; build adjacent-frame transitions."""
     out: list[dict[str, Tensor]] = []
@@ -132,12 +150,17 @@ def _encode_episode(
     for i in range(N - 1):
         is_last = i == (N - 2)
         next_i = i + 1
+        reward_seq = build_reward_seq(
+            chunk_length=C,
+            is_terminal_chunk=is_last,
+            episode_success=episode_success,
+        )
         out.append(
             {
                 "state_vec": state_vecs_t[i],
                 "exec_chunk": ref_chunks_t[i],
                 "ref_chunk": ref_chunks_t[i],
-                "reward_seq": torch.zeros(C, dtype=torch.float32),
+                "reward_seq": reward_seq,
                 "next_state_vec": state_vecs_t[next_i],
                 "next_ref_chunk": ref_chunks_t[next_i],
                 "done": torch.tensor(float(is_last)),
@@ -227,7 +250,8 @@ def main() -> None:
                     chunk_length=cfg.chunk_size,
                     stride=args.frame_stride,
                 )
-                _log(f"  [{split_name}] ep {k+1}/{len(eps)} id={ep_id} frames={ep_to-ep_from} chunks={len(frame_indices)} (total transitions={len(all_tx)}, wall={time.time()-t_start:.0f}s)")
+                episode_success = _get_episode_success(dataset, ep_id)
+                _log(f"  [{split_name}] ep {k+1}/{len(eps)} id={ep_id} frames={ep_to-ep_from} chunks={len(frame_indices)} success={episode_success} (total transitions={len(all_tx)}, wall={time.time()-t_start:.0f}s)")
                 ep_tx = _encode_episode(
                     pi05=pi05,
                     rl_token=rl_token,
@@ -244,6 +268,7 @@ def main() -> None:
                     empty_cache_every=args.empty_cache_every,
                     task_str=args.task_instruction,
                     ep_id=ep_id,
+                    episode_success=episode_success,
                 )
                 all_tx.extend(ep_tx)
                 if (k + 1) % 5 == 0 or (k + 1) == len(eps):

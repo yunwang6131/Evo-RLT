@@ -167,14 +167,14 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
   --policy.chunk_exec_steps=25 \
   --policy.phase_mode=always_rl \
   --policy.device=cuda \
-  --batch_size=8 \
+  --batch_size=2 \
   --steps=50000 \
   --save_freq=5000 \
   --eval_freq=0 \
   --output_dir=outputs/bimanual_ac \
   --job_name=bimanual_rlt_ac
 
-# 真机部署验证（跟前面 pi05_baseline_eval 同样的episode数对比，成功率差就是RL的提升）
+# 真机部署验证
 evo-rlt-record collect \
   --setup-json configs/my_so101_manifest.json \
   --policy-path outputs/bimanual_ac/checkpoints/last/pretrained_model \
@@ -183,8 +183,49 @@ evo-rlt-record collect \
   --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area." \
   --dataset-tag rlt_ac_eval \
   --num-episodes 10 \
-  --episode-time-s 60 \
+  --episode-time-s 3000 \
   --fps 30 \
   --vcodec h264 \
   --rlt-toggle-key r \
-  --teleop-toggle-key space
+  --teleop-toggle-key i \
+  --rtc-execution-horizon 10 \
+  --vla-rtc-execution-horizon 25 \
+  --rtc-action-queue-size-to-get-new-actions 40
+  
+r / r+r   结束整个 episode（成功/失败）
+s / f     结束当前 RLT 阶段（成功/失败），不结束 episode
+i/Space   人工干预，取决于 --teleop-toggle-key
+←         丢弃并重录
+Esc       停止录制
+# 只推理不录制
+evo-rlt-record collect \
+  --inference-only \
+  --setup-json configs/my_so101_manifest.json \
+  --policy-path outputs/bimanual_ac/checkpoints/last/pretrained_model \
+  --vla-path pretrained/pi05_full_ft/pretrained_model \
+  --rl-token-path outputs/bimanual_rl_token/checkpoints/last/pretrained_model \
+  --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area." \
+  --episode-time-s 3000 \
+  --fps 30 \
+  --rlt-toggle-key r \
+  --teleop-toggle-key i \
+  --rtc-execution-horizon 10 \
+  --vla-rtc-execution-horizon 25 \
+  --rtc-action-queue-size-to-get-new-actions 40
+
+## 诊断（RL比VLA差时排查，diagnostics/）
+# 1. cache本身有没有问题（reward是不是全零、exec_chunk是不是等于ref_chunk）
+python diagnostics/inspect_transition_cache.py --cache-dir outputs/bimanual_cache --splits train val
+
+# 若发现 reward 全零：build_transition_cache_v2.py 曾经硬编码 reward_seq=0，从不读取
+# episode_success（已修复，见下）。已生成的 cache 不用整个重跑（GPU 编码不受影响，只是
+# reward 标签没写对），可以直接原地 patch：仅当数据集里所有 episode 都是成功样本时适用，
+# 否则请改用修复后的 evo-rlt-build-transition-cache-v2 重新生成。
+PYTHONPATH=src python src/evo_rlt/cli/patch_cache_terminal_reward.py \
+  --cache-dir outputs/bimanual_cache --splits train val
+
+# 2. 训练/部署config是否对得上（chunk_length、chunk_exec_steps、phase_mode等）
+python diagnostics/check_config_consistency.py \
+  --ac-config-dir outputs/bimanual_ac/checkpoints/last/pretrained_model \
+  --cache-build-chunk-length 10 --cache-build-frame-stride 2 \
+  --deploy-chunk-exec-steps 25 --deploy-phase-mode always_rl
