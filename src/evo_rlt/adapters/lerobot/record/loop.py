@@ -370,6 +370,7 @@ def record_loop(
     _frame_counter = 0
     if dataset is not None and hasattr(dataset, "root") and dataset.root is not None:
         _recovery_path = dataset.root / "recovery_frames.jsonl"
+        _recovery_path.parent.mkdir(parents=True, exist_ok=True)
         _recovery_fh = open(_recovery_path, "a")  # noqa: SIM115
 
     def _is_image_key(key: str) -> bool:
