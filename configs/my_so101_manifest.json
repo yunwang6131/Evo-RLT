@@ -34,8 +34,8 @@
     }
   ],
   "cameras": [
-    {"alias": "left_wrist",  "port": 6, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"},
-    {"alias": "right_wrist", "port": 4, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"},
-    {"alias": "right_front", "port": 2, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"}
+    {"alias": "left_wrist",  "port": 4, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"},
+    {"alias": "right_wrist", "port": 2, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"},
+    {"alias": "right_front", "port": 6, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"}
   ]
 }

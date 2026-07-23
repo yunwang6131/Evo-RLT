@@ -90,13 +90,6 @@ rm -rf ~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817
 ## 以下训练数据全部指向统一训练目录 data/bimanual,不是暂存区
 ls -td data/bimanual/*/record_teleop_full_*/
 
-# 查看SFT之后的pi05_baseline
-cd /home/wangyun/Evo-RLT
-conda activate evo-rlt
-
-# 训练好的模型位于 pretrained/pi05_full_ft/pretrained_model
-evo-rlt-record full   --initial-source vla   --setup-json configs/my_so101_manifest.json   --policy-path pretrained/pi05_full_ft/pretrained_model   --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area."   --dataset-tag pi05_baseline_eval   --num-episodes 10   --episode-time-s 60   --reset-time-s 6   --fps 30   --vcodec h264
-
 # 合并 data/bimanual 下现在有的全部11个session，作为RL Token/transition cache用的demo数据集
 lerobot-edit-dataset \
   --operation.type merge \
@@ -108,7 +101,11 @@ lerobot-edit-dataset \
 # 核对合并后的总episode数
 jq '{total_episodes, total_frames}' data/bimanual/merged_screw_v1/meta/info.json
 
-# 训练 RL Token（数据集用上面合并出来的 merged_screw_v1）
+# 收集SFT之后的pi05_baseline
+
+evo-rlt-record full   --initial-source vla   --setup-json configs/my_so101_manifest.json   --policy-path pretrained/pi05_full_ft/pretrained_model   --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area."   --dataset-tag pi05_baseline_eval   --num-episodes 30   --episode-time-s 600   --reset-time-s 6   --fps 30   --vcodec h264
+
+# 训练 RL Token, 用VLA full采集的数据
 python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerobot.scripts.lerobot_train import main; main()' \
   --dataset.repo_id=local/merged_screw_v1 \
   --dataset.root=data/bimanual/merged_screw_v1 \
@@ -117,7 +114,7 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
   --policy.push_to_hub=false \
   --policy.vla_pretrained_path=pretrained/pi05_full_ft/pretrained_model \
   --policy.vla_dtype=bfloat16 \
-  --policy.rl_token_num_rl_tokens=4 \
+  --policy.rl_token_num_rl_tokens=1 \
   --policy.tokenizer_path=/home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --policy.token_pool_size=0 \
   --policy.device=cuda \
@@ -140,7 +137,7 @@ evo-rlt-build-transition-cache-v2 \
   --task-instruction "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area." \
   --chunk-length 10 \
   --frame-stride 2 \
-  --batch-size 2 \
+  --batch-size 32 \
   --num-workers 2 \
   --train-ratio 0.9 \
   --tolerance-s 0.04 \
@@ -156,76 +153,80 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
   --policy.rl_token_pretrained_path=outputs/bimanual_rl_token/checkpoints/last/pretrained_model \
   --policy.vla_dtype=bfloat16 \
   --policy.tokenizer_path=/home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
-  --policy.rl_token_num_rl_tokens=4 \
-  --policy.actor_hidden_dim=512 --policy.actor_num_layers=4 \
-  --policy.actor_fixed_std=0.01 --policy.actor_ref_dropout_p=0.7 \
+  --policy.rl_token_num_rl_tokens=1 \
   --policy.actor_activation=silu --policy.actor_residual=true \
-  --policy.critic_hidden_dim=512 --policy.critic_num_layers=4 \
   --policy.critic_activation=silu --policy.critic_residual=true \
-  --policy.beta=5.0 --policy.tau=0.02 \
   --policy.chunk_length=10 \
   --policy.chunk_exec_steps=25 \
   --policy.phase_mode=always_rl \
   --policy.device=cuda \
-  --batch_size=2 \
+  --batch_size=256 \
   --steps=50000 \
-  --save_freq=5000 \
+  --salt_always_rl_eval \
+  --num-episodes 20 \
+  --episode-time-s 3000 \
+  --fps 30 \
+  --vcodec h264 \
+  --rtc-execution-horizon 10 \
+  --vla-rtc-execution-horizon 25 \
+  --rtc-action-queue-size-to-get-new-actions 40 \ve_freq=5000 \
   --eval_freq=0 \
   --output_dir=outputs/bimanual_ac \
   --job_name=bimanual_rlt_ac
 
-# 真机部署验证
+# 全程RLT
+evo-rlt-record full \
+  --initial-source vla \
+  --setup-json configs/my_so101_manifest.json \
+  --policy-path outputs/bimanual_ac/checkpoints/050000/pretrained_model \
+  --vla-path pretrained/pi05_full_ft/pretrained_model \
+  --rl-token-path outputs/bimanual_rl_token/checkpoints/last/pretrained_model \
+  --phase-mode always_rl \
+  --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area." \
+  --dataset-tag rlt_always_rl_eval \
+  --num-episodes 20 \
+  --episode-time-s 3000 \
+  --reset-time-s 6 \
+  --fps 30 \
+  --vcodec h264 \
+  --rtc-execution-horizon 10 \
+  --vla-rtc-execution-horizon 25 \
+  --rtc-action-queue-size-to-get-new-actions 40 \
+  --no-teleop
+
+s    完整 episode 成功并结束
+f    完整 episode 失败并结束
+Esc  停止采集
+
+# VLA → 手动进入 RLT，并且只录制RLT
 evo-rlt-record collect \
   --setup-json configs/my_so101_manifest.json \
-  --policy-path outputs/bimanual_ac/checkpoints/last/pretrained_model \
+  --policy-path outputs/bimanual_ac/checkpoints/050000/pretrained_model \
   --vla-path pretrained/pi05_full_ft/pretrained_model \
   --rl-token-path outputs/bimanual_rl_token/checkpoints/last/pretrained_model \
   --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area." \
-  --dataset-tag rlt_ac_eval \
-  --num-episodes 10 \
+  --dataset-tag rlt_critical_eval \
+  --num-episodes 20 \
   --episode-time-s 3000 \
   --fps 30 \
-  --vcodec h264 \
+  --vcodec h264 \frrirr
+  --only-critical \
   --rlt-toggle-key r \
   --teleop-toggle-key i \
   --rtc-execution-horizon 10 \
   --vla-rtc-execution-horizon 25 \
   --rtc-action-queue-size-to-get-new-actions 40
   
-r / r+r   结束整个 episode（成功/失败）
-s / f     结束当前 RLT 阶段（成功/失败），不结束 episode
-i/Space   人工干预，取决于 --teleop-toggle-key
-←         丢弃并重录
-Esc       停止录制
-# 只推理不录制
-evo-rlt-record collect \
-  --inference-only \
-  --setup-json configs/my_so101_manifest.json \
-  --policy-path outputs/bimanual_ac/checkpoints/last/pretrained_model \
-  --vla-path pretrained/pi05_full_ft/pretrained_model \
-  --rl-token-path outputs/bimanual_rl_token/checkpoints/last/pretrained_model \
-  --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area." \
-  --episode-time-s 3000 \
-  --fps 30 \
-  --rlt-toggle-key r \
-  --teleop-toggle-key i \
-  --rtc-execution-horizon 10 \
-  --vla-rtc-execution-horizon 25 \
-  --rtc-action-queue-size-to-get-new-actions 40
-
+ r进入核心，r退出核心，只记录核心
 ## 诊断（RL比VLA差时排查，diagnostics/）
 # 1. cache本身有没有问题（reward是不是全零、exec_chunk是不是等于ref_chunk）
 python diagnostics/inspect_transition_cache.py --cache-dir outputs/bimanual_cache --splits train val
-
-# 若发现 reward 全零：build_transition_cache_v2.py 曾经硬编码 reward_seq=0，从不读取
-# episode_success（已修复，见下）。已生成的 cache 不用整个重跑（GPU 编码不受影响，只是
-# reward 标签没写对），可以直接原地 patch：仅当数据集里所有 episode 都是成功样本时适用，
-# 否则请改用修复后的 evo-rlt-build-transition-cache-v2 重新生成。
-PYTHONPATH=src python src/evo_rlt/cli/patch_cache_terminal_reward.py \
-  --cache-dir outputs/bimanual_cache --splits train val
 
 # 2. 训练/部署config是否对得上（chunk_length、chunk_exec_steps、phase_mode等）
 python diagnostics/check_config_consistency.py \
   --ac-config-dir outputs/bimanual_ac/checkpoints/last/pretrained_model \
   --cache-build-chunk-length 10 --cache-build-frame-stride 2 \
   --deploy-chunk-exec-steps 25 --deploy-phase-mode always_rl
+
+# 整体流程
+从采集数据VLA开始，然后pi05微调，微调VLA之后再RL token，然后用SFT的VLA采集full里面有成功失败和认为干预的，然后transition cache,然后actor critic，然后用得到的模型采集Critical 片段，然后用这个片段制成数据集，transition cache,然后在之前的checkpoint上actor critic，这样重复几次
