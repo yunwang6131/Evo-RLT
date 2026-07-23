@@ -229,4 +229,4 @@ python diagnostics/check_config_consistency.py \
   --deploy-chunk-exec-steps 25 --deploy-phase-mode always_rl
 
 # 整体流程
-从采集数据VLA开始，然后pi05微调，微调VLA之后再RL token，然后用SFT的VLA采集full里面有成功失败和认为干预的，然后transition cache,然后actor critic，然后用得到的模型采集Critical 片段，然后用这个片段制成数据集，transition cache,然后在之前的checkpoint上actor critic，这样重复几次
+从采集数据VLA开始，然后pi05微调，微调VLA之后再RL token，然后用SFT的VLA采集full里面有成功失败和认为干预的，然后transition cache,然后actor critic，然后用得到的模型采集Critical 片段，然后用这个片段制成数据集，然后累加之前的数据transition cache,然后在之前的checkpoint上actor critic。然后把最后这几个采集到actor_critic的重复几遍
