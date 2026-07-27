@@ -48,6 +48,7 @@ class RLTPolicy(nn.Module):
             activation=config.actor.activation,
             layer_norm=config.actor.layer_norm,
             residual=config.actor.residual,
+            residual_to_ref=config.actor.residual_to_ref,
         )
 
 

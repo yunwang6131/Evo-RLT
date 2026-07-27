@@ -77,6 +77,7 @@ class ChunkACPolicy(PreTrainedPolicy):
             activation=config.actor_activation,
             layer_norm=config.actor_layer_norm,
             residual=config.actor_residual,
+            residual_to_ref=config.actor_residual_to_ref,
         )
         self.critic = TwinCritic(
             state_dim=state_dim,
@@ -238,6 +239,7 @@ class ChunkACPolicy(PreTrainedPolicy):
                 proprio_dim=self.config.proprio_dim,
                 chunk_exec_steps=self.config.chunk_exec_steps,
                 vla_ref=self.vla_ref,
+                action_clip_delta=self.config.actor_action_clip_delta,
             )
             self._prefix_capture = PrefixOutputCapture(
                 token_pool_size=self.config.token_pool_size,
@@ -589,6 +591,15 @@ class ChunkACPolicy(PreTrainedPolicy):
             self._reset_rtc_runtime()
         if self.modifier is not None:
             self.modifier.interrupt_chunk()
+
+    def get_last_chunk_tensors(self):
+        """Duck-typed passthrough for online-RL transition collection.
+
+        Not supported under the RTC runtime (v1 online training disables RTC).
+        """
+        if self.modifier is None:
+            return None
+        return self.modifier.get_last_chunk_tensors()
 
     def pop_step_metadata(self):
         if self._rtc_runtime_enabled:

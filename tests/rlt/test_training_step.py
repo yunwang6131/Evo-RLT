@@ -124,6 +124,25 @@ def test_soft_update_changes_target(algorithm):
     assert changed
 
 
+def test_soft_update_tau_zero_is_noop(algorithm):
+    """tau=0 must leave the target untouched: target = (1-0)*target + 0*source.
+
+    Online training relies on this exact no-op to disable ChunkACPolicy.forward()'s
+    internal (mistimed) soft update via cfg.policy.tau=0, doing the real soft
+    update itself afterwards once critic.step() has actually run -- see
+    backend.py's `_run_online_rl_update`.
+    """
+    orig_params = [p.data.clone() for p in algorithm.target_critic.parameters()]
+
+    for p in algorithm.critic.parameters():
+        p.data += torch.randn_like(p.data) * 0.1
+
+    soft_update(algorithm.target_critic, algorithm.critic, tau=0.0)
+
+    for orig, p in zip(orig_params, algorithm.target_critic.parameters()):
+        assert torch.allclose(orig, p.data)
+
+
 def test_compute_discount_vector():
     v = compute_discount_vector(0.99, 5)
     assert v.shape == (5,)

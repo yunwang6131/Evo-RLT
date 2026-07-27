@@ -259,6 +259,10 @@ def _patch_record_keyboard_listener() -> None:
     def init_keyboard_listener(*args, **kwargs):
         key_bindings = {
             kwargs.pop("intervention_toggle_key", None): "toggle_intervention",
+            # Safety hotkey: reuses the same event as intervention_toggle_key
+            # so pressing either grabs manual control (dict values need not
+            # be unique -- two physical keys, one logical event).
+            kwargs.pop("estop_key", None): "toggle_intervention",
             kwargs.pop("critical_phase_toggle_key", None): "toggle_critical_phase",
             kwargs.pop("episode_success_key", None): "episode_success",
             kwargs.pop("episode_failure_key", None): "episode_failure",

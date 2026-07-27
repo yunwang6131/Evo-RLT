@@ -39,6 +39,18 @@ def test_capacity_limit():
     assert len(buf) == 5
 
 
+def test_total_added_keeps_growing_past_capacity():
+    """len() stops growing once the deque is full and starts evicting; callers
+    that need "how many transitions were added since X" (e.g. online training's
+    UTD scaling) must use total_added instead, or the count silently drops to
+    ~0 forever once the buffer fills."""
+    buf = ReplayBuffer(capacity=5)
+    for _ in range(10):
+        buf.add(_make_transition())
+    assert len(buf) == 5
+    assert buf.total_added == 10
+
+
 def test_sample_shapes():
     buf = ReplayBuffer(capacity=100)
     for _ in range(20):
@@ -75,3 +87,83 @@ def test_batch_keys():
         "source", "episode_id", "is_critical",
     }
     assert set(batch.keys()) == expected_keys
+
+
+def _make_episode_transition(
+    episode_id: int, done: bool = False, success: bool = False, intervention: bool = False,
+) -> ChunkTransition:
+    reward_seq = torch.zeros(C)
+    if done and success:
+        reward_seq[-1] = 1.0
+    return ChunkTransition(
+        state_vec=torch.randn(STATE_DIM),
+        exec_chunk=torch.randn(C, ACTION_DIM),
+        ref_chunk=torch.randn(C, ACTION_DIM),
+        reward_seq=reward_seq,
+        next_state_vec=torch.randn(STATE_DIM),
+        next_ref_chunk=torch.randn(C, ACTION_DIM),
+        done=torch.tensor(float(done)),
+        intervention=torch.tensor(float(intervention)),
+        actual_steps=torch.tensor(C),
+        episode_id=torch.tensor(episode_id),
+    )
+
+
+class TestEpisodeOutcomes:
+    def test_count_outcomes(self):
+        buf = ReplayBuffer(capacity=100)
+        # Episode 0: two lead-up transitions + a successful terminal one.
+        buf.add(_make_episode_transition(0))
+        buf.add(_make_episode_transition(0))
+        buf.add(_make_episode_transition(0, done=True, success=True))
+        # Episode 1: a single failed terminal transition.
+        buf.add(_make_episode_transition(1, done=True, success=False))
+        successes, failures = buf.count_outcomes()
+        assert successes == 1
+        assert failures == 1
+
+    def test_episode_outcomes_tags_non_terminal_transitions_via_episode_id(self):
+        buf = ReplayBuffer(capacity=100)
+        buf.add(_make_episode_transition(5))
+        buf.add(_make_episode_transition(5, done=True, success=True))
+        outcomes = buf.episode_outcomes()
+        assert outcomes == {5: "success"}
+
+
+class TestStratifiedSampling:
+    def test_falls_back_to_uniform_when_buffer_is_small(self):
+        buf = ReplayBuffer(capacity=100)
+        for _ in range(3):
+            buf.add(_make_episode_transition(0))
+        batch = buf.sample_stratified(8)
+        assert batch["state_vec"].shape[0] == 8  # backfilled from the 'other' bucket
+
+    def test_prefers_success_failure_intervention_buckets_when_available(self):
+        buf = ReplayBuffer(capacity=1000)
+        # A large pool of plain (non-terminal, non-intervention, unresolved-episode)
+        # transitions that should be under-represented relative to uniform sampling.
+        for eid in range(50, 550):
+            buf.add(_make_episode_transition(eid))
+        # A single success episode, a single failure episode, a few intervention
+        # transitions -- small pools that stratified sampling should still pull from.
+        buf.add(_make_episode_transition(1, done=True, success=True))
+        buf.add(_make_episode_transition(2, done=True, success=False))
+        for _ in range(5):
+            buf.add(_make_episode_transition(3, intervention=True))
+
+        batch = buf.sample_stratified(
+            100, success_frac=0.4, failure_frac=0.3, intervention_frac=0.2, recent_frac=0.1,
+        )
+        assert batch["state_vec"].shape[0] == 100
+        # With only one success/failure transition each, requesting 40%/30% of a
+        # 100-batch must be satisfied by resampling those single transitions
+        # with replacement -- i.e. stratified sampling must not silently drop
+        # the quota just because the pool is tiny.
+        successes = (batch["done"] * (batch["reward_seq"].sum(dim=-1) > 0).float()).sum().item()
+        assert successes >= 30  # allow slack for the 'recent'/backfill overlap
+
+    def test_batch_keys_match_uniform_sample(self):
+        buf = ReplayBuffer(capacity=100)
+        for _ in range(20):
+            buf.add(_make_episode_transition(0))
+        assert set(buf.sample_stratified(8).keys()) == set(buf.sample(8).keys())

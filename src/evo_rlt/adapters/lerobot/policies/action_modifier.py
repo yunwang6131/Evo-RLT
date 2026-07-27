@@ -122,6 +122,7 @@ class RLTActionModifier(nn.Module):
         proprio_dim: int,
         chunk_exec_steps: int = 25,
         vla_ref: bool = True,
+        action_clip_delta: float | None = None,
     ):
         super().__init__()
         self.rl_token = rl_token
@@ -130,11 +131,18 @@ class RLTActionModifier(nn.Module):
         self.chunk_length = chunk_length
         self.chunk_exec_steps = chunk_exec_steps
         self.vla_ref = vla_ref
+        self.action_clip_delta = action_clip_delta
         self._cc_log_count = 0  # throttle for the compute_chunk ref diagnostic
         self.action_dim = action_dim
         self.proprio_dim = proprio_dim
         self._action_queue: deque[Tensor] = deque()
         self._step_metadata: deque[RLTStepMetadata] = deque()
+        # Last computed RL-phase chunk tensors, for online-RL transition
+        # collection (see RLTOnlineCollector). Populated only in RL phase;
+        # persists (peek, not pop) until overwritten by the next compute_chunk()
+        # or cleared by reset() -- see get_last_chunk_tensors().
+        self._last_state_vec: Tensor | None = None
+        self._last_ref_chunk: Tensor | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -192,6 +200,15 @@ class RLTActionModifier(nn.Module):
         should_log = self._cc_log_count < 3 or self._cc_log_count % 30 == 0
         mu, _ = self.actor(state_vec, ref_flat, training=False)
         chunk = unflatten_chunk(mu, self.chunk_length).clamp(-1, 1)
+        if self.action_clip_delta is not None:
+            # Safety bound: limit how far the (possibly still-training) RL
+            # actor's output may deviate from the VLA reference chunk, on
+            # top of the residual-actor zero-init. Guards against a partially
+            # trained actor producing large jumps on real hardware.
+            delta = (chunk - ref_chunk).clamp(-self.action_clip_delta, self.action_clip_delta)
+            chunk = (ref_chunk + delta).clamp(-1, 1)
+        self._last_state_vec = state_vec.detach().clone()
+        self._last_ref_chunk = ref_chunk.detach().clone()
         if should_log:
             delta = (chunk - ref_chunk).abs()
             # Diagnostic: the VLA ref is only the actor input; the returned
@@ -234,6 +251,26 @@ class RLTActionModifier(nn.Module):
             return None
         return self._step_metadata.popleft()
 
+    def get_last_chunk_tensors(self) -> tuple[Tensor, Tensor] | None:
+        """Peek (not pop) the (state_vec, ref_chunk) from the most recently
+        computed RL-phase chunk, or None if none has been computed yet.
+
+        Deliberately non-consuming: policy inference (and therefore
+        compute_chunk()) is skipped entirely while human intervention is
+        active, so this can go several frames without a fresh value. Callers
+        that only care about it at their own chunk-start boundary (e.g.
+        RLTOnlineCollector) still get the most recent real VLA/RL-token
+        encoding available instead of losing it the instant it's read once.
+
+        Does NOT include the actor's output chunk: RLTOnlineCollector builds
+        exec_chunk itself from the actual per-frame executed actions (which
+        may differ from the actor's raw output under human intervention), not
+        from what the actor originally proposed.
+        """
+        if self._last_state_vec is None:
+            return None
+        return (self._last_state_vec, self._last_ref_chunk)
+
     # ------------------------------------------------------------------
     # Phase control (duck-typed interface for recording_loop)
     # ------------------------------------------------------------------
@@ -255,7 +292,11 @@ class RLTActionModifier(nn.Module):
             self.phase_ctrl.trigger_critical()
 
     def interrupt_chunk(self) -> None:
-        """Clear both action and metadata queues (e.g. on phase switch)."""
+        """Clear action and metadata queues (e.g. on phase switch or human
+        intervention start). Deliberately does NOT clear the last-chunk
+        tensor cache (see get_last_chunk_tensors) -- intervention stops new
+        chunks from being computed, so the cache should keep holding the most
+        recent real encoding rather than going blank the instant it's read."""
         self._action_queue.clear()
         self._step_metadata.clear()
 
@@ -263,4 +304,6 @@ class RLTActionModifier(nn.Module):
         """Reset queues and phase controller to initial state."""
         self._action_queue.clear()
         self._step_metadata.clear()
+        self._last_state_vec = None
+        self._last_ref_chunk = None
         self.phase_ctrl.reset()

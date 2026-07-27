@@ -30,6 +30,7 @@ class ActorConfig:
     activation: str = "relu"
     layer_norm: bool = False
     residual: bool = False
+    residual_to_ref: bool = False
 
 
 @dataclass

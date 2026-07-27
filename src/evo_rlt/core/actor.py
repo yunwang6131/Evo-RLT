@@ -55,6 +55,7 @@ class ChunkActor(nn.Module):
         activation: str = "relu",
         layer_norm: bool = False,
         residual: bool = False,
+        residual_to_ref: bool = False,
     ):
         super().__init__()
         if residual:
@@ -69,6 +70,15 @@ class ChunkActor(nn.Module):
             )
         self.fixed_std = fixed_std
         self.ref_dropout_p = ref_dropout_p
+        self.residual_to_ref = residual_to_ref
+        if residual_to_ref:
+            # Zero-init the final layer so mu == ref_chunk exactly at init
+            # (delta == 0), giving a safe starting policy for online RL on
+            # real hardware: the untrained actor is a no-op over the VLA
+            # reference until gradient updates move it away from zero.
+            out_layer = self.net.output_proj if residual else self.net[-1]
+            nn.init.zeros_(out_layer.weight)
+            nn.init.zeros_(out_layer.bias)
 
     def forward(
         self,
@@ -77,13 +87,15 @@ class ChunkActor(nn.Module):
         training: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass returning (mu, std)."""
+        net_ref = ref_chunk_flat
         if training:
             mask = (
                 torch.rand(state_vec.shape[0], 1, device=state_vec.device) > self.ref_dropout_p
             ).float()
-            ref_chunk_flat = ref_chunk_flat * mask
-        x = torch.cat([state_vec, ref_chunk_flat], dim=-1)
-        mu = self.net(x)
+            net_ref = ref_chunk_flat * mask
+        x = torch.cat([state_vec, net_ref], dim=-1)
+        delta = self.net(x)
+        mu = ref_chunk_flat + delta if self.residual_to_ref else delta
         std = torch.full_like(mu, self.fixed_std)
         return mu, std
 

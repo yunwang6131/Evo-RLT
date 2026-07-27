@@ -65,6 +65,55 @@ class TestActor:
             assert p.grad is not None
 
 
+class TestResidualToRefActor:
+    """residual_to_ref=True must start out as a no-op over the VLA reference
+    (mu == ref, delta == 0), for safe online RL initialization on real hardware."""
+
+    def test_mu_equals_ref_at_init(self):
+        actor = ChunkActor(
+            state_dim=78, chunk_dim=140, hidden_dim=64, num_layers=2, residual_to_ref=True,
+        )
+        state = torch.randn(8, 78)
+        ref = torch.randn(8, 140)
+        mu, _ = actor(state, ref, training=False)
+        assert torch.allclose(mu, ref)
+
+    def test_mu_equals_ref_at_init_with_residual_mlp(self):
+        actor = ChunkActor(
+            state_dim=78, chunk_dim=140, hidden_dim=64, num_layers=2,
+            residual=True, residual_to_ref=True,
+        )
+        state = torch.randn(8, 78)
+        ref = torch.randn(8, 140)
+        mu, _ = actor(state, ref, training=False)
+        assert torch.allclose(mu, ref)
+
+    def test_ref_dropout_does_not_break_residual_bias(self):
+        """Even when the network's view of ref is dropped out during training,
+        the true (undropped) ref is still added back as the residual bias."""
+        actor = ChunkActor(
+            state_dim=78, chunk_dim=140, hidden_dim=64, num_layers=2,
+            residual_to_ref=True, ref_dropout_p=1.0,  # force full dropout
+        )
+        state = torch.randn(8, 78)
+        ref = torch.randn(8, 140)
+        mu, _ = actor(state, ref, training=True)
+        # delta==0 at init regardless of what the net saw, so mu still == ref.
+        assert torch.allclose(mu, ref)
+
+    def test_gradient_flow(self):
+        actor = ChunkActor(
+            state_dim=78, chunk_dim=140, hidden_dim=64, num_layers=2, residual_to_ref=True,
+        )
+        state = torch.randn(4, 78)
+        ref = torch.randn(4, 140)
+        action, _ = actor.sample(state, ref, training=True)
+        loss = action.sum()
+        loss.backward()
+        for p in actor.parameters():
+            assert p.grad is not None
+
+
 class TestCritic:
     def test_chunk_critic_shape(self):
         critic = ChunkCritic(state_dim=78, chunk_dim=140, hidden_dim=64)

@@ -67,6 +67,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
 
+import torch
+
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
@@ -255,6 +257,60 @@ class RLTRecordConfig:
 
 
 @dataclass
+class OnlineRLConfig:
+    """Synchronous online RL training on real hardware (RLT Algorithm 1).
+
+    Each recorded episode is one critical-phase segment (requires
+    rlt.rl_phase_key_toggles_episode=true, rlt.skip_prefix_recording=true).
+    After each episode's success/failure label is resolved, the terminal
+    transition is flushed into the replay buffer and
+    min(new_transitions_this_episode * utd_ratio, max_updates_per_episode)
+    gradient steps run on `policy` in-place before the next rollout episode --
+    no checkpoint save/reload between episodes.
+    """
+
+    enable: bool = False
+    # Episodes to collect (VLA-reference rollout via the zero-init residual
+    # actor) before any gradient update runs, matching the paper's warmup
+    # phase of pre-filling the replay buffer.
+    warmup_episodes: int = 5
+    # Episodes immediately after warmup during which only the critic updates
+    # (actor stays frozen at its zero-init-residual, VLA-equivalent behavior).
+    # Lets the critic form a non-random value estimate before the actor starts
+    # moving away from the safe VLA-equivalent starting point. Real-hardware
+    # sample budgets can't afford the thousands of critic-only steps common in
+    # sim (that alone would be hundreds of robot episodes); this is a much
+    # smaller, real-hardware-sized version of the same idea.
+    critic_only_episodes: int = 10
+    replay_capacity: int = 20_000
+    batch_size: int = 256
+    # Actor lr is kept well below critic lr: the critic needs to adapt
+    # quickly to new transitions, while the actor -- which directly drives
+    # the robot -- should change slowly and conservatively online.
+    lr_actor: float = 3e-5
+    lr_critic: float = 1e-4
+    # Gradient updates per episode = min(new_transitions * cfg.policy.utd_ratio,
+    # max_updates_per_episode) -- scaled by how much data the episode actually
+    # added, not a fixed count regardless of episode length.
+    max_updates_per_episode: int = 200
+    # Warmup ends only once ALL of these hold (not just warmup_episodes):
+    # episode count alone doesn't say whether the critic has seen both
+    # outcomes, and a VLA that always succeeds (or always fails) in its first
+    # few episodes gives the critic nothing to discriminate.
+    min_warmup_transitions: int = 1000
+    min_warmup_successes: int = 3
+    min_warmup_failures: int = 3
+    # Stratified batches (success/failure/intervention/recent) instead of
+    # uniform sampling -- under sparse terminal-only reward, a uniform batch
+    # from a mostly-zero-reward buffer can end up with few or no positive
+    # examples.
+    use_stratified_sampling: bool = True
+    # Directory to save periodic online-training checkpoints. Required when enable=true.
+    save_dir: str | None = None
+    save_every_episodes: int = 5
+
+
+@dataclass
 class RecordConfig:
     robot: RobotConfig
     dataset: DatasetRecordConfig
@@ -282,6 +338,12 @@ class RecordConfig:
     intervention_state_machine_enabled: bool = True
     # Keyboard key used to toggle entering/leaving intervention.
     intervention_toggle_key: str = "i"
+    # Safety hotkey: bound to the same toggle-intervention event as
+    # `intervention_toggle_key`, giving a second always-available way to grab
+    # manual control (e.g. during autonomous RL-phase rollout in online
+    # training). Not a hardware E-stop -- physical supervision is still
+    # required.
+    estop_key: str = "x"
     # Pure-teleop mode: r key starts an episode (entering critical phase),
     # second r press ends the episode and marks it success; a double-tap
     # inside `rlt.rl_phase_double_tap_window_s` marks it failure. No VLA,
@@ -319,6 +381,7 @@ class RecordConfig:
     # Keyboard key for toggling critical phase marking. Default is space.
     critical_phase_toggle_key: str = " "
     rlt: RLTRecordConfig = field(default_factory=RLTRecordConfig)
+    online_rl: OnlineRLConfig = field(default_factory=OnlineRLConfig)
     # Path to a JSON file with robot + camera config (e.g. roboclaw setup.json).
     # When set, overrides robot port and camera CLI args.
     robot_config_file: str | None = None
@@ -371,6 +434,10 @@ class RecordConfig:
             raise ValueError("Choose a policy, a teleoperator, or enable RLT to control the robot")
         if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
             raise ValueError("`intervention_toggle_key` must be a single character.")
+        if not self.estop_key or len(self.estop_key) != 1:
+            raise ValueError("`estop_key` must be a single character.")
+        if self.estop_key.lower() == self.intervention_toggle_key.lower():
+            raise ValueError("`estop_key` must differ from `intervention_toggle_key`.")
 
         if self.enable_episode_outcome_labeling:
             label_key_bindings = {
@@ -383,12 +450,14 @@ class RecordConfig:
 
             normalized_keys = [
                 self.intervention_toggle_key.lower(),
+                self.estop_key.lower(),
                 self.episode_success_key.lower(),
                 self.episode_failure_key.lower(),
             ]
             if len(set(normalized_keys)) != len(normalized_keys):
                 raise ValueError(
-                    "`intervention_toggle_key`, `episode_success_key`, and `episode_failure_key` must be distinct."
+                    "`intervention_toggle_key`, `estop_key`, `episode_success_key`, and "
+                    "`episode_failure_key` must be distinct."
                 )
 
         if self.rlt.enable:
@@ -398,6 +467,7 @@ class RecordConfig:
             reserved_keys = [
                 self.rlt.critical_phase_toggle_key.lower(),
                 self.intervention_toggle_key.lower(),
+                self.estop_key.lower(),
             ]
             if self.enable_episode_outcome_labeling:
                 reserved_keys.append(self.episode_success_key.lower())
@@ -428,6 +498,56 @@ class RecordConfig:
             raise ValueError("`communication_retry_interval_s` must be > 0.")
         if self.rlt.intervention_action_blend_time_s < 0:
             raise ValueError("`rlt.intervention_action_blend_time_s` must be >= 0.")
+
+        if self.online_rl.enable:
+            if self.policy is None or getattr(self.policy, "type", None) != "rlt_ac":
+                raise ValueError("`online_rl.enable=true` requires an `rlt_ac`-type `policy`.")
+            if not self.enable_episode_outcome_labeling:
+                raise ValueError(
+                    "`online_rl.enable=true` requires `enable_episode_outcome_labeling=true` "
+                    "(episode success/failure is the sparse reward signal)."
+                )
+            if not self.rlt.rl_phase_key_toggles_episode or not self.rlt.skip_prefix_recording:
+                raise ValueError(
+                    "`online_rl.enable=true` requires `rlt.rl_phase_key_toggles_episode=true` and "
+                    "`rlt.skip_prefix_recording=true` (each episode is exactly one critical-phase segment)."
+                )
+            if not self.online_rl.save_dir:
+                raise ValueError("`online_rl.enable=true` requires `online_rl.save_dir` to be set.")
+            if self.online_rl.warmup_episodes < 0:
+                raise ValueError("`online_rl.warmup_episodes` must be >= 0.")
+            if self.online_rl.critic_only_episodes < 0:
+                raise ValueError("`online_rl.critic_only_episodes` must be >= 0.")
+            if self.online_rl.min_warmup_transitions < 0:
+                raise ValueError("`online_rl.min_warmup_transitions` must be >= 0.")
+            if self.online_rl.min_warmup_successes < 0:
+                raise ValueError("`online_rl.min_warmup_successes` must be >= 0.")
+            if self.online_rl.min_warmup_failures < 0:
+                raise ValueError("`online_rl.min_warmup_failures` must be >= 0.")
+            if self.online_rl.max_updates_per_episode <= 0:
+                raise ValueError("`online_rl.max_updates_per_episode` must be > 0.")
+            if self.online_rl.batch_size <= 0:
+                raise ValueError("`online_rl.batch_size` must be > 0.")
+            if self.online_rl.replay_capacity < self.online_rl.batch_size:
+                raise ValueError("`online_rl.replay_capacity` must be >= `online_rl.batch_size`.")
+            if self.online_rl.save_every_episodes <= 0:
+                raise ValueError(
+                    "`online_rl.save_every_episodes` must be > 0 (used as a modulo divisor)."
+                )
+            if self.online_rl.lr_actor <= 0 or self.online_rl.lr_critic <= 0:
+                raise ValueError("`online_rl.lr_actor` and `online_rl.lr_critic` must be > 0.")
+            if not (0 < self.policy.gamma <= 1):
+                raise ValueError("`policy.gamma` must be in (0, 1].")
+            if self.policy.beta < 0:
+                raise ValueError("`policy.beta` must be >= 0.")
+            if not (0 <= self.policy.tau <= 1):
+                raise ValueError("`policy.tau` must be in [0, 1].")
+            if self.policy.utd_ratio <= 0:
+                raise ValueError("`policy.utd_ratio` must be > 0.")
+            if self.policy.actor_update_interval <= 0:
+                raise ValueError("`policy.actor_update_interval` must be > 0.")
+            if self.policy.actor_action_clip_delta is not None and self.policy.actor_action_clip_delta < 0:
+                raise ValueError("`policy.actor_action_clip_delta` must be >= 0 when set.")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -633,6 +753,46 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         # Load pretrained policy
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
         _configure_rlt_record_policy(policy, cfg)
+
+        online_collector = None
+        online_replay_buffer = None
+        online_actor_optimizer = None
+        online_critic_optimizer = None
+        online_actor_update_interval = None
+        if cfg.online_rl.enable:
+            from evo_rlt.adapters.lerobot.online_collector import RLTOnlineCollector
+            from evo_rlt.core.replay_buffer import ReplayBuffer
+
+            online_replay_buffer = ReplayBuffer(capacity=cfg.online_rl.replay_capacity)
+            online_collector = RLTOnlineCollector(
+                replay_buffer=online_replay_buffer,
+                chunk_length=cfg.policy.chunk_length,
+                action_dim=cfg.policy.action_dim,
+            )
+            # Separate optimizers (not just param groups on one Adam): actor lr
+            # << critic lr since the critic should adapt quickly while the actor
+            # -- which directly drives the robot -- should not, and this also
+            # makes actor/critic state separately checkpointable/restartable.
+            online_actor_optimizer = torch.optim.Adam(policy.actor.parameters(), lr=cfg.online_rl.lr_actor)
+            online_critic_optimizer = torch.optim.Adam(policy.critic.parameters(), lr=cfg.online_rl.lr_critic)
+            # cfg.policy.actor_update_interval is read live by ChunkACPolicy.forward()
+            # on every call; remembered here so the critic-only warmup window (below)
+            # can temporarily inflate it and then restore the real value.
+            online_actor_update_interval = cfg.policy.actor_update_interval
+            # ChunkACPolicy.forward() soft-updates target_critic BEFORE the
+            # caller's optimizer.step() actually applies this iteration's
+            # critic gradient -- i.e. one iteration too early, off standard
+            # TD3 order. forward() is shared with offline training
+            # (lerobot-train), so it isn't touched; instead cfg.policy.tau is
+            # temporarily zeroed around each online forward() call (making its
+            # internal soft_update(..., tau=0) an exact no-op, since
+            # target = (1-tau)*target + tau*source), and the real soft update
+            # runs here afterwards, once critic.step() has actually happened.
+            online_tau = cfg.policy.tau
+            # Set once, the episode warmup actually finished on -- see
+            # _warmup_satisfied(). None means warmup hasn't completed yet.
+            warmup_completed_at_episode: int | None = None
+
         preprocessor = None
         postprocessor = None
         if cfg.acp_inference.enable and cfg.policy is None:
@@ -712,6 +872,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             intervention_toggle_key=(
                 (" " if rlt_hil_mode else cfg.intervention_toggle_key) if policy is not None else None
             ),
+            estop_key=cfg.estop_key if policy is not None else None,
             critical_phase_toggle_key=cp_key if not rlt_active else None,
             episode_success_key=cfg.episode_success_key if bind_ep_outcome_keys else None,
             episode_failure_key=cfg.episode_failure_key if bind_ep_outcome_keys else None,
@@ -786,6 +947,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 rl_phase_double_tap_window_s=cfg.rlt.rl_phase_double_tap_window_s,
                 start_in_teleop=cfg.rlt.start_in_teleop,
                 intervention_action_blend_time_s=cfg.rlt.intervention_action_blend_time_s,
+                rlt_online_collector=online_collector,
             )
 
         def _current_episode_frame_count() -> int:
@@ -898,6 +1060,199 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             dataset.save_episode(extra_episode_metadata=_extra_episode_metadata(episode_success))
             return recorded_episodes + 1
 
+        def _warmup_satisfied(recorded_episodes: int) -> bool:
+            nonlocal warmup_completed_at_episode
+            if warmup_completed_at_episode is not None:
+                return True  # sticky: once satisfied, stays satisfied
+            if recorded_episodes < cfg.online_rl.warmup_episodes:
+                return False
+            if len(online_replay_buffer) < cfg.online_rl.min_warmup_transitions:
+                return False
+            successes, failures = online_replay_buffer.count_outcomes()
+            if not (
+                successes >= cfg.online_rl.min_warmup_successes
+                and failures >= cfg.online_rl.min_warmup_failures
+            ):
+                return False
+            # Record when warmup actually finished -- the critic-only window
+            # below anchors to this, not a fixed offset (see its comment).
+            warmup_completed_at_episode = recorded_episodes
+            return True
+
+        def _run_online_rl_update(
+            recorded_episodes: int, episode_success: str | None, buffer_total_added_before: int,
+        ) -> None:
+            """Flush the episode's terminal transition (sparse binary reward from
+            the success/failure label) into the replay buffer, then run gradient
+            steps scaled to how much data this episode actually added, in place
+            on `policy` -- the very next rollout episode uses the updated
+            weights directly, no checkpoint save/reload."""
+            if not cfg.online_rl.enable or episode_success is None:
+                return
+            online_collector.flush_episode(episode_success == "success")
+            # total_added is monotonic (unlike len(), which stops growing once
+            # the deque hits capacity and starts evicting) -- see ReplayBuffer.
+            new_transitions = online_replay_buffer.total_added - buffer_total_added_before
+
+            if not _warmup_satisfied(recorded_episodes):
+                successes, failures = online_replay_buffer.count_outcomes()
+                logging.info(
+                    "Online RL warmup not yet satisfied after episode %d: "
+                    "transitions=%d (need %d), successes=%d (need %d), failures=%d (need %d)",
+                    recorded_episodes, len(online_replay_buffer), cfg.online_rl.min_warmup_transitions,
+                    successes, cfg.online_rl.min_warmup_successes,
+                    failures, cfg.online_rl.min_warmup_failures,
+                )
+                return
+            if len(online_replay_buffer) < cfg.online_rl.batch_size:
+                return
+
+            import time as _time
+
+            from evo_rlt.core.utils import soft_update, unflatten_chunk
+
+            # Critic-only window: freeze actor updates so the critic gets a
+            # chance to form a non-random value estimate before the actor
+            # starts moving away from its safe, VLA-equivalent starting
+            # point. Implemented by inflating actor_update_interval (read
+            # live by ChunkACPolicy.forward()) rather than toggling
+            # requires_grad, so no actor gradient is even computed. Anchored
+            # to warmup_completed_at_episode (set by _warmup_satisfied, which
+            # already returned True above) rather than a fixed
+            # warmup_episodes + critic_only_episodes offset -- if warmup took
+            # longer than warmup_episodes to actually satisfy its
+            # transition/success/failure thresholds, the fixed-offset version
+            # would already be in the past, skipping critic-only entirely.
+            assert warmup_completed_at_episode is not None
+            critic_only_until = warmup_completed_at_episode + cfg.online_rl.critic_only_episodes
+            cfg.policy.actor_update_interval = (
+                10**9 if recorded_episodes < critic_only_until else online_actor_update_interval
+            )
+            # See the comment at online_tau's definition: disable forward()'s
+            # own (mistimed) soft update for the duration of this call, then
+            # do it correctly ourselves after each real critic.step() below.
+            cfg.policy.tau = 0.0
+
+            # UTD: gradient updates scaled to how much new data this episode
+            # added, not a fixed count regardless of episode length.
+            requested_updates = max(new_transitions, 0) * cfg.policy.utd_ratio
+            num_updates = min(requested_updates, cfg.online_rl.max_updates_per_episode)
+
+            device = next(policy.parameters()).device
+            policy.train()
+            start_t = _time.perf_counter()
+            info = None
+            try:
+                for _ in range(num_updates):
+                    # ReplayBuffer.sample()/sample_stratified() return core/losses.py's
+                    # flat-key format (exec_chunk_flat/ref_chunk_flat/next_ref_flat);
+                    # ChunkACPolicy's forward()/_coerce_batch expects unflattened
+                    # (B, C, action_dim) exec_chunk/ref_chunk/next_ref_chunk and
+                    # flattens internally.
+                    if cfg.online_rl.use_stratified_sampling:
+                        raw = online_replay_buffer.sample_stratified(cfg.online_rl.batch_size)
+                    else:
+                        raw = online_replay_buffer.sample(cfg.online_rl.batch_size)
+                    C = cfg.policy.chunk_length
+                    batch = {
+                        "state_vec": raw["state_vec"],
+                        "exec_chunk": unflatten_chunk(raw["exec_chunk_flat"], C),
+                        "ref_chunk": unflatten_chunk(raw["ref_chunk_flat"], C),
+                        "reward_seq": raw["reward_seq"],
+                        "next_state_vec": raw["next_state_vec"],
+                        "next_ref_chunk": unflatten_chunk(raw["next_ref_flat"], C),
+                        "done": raw["done"],
+                        "actual_steps": raw["actual_steps"],
+                    }
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    loss, info = policy.forward(batch)
+                    online_actor_optimizer.zero_grad()
+                    online_critic_optimizer.zero_grad()
+                    loss.backward()
+                    # Matches ChunkACPolicyConfig.get_optimizer_preset()'s
+                    # grad_clip_norm=1.0 (applied automatically for offline
+                    # training by lerobot's generic train loop; this custom
+                    # online loop bypasses that loop entirely, so it has to be
+                    # applied explicitly here to get the same protection).
+                    torch.nn.utils.clip_grad_norm_(policy.actor.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(policy.critic.parameters(), max_norm=1.0)
+                    online_critic_optimizer.step()
+                    online_actor_optimizer.step()
+                    # Correct TD3 order: soft-update target only now, after
+                    # critic.step() has actually applied this iteration's gradient.
+                    soft_update(policy.target_critic, policy.critic, online_tau)
+            finally:
+                # Always restore, even on exception (CUDA OOM, bad sample, NaN
+                # loss, ...): cfg.policy is the same object make_policy() gave
+                # the live ChunkACPolicy, so a corrupted tau=0 /
+                # actor_update_interval=10**9 left behind by an unhandled
+                # exception would silently disable target updates / actor
+                # training for the rest of the session (and leak into
+                # policy.save_pretrained()'s config.json below).
+                cfg.policy.tau = online_tau
+                cfg.policy.actor_update_interval = online_actor_update_interval
+                policy.eval()
+            training_time_s = _time.perf_counter() - start_t
+            logging.info(
+                "Online RL update after episode %d: new_transitions=%d requested_updates=%d "
+                "actual_updates=%d effective_utd=%.2f training_time=%.1fs loss=%s",
+                recorded_episodes, new_transitions, requested_updates, num_updates,
+                (num_updates / new_transitions) if new_transitions > 0 else 0.0,
+                training_time_s,
+                {k: (v.item() if torch.is_tensor(v) else v) for k, v in (info or {}).items()},
+            )
+
+            completed_episodes = recorded_episodes + 1
+            if completed_episodes % cfg.online_rl.save_every_episodes == 0:
+                save_path = Path(cfg.online_rl.save_dir) / f"step_{completed_episodes:06d}"
+                policy.save_pretrained(save_path)
+                logging.info("Online RL checkpoint saved to %s", save_path)
+
+        def _save_online_rl_latest_state(completed_episodes: int) -> None:
+            """Overwrite a single, internally-consistent 'latest' snapshot every
+            episode -- model weights AND optimizer state AND replay buffer AND
+            counters together, not just the optimizer/buffer/counters. The
+            periodic step_NNNNNN saves above (policy.save_pretrained(), every
+            `save_every_episodes`) run on a DIFFERENT cadence than this
+            per-episode save; if this file held only optimizer/buffer/counters,
+            a crash between two step_NNNNNN saves would leave weights from
+            episode N sitting next to optimizer/buffer state from episode N+2,
+            which can't be recombined into a valid training state. Written to a
+            temp file then atomically renamed so a crash mid-write never
+            leaves a half-written file behind.
+
+            Loading this back into a running session (full resume) is not
+            wired up yet -- this is crash-survivability for the data, not a
+            `--resume` CLI path.
+            """
+            if not cfg.online_rl.enable:
+                return
+            import os
+
+            save_dir = Path(cfg.online_rl.save_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+            state = {
+                "recorded_episodes": completed_episodes,
+                "actor_state_dict": policy.actor.state_dict(),
+                "critic_state_dict": policy.critic.state_dict(),
+                "target_critic_state_dict": policy.target_critic.state_dict(),
+                "critic_step": policy._critic_step,
+                "actor_optimizer": online_actor_optimizer.state_dict(),
+                "critic_optimizer": online_critic_optimizer.state_dict(),
+                "replay_buffer": list(online_replay_buffer.buffer),
+                "replay_buffer_total_added": online_replay_buffer.total_added,
+                "replay_capacity": online_replay_buffer.capacity,
+                "torch_rng_state": torch.get_rng_state(),
+            }
+            final_path = save_dir / "latest_online_state.pt"
+            tmp_path = save_dir / "latest_online_state.pt.tmp"
+            torch.save(state, tmp_path)
+            os.replace(tmp_path, final_path)
+            logging.info(
+                "Online RL latest state saved to %s (episodes=%d, buffer=%d transitions)",
+                final_path, completed_episodes, len(online_replay_buffer),
+            )
+
         with VideoEncodingManager(dataset):
             _warmup_rlt_path()
             recorded_episodes = 0
@@ -906,14 +1261,29 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
                 _start_episode_trackers()
                 _reset_policy_for_episode()
+                if online_collector is not None:
+                    online_collector.start_episode(dataset.num_episodes)
+                # Captured before _record_episode(): most of an episode's
+                # transitions are added live, frame-by-frame, during rollout
+                # (RLTOnlineCollector.on_frame's non-terminal _emit_transition
+                # calls) -- only the terminal one is added later by
+                # flush_episode() inside _run_online_rl_update. Baselining
+                # total_added here (not inside _run_online_rl_update, after
+                # rollout already happened) is what makes the delta actually
+                # cover the whole episode.
+                buffer_total_added_before = (
+                    online_replay_buffer.total_added if online_replay_buffer is not None else 0
+                )
                 _record_episode()
                 _finish_episode_trackers()
                 episode_success = (
                     None if events["rerecord_episode"] else _resolve_current_episode_success()
                 )
                 _notify_episode_outcome(episode_success)
+                _run_online_rl_update(recorded_episodes, episode_success, buffer_total_added_before)
                 _run_reset_loop_if_needed(recorded_episodes)
                 recorded_episodes = _finish_recorded_episode(recorded_episodes, episode_success)
+                _save_online_rl_latest_state(recorded_episodes)
     finally:
         def _save_critical_phase_intervals() -> None:
             if critical_phase_tracker is None or len(critical_phase_tracker) == 0:

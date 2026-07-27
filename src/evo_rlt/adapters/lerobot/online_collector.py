@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import logging
-
 import torch
 
 from evo_rlt.core.interfaces import ChunkTransition
 from evo_rlt.core.replay_buffer import ReplayBuffer
 from evo_rlt.adapters.lerobot.record.annotations import SOURCE_HUMAN
 
-logger = logging.getLogger(__name__)
-
 
 class RLTOnlineCollector:
-    """Accumulates per-frame robot data and emits ChunkTransitions every C frames."""
+    """Accumulates per-frame robot data into ChunkTransitions every C frames.
+
+    Transitions stage locally per-episode and only commit to the global
+    replay buffer on flush_episode() -- see _episode_staging.
+    """
 
     def __init__(
         self,
@@ -30,6 +30,13 @@ class RLTOnlineCollector:
         self._chunk_is_critical: float = 0.0
         self._episode_id: int = -1
         self._prev_transition: ChunkTransition | None = None
+        # Transitions accumulate here, NOT in the global replay buffer,
+        # until flush_episode() commits them. A rerecorded/discarded/never-
+        # labeled episode's staged transitions are simply dropped by the next
+        # start_episode() call instead of permanently polluting the global
+        # buffer with dangling non-terminal transitions (no valid next_state,
+        # no outcome label, possibly built from footage the user rejected).
+        self._episode_staging: list[ChunkTransition] = []
 
     def start_episode(self, episode_id: int) -> None:
         self._episode_id = episode_id
@@ -39,6 +46,7 @@ class RLTOnlineCollector:
         self._chunk_ref = None
         self._chunk_is_critical = 0.0
         self._prev_transition = None
+        self._episode_staging = []
 
     def on_frame(
         self,
@@ -67,17 +75,29 @@ class RLTOnlineCollector:
         return None
 
     def flush_episode(self, episode_success: bool) -> ChunkTransition | None:
-        # TODO(online-rl): episode_success is accepted but discarded. Before enabling the
-        # online collector, thread it into _emit_transition so the terminal chunk's
-        # reward_seq carries success_bonus. See docs/rlt/rlt_pipeline_review_20260415_1839.md S2-1.
+        """Finalize the episode, marking the terminal transition done=1 and
+        writing the sparse binary reward (r=1 iff success, else 0) onto its
+        last valid timestep, matching the paper's terminal-reward-only setup.
+        Commits every transition staged this episode to the global replay
+        buffer -- call this ONLY for an episode that is being kept (has a
+        real outcome label); for a rerecorded/discarded episode, just don't
+        call it and let the next start_episode() drop the staged data.
+        """
+        terminal_reward = 1.0 if episode_success else 0.0
+        result: ChunkTransition | None = None
         if self._frame_actions:
-            return self._emit_transition(done=True)
-        # Episode length was exact multiple of C — mark last emitted chunk as terminal
-        if self._prev_transition is not None:
+            result = self._emit_transition(done=True, terminal_reward=terminal_reward)
+        elif self._prev_transition is not None:
+            # Episode length was exact multiple of C — mark last staged chunk as terminal.
             self._prev_transition.done = torch.tensor(1.0)
-        return None
+            actual = int(self._prev_transition.actual_steps.item())
+            self._prev_transition.reward_seq[actual - 1] = terminal_reward
+        for transition in self._episode_staging:
+            self._buffer.add(transition)
+        self._episode_staging = []
+        return result
 
-    def _emit_transition(self, done: bool) -> ChunkTransition | None:
+    def _emit_transition(self, done: bool, terminal_reward: float = 0.0) -> ChunkTransition | None:
         if self._chunk_state is None or self._chunk_ref is None:
             self._frame_actions.clear()
             self._frame_sources.clear()
@@ -98,14 +118,14 @@ class RLTOnlineCollector:
             ref = exec_chunk.clone()
 
         state = self._chunk_state.cpu()
-        # TODO(online-rl): inject terminal success reward here before real-robot online RL
-        # is enabled. Currently this collector is unwired — flush_episode is never called
-        # from the recording loop. See docs/rlt/rlt_pipeline_review_20260415_1839.md S2-1.
+        reward_seq = torch.zeros(self._C)
+        if done and actual > 0:
+            reward_seq[actual - 1] = terminal_reward
         transition = ChunkTransition(
             state_vec=state,
             exec_chunk=exec_chunk,
             ref_chunk=ref,
-            reward_seq=torch.zeros(self._C),
+            reward_seq=reward_seq,
             next_state_vec=state,
             next_ref_chunk=ref,
             done=torch.tensor(float(done)),
@@ -120,7 +140,7 @@ class RLTOnlineCollector:
             self._prev_transition.next_state_vec = state.clone()
             self._prev_transition.next_ref_chunk = ref.clone()
 
-        self._buffer.add(transition)
+        self._episode_staging.append(transition)
         self._prev_transition = transition
 
         self._frame_actions.clear()

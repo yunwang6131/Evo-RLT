@@ -45,6 +45,16 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     actor_activation: str = "relu"
     actor_layer_norm: bool = False
     actor_residual: bool = False
+    # When True, actor predicts a residual delta added to the VLA reference
+    # chunk (mu = ref + delta) with the final layer zero-initialized, so an
+    # untrained actor starts out identical to the VLA reference. Used for
+    # online RL on real hardware where a randomly-initialized actor would
+    # otherwise be unsafe to run from step one.
+    actor_residual_to_ref: bool = False
+    # Optional safety clamp on the RL actor's per-step deviation from the VLA
+    # reference chunk while in the critical/RL phase. None disables clamping
+    # (existing deploy behavior). Only affects RLTActionModifier's RL branch.
+    actor_action_clip_delta: float | None = None
 
     # --- Critic + target ---
     critic_hidden_dim: int = 256

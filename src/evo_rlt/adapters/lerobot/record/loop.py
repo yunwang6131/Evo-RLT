@@ -809,10 +809,20 @@ def record_loop(
 
         if rlt_online_collector is not None:
             action_tensor = build_action_tensor(action_values)
+            # Peek (non-consuming): the most recent real VLA/RL-token encoding,
+            # possibly several frames old if human intervention is active (policy
+            # inference -- and therefore compute_chunk() -- is skipped while
+            # intervention is active, see the `not is_intervention` guard above).
+            # RLTOnlineCollector only actually uses this on its own chunk-start
+            # frame, so getting the same value across several frames is fine.
+            last_chunk_tensors = rlt.get_last_chunk_tensors() if rlt is not None else None
+            state_vec_for_collector, ref_chunk_for_collector = (
+                last_chunk_tensors if last_chunk_tensors is not None else (None, None)
+            )
             rlt_online_collector.on_frame(
                 action=action_tensor,
-                state_vec=None,
-                ref_chunk=None,
+                state_vec=state_vec_for_collector,
+                ref_chunk=ref_chunk_for_collector,
                 source_type=rlt_source,
                 is_critical=rlt_is_critical,
             )
