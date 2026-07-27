@@ -37,6 +37,13 @@ class RLTOnlineCollector:
         # buffer with dangling non-terminal transitions (no valid next_state,
         # no outcome label, possibly built from footage the user rejected).
         self._episode_staging: list[ChunkTransition] = []
+        # True once flush_episode() has fired for this "sub-episode" (one
+        # critical-phase attempt). The recorded dataset episode may continue
+        # past that point (e.g. VLA autonomously finishing a subsequent
+        # placement step) -- on_frame() ignores those later frames entirely
+        # so the RL reward reflects only what the actor actually controlled,
+        # not whatever happens afterward. Reset by the next start_episode().
+        self._flushed: bool = False
 
     def start_episode(self, episode_id: int) -> None:
         self._episode_id = episode_id
@@ -47,6 +54,7 @@ class RLTOnlineCollector:
         self._chunk_is_critical = 0.0
         self._prev_transition = None
         self._episode_staging = []
+        self._flushed = False
 
     def on_frame(
         self,
@@ -56,6 +64,8 @@ class RLTOnlineCollector:
         source_type: float,
         is_critical: float,
     ) -> ChunkTransition | None:
+        if self._flushed:
+            return None
         if len(self._frame_actions) == 0:
             # Capture state at chunk start. During intervention state_vec may be None;
             # fall back to the previous transition's state so human chunks are not dropped.
@@ -75,13 +85,18 @@ class RLTOnlineCollector:
         return None
 
     def flush_episode(self, episode_success: bool) -> ChunkTransition | None:
-        """Finalize the episode, marking the terminal transition done=1 and
-        writing the sparse binary reward (r=1 iff success, else 0) onto its
-        last valid timestep, matching the paper's terminal-reward-only setup.
-        Commits every transition staged this episode to the global replay
-        buffer -- call this ONLY for an episode that is being kept (has a
-        real outcome label); for a rerecorded/discarded episode, just don't
-        call it and let the next start_episode() drop the staged data.
+        """Finalize the critical-phase attempt, marking the terminal
+        transition done=1 and writing the sparse binary reward (r=1 iff
+        success, else 0) onto its last valid timestep, matching the paper's
+        terminal-reward-only setup. Commits every transition staged so far to
+        the global replay buffer, then ignores any further on_frame() calls
+        until the next start_episode() -- call this at the moment the
+        critical phase itself resolves (success/failure), not necessarily at
+        whole-episode end: the recorded episode may continue afterward (e.g.
+        VLA autonomously finishing a subsequent step), but that tail is
+        dataset-only and must not leak into the RL reward. For a
+        rerecorded/discarded/never-labeled attempt, just don't call this and
+        let the next start_episode() drop the staged data instead.
         """
         terminal_reward = 1.0 if episode_success else 0.0
         result: ChunkTransition | None = None
@@ -95,6 +110,7 @@ class RLTOnlineCollector:
         for transition in self._episode_staging:
             self._buffer.add(transition)
         self._episode_staging = []
+        self._flushed = True
         return result
 
     def _emit_transition(self, done: bool, terminal_reward: float = 0.0) -> ChunkTransition | None:

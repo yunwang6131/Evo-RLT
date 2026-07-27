@@ -98,15 +98,19 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         # physically reset the scene before the next episode's recording (and
         # possible autonomous critical-phase attempt) begins.
         f"--dataset.reset_time_s={args.reset_time_s}",
-        # Each episode is exactly one critical-phase segment: rlt_toggle_key
-        # starts RL phase, the next press (or double-tap) ends the episode
-        # and labels it -- reuses the same semantics as `evo-rlt-record
-        # collect --only-critical`.
+        # rlt_toggle_key starts the critical-phase attempt; the next press (or
+        # double-tap) ends JUST the critical phase (success/failure), hands
+        # control back to VLA, and flushes that reward into the online replay
+        # buffer right there (see loop.py) -- it does NOT end the recorded
+        # episode. The episode keeps recording (e.g. VLA autonomously
+        # finishing a subsequent step like placing the object) until you
+        # press the whole-episode outcome key (episode_success_key/
+        # episode_failure_key, s/f by default) once that's done.
         "--rlt.enable=true",
         f"--rlt.rl_phase_key={args.rlt_toggle_key}",
         f"--rlt.rl_phase_double_tap_window_s={args.double_tap_window_s}",
         "--rlt.skip_prefix_recording=true",
-        "--rlt.rl_phase_key_toggles_episode=true",
+        "--rlt.rl_phase_key_toggles_critical_phase=true",
         "--rlt.start_in_teleop=false",
         # v1 online training does not support the RTC runtime.
         "--rlt.rtc_enabled=false",
@@ -132,6 +136,8 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--online_rl.lr_critic={args.lr_critic}",
         f"--online_rl.save_dir={args.save_dir}",
         f"--online_rl.save_every_episodes={args.save_every_episodes}",
+        f"--online_rl.go_home_time_s={args.go_home_time_s}",
+        f"--online_rl.go_home_gripper_value={args.go_home_gripper_value}",
     ]
     if args.actor_action_clip_delta is not None:
         argv.append(f"--policy.actor_action_clip_delta={args.actor_action_clip_delta}")
@@ -163,14 +169,21 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
         "stay near the leader arm / power cutoff)"
     )
     print(
-        f"Controls: {args.rlt_toggle_key}=start/end RL critical segment (double-tap "
-        f"within {args.double_tap_window_s:.1f}s = failure), "
+        f"Controls: {args.rlt_toggle_key}=start/end critical-phase attempt (double-tap "
+        f"within {args.double_tap_window_s:.1f}s = failure; reward flushed immediately, "
+        "recording continues under VLA afterward), s/f=end the whole recorded episode "
+        "once VLA finishes, "
         f"{args.teleop_toggle_key} or {args.estop_key}=grab manual control"
+    )
+    print(
+        f"Go-home: {args.go_home_time_s}s ramp to the calibrated middle position "
+        f"(gripper -> {args.go_home_gripper_value}, verify this means 'open' for your "
+        "hardware) after each episode, before the reset window. 0 = disabled."
     )
     print(
         f"Reset window: {args.reset_time_s}s pure teleop after every episode "
         "(success or failure) before the next one starts -- use it to physically "
-        "reset the scene."
+        "reposition task objects (go-home does not move them)."
     )
 
 
@@ -182,8 +195,13 @@ def run_online_train(args: argparse.Namespace) -> None:
 
     setup = load_robot_setup(args.setup_json)
     paths = resolve_run_paths(setup.setup, args.dataset_tag, DEFAULT_DATASET_TAG)
-    configure_logging(paths.log_file, args.log_level)
-    remove_existing_dataset(paths.dataset_root)
+    # A dry run is intended to be a read-only configuration check.  In
+    # particular, do not delete a previous dataset or connect to/torque-check
+    # real motors, or create a log directory just to print the generated
+    # LeRobot argv.
+    if not args.dry_run:
+        configure_logging(paths.log_file, args.log_level)
+        remove_existing_dataset(paths.dataset_root)
     teleop_argv = build_teleop_argv(setup.leaders, no_teleop=False)
     if not teleop_argv:
         raise ValueError(
@@ -195,7 +213,7 @@ def run_online_train(args: argparse.Namespace) -> None:
     with TemporaryDirectory(prefix="online-train-") as cal_dir:
         stage_follower_calibrations(setup.followers, cal_dir)
         leader_cal_dir = stage_leader_calibrations(setup.leaders, teleop_argv)
-        if args.preflight:
+        if args.preflight and not args.dry_run:
             preflight_motor_connections(
                 setup.followers, setup.leaders, cal_dir,
                 leader_cal_dir.name if leader_cal_dir is not None else None,
@@ -341,6 +359,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-critic", type=float, default=1e-4)
     parser.add_argument("--save-dir", required=True)
     parser.add_argument("--save-every-episodes", type=int, default=5)
+    parser.add_argument(
+        "--go-home-time-s", type=float, default=3.0,
+        help="After each episode ends (s/f), ramp the follower back to the calibrated "
+        "middle position (all non-gripper joints = 0 degrees) over this many seconds, "
+        "before the teleop reset window. 0 disables this step.",
+    )
+    parser.add_argument(
+        "--go-home-gripper-value", type=float, default=100.0,
+        help="Gripper target (0-100) during go-home. VERIFY which end means 'open' for "
+        "your specific hardware (mounting-dependent) before relying on this.",
+    )
     return parser
 
 

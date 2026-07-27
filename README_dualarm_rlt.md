@@ -125,7 +125,7 @@ lerobot-edit-dataset \
   --operation.episode_indices "[174]"
 # 收集SFT之后的pi05_baseline
 
-evo-rlt-record full   --initial-source vla   --setup-json configs/my_so101_manifest.json   --policy-path pretrained/pi05_full_ft/pretrained_model   --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area."   --dataset-tag pi05_baseline_eval   --num-episodes 30   --episode-time-s 600   --reset-time-s 6   --fps 30   --vcodec h264
+evo-rlt-record full   --initial-source vla   --setup-json configs/my_so101_manifest.json   --policy-path pretrained/pi05_full_ft/pretrained_model   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area."   --dataset-tag pi05_baseline_eval   --num-episodes 30   --episode-time-s 600   --reset-time-s 6   --fps 30   --vcodec h264
 
 # 训练 RL Token, 用VLA full采集的数据
 python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerobot.scripts.lerobot_train import main; main()' \

@@ -491,6 +491,11 @@ def record_loop(
                 rlt.set_vla_mode()
             if critical_phase_tracker is not None and dataset is not None:
                 critical_phase_tracker.mark_failure(dataset.episode_buffer["size"])
+            if rlt_online_collector is not None:
+                # Reward the critical phase's OWN outcome, not whatever
+                # happens in the rest of the (still-recording) episode --
+                # see the matching comment in _resolve_pending_rl_phase_end.
+                rlt_online_collector.flush_episode(False)
             rl_phase_started = False
         pending_end_press_time = None
         log_say("failure", play_sounds=True)
@@ -546,6 +551,15 @@ def record_loop(
             rlt.set_vla_mode()
             if critical_phase_tracker is not None and dataset is not None:
                 critical_phase_tracker.mark_success(dataset.episode_buffer["size"])
+            if rlt_online_collector is not None:
+                # Flush the online replay buffer right here, at the moment
+                # the critical phase itself resolves -- NOT at whole-episode
+                # end. The episode keeps recording afterward (e.g. VLA
+                # autonomously finishing a subsequent placement step), but
+                # that tail is for the dataset only: RLTOnlineCollector stops
+                # accumulating once flushed (see its `_flushed` guard) so the
+                # RL reward reflects only what the actor actually controlled.
+                rlt_online_collector.flush_episode(True)
             rl_phase_started = False
         pending_end_press_time = None
         log_say("success", play_sounds=True)
@@ -572,6 +586,8 @@ def record_loop(
         if critical_phase_tracker is not None and dataset is not None:
             marker = critical_phase_tracker.mark_success if outcome == EPISODE_SUCCESS else critical_phase_tracker.mark_failure
             marker(dataset.episode_buffer["size"])
+        if rlt_online_collector is not None:
+            rlt_online_collector.flush_episode(outcome == EPISODE_SUCCESS)
         _release_active_intervention_after_phase_end()
         log_say(outcome, play_sounds=True)
         logging.info("RL phase ended (%s)", outcome)

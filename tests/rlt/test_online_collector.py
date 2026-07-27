@@ -134,3 +134,38 @@ class TestEpisodeStaging:
         collector.flush_episode(episode_success=True)
         # Only the retry's transition made it to the buffer.
         assert len(buffer) == 1
+
+
+class TestFlushedGuard:
+    """After flush_episode() (critical phase resolved), the recorded episode
+    may keep going (e.g. VLA autonomously finishing a subsequent step) --
+    on_frame() must ignore all of that so the RL reward reflects only what
+    the actor actually controlled, not whatever happens afterward."""
+
+    def test_on_frame_is_noop_after_flush(self):
+        collector, buffer = _make_collector()
+        for i in range(CHUNK_LENGTH - 1):
+            _feed_frame(collector, i)
+        collector.flush_episode(episode_success=True)
+        assert len(buffer) == 1
+
+        # Episode keeps recording under VLA afterward -- fed to on_frame as
+        # usual by loop.py, but must not affect the buffer at all.
+        for i in range(CHUNK_LENGTH * 3):
+            _feed_frame(collector, i % CHUNK_LENGTH)
+        assert len(buffer) == 1
+        assert collector._episode_staging == []
+
+    def test_next_start_episode_clears_flushed_guard(self):
+        collector, buffer = _make_collector()
+        for i in range(CHUNK_LENGTH - 1):
+            _feed_frame(collector, i)
+        collector.flush_episode(episode_success=True)
+        assert collector._flushed is True
+
+        collector.start_episode(episode_id=1)
+        assert collector._flushed is False
+        for i in range(CHUNK_LENGTH - 1):
+            _feed_frame(collector, i)
+        collector.flush_episode(episode_success=False)
+        assert len(buffer) == 2

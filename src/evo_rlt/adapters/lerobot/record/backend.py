@@ -260,13 +260,19 @@ class RLTRecordConfig:
 class OnlineRLConfig:
     """Synchronous online RL training on real hardware (RLT Algorithm 1).
 
-    Each recorded episode is one critical-phase segment (requires
-    rlt.rl_phase_key_toggles_episode=true, rlt.skip_prefix_recording=true).
-    After each episode's success/failure label is resolved, the terminal
-    transition is flushed into the replay buffer and
-    min(new_transitions_this_episode * utd_ratio, max_updates_per_episode)
-    gradient steps run on `policy` in-place before the next rollout episode --
-    no checkpoint save/reload between episodes.
+    Requires rlt.rl_phase_key_toggles_critical_phase=true (not
+    rl_phase_key_toggles_episode): the RL-phase key ends the critical-phase
+    ATTEMPT, not necessarily the whole recorded episode -- the dataset
+    episode may keep recording afterward (e.g. VLA autonomously finishing a
+    subsequent step), ended later by the usual episode-outcome keys. The
+    online replay buffer is flushed (see RLTOnlineCollector.flush_episode(),
+    called from loop.py at the exact moment the critical phase resolves) with
+    the CRITICAL PHASE's own success/failure -- not the whole episode's --
+    so the reward reflects only what the actor actually controlled. After
+    each recorded episode returns, min(new_transitions_this_cycle *
+    utd_ratio, max_updates_per_episode) gradient steps run on `policy` in
+    place before the next rollout episode -- no checkpoint save/reload
+    between episodes.
     """
 
     enable: bool = False
@@ -308,6 +314,18 @@ class OnlineRLConfig:
     # Directory to save periodic online-training checkpoints. Required when enable=true.
     save_dir: str | None = None
     save_every_episodes: int = 5
+    # After each recorded episode ends (s/f pressed), before the teleop reset
+    # window, smoothly ramp the follower back to the calibrated middle
+    # position (all non-gripper joints = 0 degrees -- exactly the pose set by
+    # hand during lerobot-calibrate's homing step) over this many seconds.
+    # 0 disables this step (robot stays wherever the episode left it).
+    go_home_time_s: float = 3.0
+    # Gripper target during go-home (0-100 range, no "middle" concept for an
+    # open/close range). VERIFY which end means "open" for your specific
+    # hardware (mounting-dependent, not fixed by lerobot) before relying on
+    # this -- sending the wrong direction closes the gripper instead of
+    # opening it.
+    go_home_gripper_value: float = 100.0
 
 
 @dataclass
@@ -507,10 +525,12 @@ class RecordConfig:
                     "`online_rl.enable=true` requires `enable_episode_outcome_labeling=true` "
                     "(episode success/failure is the sparse reward signal)."
                 )
-            if not self.rlt.rl_phase_key_toggles_episode or not self.rlt.skip_prefix_recording:
+            if not self.rlt.rl_phase_key_toggles_critical_phase or not self.rlt.skip_prefix_recording:
                 raise ValueError(
-                    "`online_rl.enable=true` requires `rlt.rl_phase_key_toggles_episode=true` and "
-                    "`rlt.skip_prefix_recording=true` (each episode is exactly one critical-phase segment)."
+                    "`online_rl.enable=true` requires `rlt.rl_phase_key_toggles_critical_phase=true` "
+                    "(the RL-phase key ends the critical-phase attempt and hands back to VLA, without "
+                    "ending the whole recorded episode) and `rlt.skip_prefix_recording=true` (frames "
+                    "before the first critical-phase entry are dropped)."
                 )
             if not self.online_rl.save_dir:
                 raise ValueError("`online_rl.enable=true` requires `online_rl.save_dir` to be set.")
@@ -548,6 +568,10 @@ class RecordConfig:
                 raise ValueError("`policy.actor_update_interval` must be > 0.")
             if self.policy.actor_action_clip_delta is not None and self.policy.actor_action_clip_delta < 0:
                 raise ValueError("`policy.actor_action_clip_delta` must be >= 0 when set.")
+            if self.online_rl.go_home_time_s < 0:
+                raise ValueError("`online_rl.go_home_time_s` must be >= 0.")
+            if not (0 <= self.online_rl.go_home_gripper_value <= 100):
+                raise ValueError("`online_rl.go_home_gripper_value` must be in [0, 100].")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -992,6 +1016,43 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 and (next_episode_needed or events["rerecord_episode"])
             )
 
+        def _run_go_home_if_needed() -> None:
+            """After the recorded episode ends (s/f pressed), before the
+            teleop reset window, smoothly ramp the follower back to the
+            calibrated middle position (see OnlineRLConfig.go_home_time_s).
+            Only resets the robot's OWN joint configuration -- it can't move
+            external task objects, which is what the teleop reset window
+            (if any) is still for."""
+            if not cfg.online_rl.enable or cfg.online_rl.go_home_time_s <= 0:
+                return
+            try:
+                import time as _time
+
+                from lerobot.utils.robot_utils import precise_sleep
+
+                start_action = robot.get_observation()
+                action_names = list(robot.action_features.keys())
+                home_action = {
+                    name: (
+                        cfg.online_rl.go_home_gripper_value
+                        if name.endswith("gripper.pos")
+                        else 0.0
+                    )
+                    for name in action_names
+                }
+                steps = max(1, round(cfg.online_rl.go_home_time_s * cfg.dataset.fps))
+                for i in range(1, steps + 1):
+                    step_t = _time.perf_counter()
+                    alpha = i / steps
+                    blended = {
+                        name: start_action[name] + (home_action[name] - start_action[name]) * alpha
+                        for name in action_names
+                    }
+                    robot.send_action(blended)
+                    precise_sleep(max(1 / cfg.dataset.fps - (_time.perf_counter() - step_t), 0.0))
+            except Exception:
+                logging.exception("Go-home ramp failed; leaving robot where the episode left it.")
+
         def _run_reset_loop_if_needed(recorded_episodes: int) -> None:
             if not _should_run_reset_loop(recorded_episodes):
                 return
@@ -1079,20 +1140,23 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             warmup_completed_at_episode = recorded_episodes
             return True
 
-        def _run_online_rl_update(
-            recorded_episodes: int, episode_success: str | None, buffer_total_added_before: int,
-        ) -> None:
-            """Flush the episode's terminal transition (sparse binary reward from
-            the success/failure label) into the replay buffer, then run gradient
-            steps scaled to how much data this episode actually added, in place
-            on `policy` -- the very next rollout episode uses the updated
-            weights directly, no checkpoint save/reload."""
-            if not cfg.online_rl.enable or episode_success is None:
+        def _run_online_rl_update(recorded_episodes: int, buffer_total_added_before: int) -> None:
+            """Run gradient steps scaled to how much data this cycle actually
+            added, in place on `policy` -- the very next rollout episode uses
+            the updated weights directly, no checkpoint save/reload.
+
+            flush_episode() itself already happened (if at all) inside
+            loop.py, at the moment the critical phase resolved -- NOT here,
+            and NOT keyed off the whole recorded episode's outcome label (see
+            OnlineRLConfig's docstring). This just checks whether that
+            happened (via the total_added delta) and, if so, trains."""
+            if not cfg.online_rl.enable:
                 return
-            online_collector.flush_episode(episode_success == "success")
             # total_added is monotonic (unlike len(), which stops growing once
             # the deque hits capacity and starts evicting) -- see ReplayBuffer.
             new_transitions = online_replay_buffer.total_added - buffer_total_added_before
+            if new_transitions == 0:
+                return  # no critical-phase attempt was flushed this cycle
 
             if not _warmup_satisfied(recorded_episodes):
                 successes, failures = online_replay_buffer.count_outcomes()
@@ -1280,7 +1344,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     None if events["rerecord_episode"] else _resolve_current_episode_success()
                 )
                 _notify_episode_outcome(episode_success)
-                _run_online_rl_update(recorded_episodes, episode_success, buffer_total_added_before)
+                _run_online_rl_update(recorded_episodes, buffer_total_added_before)
+                _run_go_home_if_needed()
                 _run_reset_loop_if_needed(recorded_episodes)
                 recorded_episodes = _finish_recorded_episode(recorded_episodes, episode_success)
                 _save_online_rl_latest_state(recorded_episodes)
