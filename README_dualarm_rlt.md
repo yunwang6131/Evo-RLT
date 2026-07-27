@@ -90,17 +90,39 @@ rm -rf ~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817
 ## 以下训练数据全部指向统一训练目录 data/bimanual,不是暂存区
 ls -td data/bimanual/*/record_teleop_full_*/
 
-# 合并 data/bimanual 下现在有的全部11个session，作为RL Token/transition cache用的demo数据集
-lerobot-edit-dataset \
-  --operation.type merge \
-  --operation.repo_ids "[local/rtf_0715_145644,local/rtf_0715_153343,local/rtf_0715_160721,local/rtf_0715_163740,local/rtf_0716_131809,local/rtf_0716_132534,local/rtf_0716_134459,local/rtf_0716_140211,local/rtf_0716_144858,local/rtf_0716_151749,local/rtf_0716_172817]" \
-  --operation.roots "[data/bimanual/0715_screw_demo_v1/record_teleop_full_145644,data/bimanual/0715_screw_demo_v1/record_teleop_full_153343,data/bimanual/0715_screw_demo_v1/record_teleop_full_160721,data/bimanual/0715_screw_demo_v1/record_teleop_full_163740,data/bimanual/0716_screw_demo_v1/record_teleop_full_131809,data/bimanual/0716_screw_demo_v1/record_teleop_full_132534,data/bimanual/0716_screw_demo_v1/record_teleop_full_134459,data/bimanual/0716_screw_demo_v1/record_teleop_full_140211,data/bimanual/0716_screw_demo_v1/record_teleop_full_144858,data/bimanual/0716_screw_demo_v1/record_teleop_full_151749,data/bimanual/0716_screw_demo_v1/record_teleop_full_172817]" \
-  --new_repo_id local/merged_screw_v1 \
-  --new_root data/bimanual/merged_screw_v1
+# 合并 data/bimanual 下现在有的全部12个session数据集
+# 使用仓库内脚本保留独立MP4，绕过LeRobot v0.5.1跨session拼接时的重复DTS错误
+python -m evo_rlt.cli.merge_lerobot_datasets \
+  --input-parent data/bimanual/0724_screw_demo_v1 \
+  --output-repo-id local/merged_screw_v1 \
+  --output-root data/bimanual/merged_screw_v1 \
+  --repo-id-prefix local/rtf_0724_ \
+  --overwrite
 
 # 核对合并后的总episode数
 jq '{total_episodes, total_frames}' data/bimanual/merged_screw_v1/meta/info.json
 
+# 检查回放合并后的数据
+conda activate evo-rlt
+
+lerobot-dataset-viz \
+  --root data/bimanual/merged_screw_v1 \
+  --repo-id local/merged_screw_v1 \
+  --episode-index 0 \
+  --mode local \
+  --display-compressed-images
+有问题的episode
+
+# 删除指定episode
+conda activate evo-rlt
+
+lerobot-edit-dataset \
+  --repo_id local/merged_screw_v1 \
+  --root data/bimanual/merged_screw_v1 \
+  --new_repo_id local/merged_screw_v1 \
+  --new_root data/bimanual/merged_screw_v1 \
+  --operation.type delete_episodes \
+  --operation.episode_indices "[174]"
 # 收集SFT之后的pi05_baseline
 
 evo-rlt-record full   --initial-source vla   --setup-json configs/my_so101_manifest.json   --policy-path pretrained/pi05_full_ft/pretrained_model   --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area."   --dataset-tag pi05_baseline_eval   --num-episodes 30   --episode-time-s 600   --reset-time-s 6   --fps 30   --vcodec h264
@@ -230,3 +252,7 @@ python diagnostics/check_config_consistency.py \
 
 # 整体流程
 从采集数据VLA开始，然后pi05微调，微调VLA之后再RL token，然后用SFT的VLA采集full里面有成功失败和认为干预的，然后transition cache,然后actor critic，然后用得到的模型采集Critical 片段，然后用这个片段制成数据集，然后累加之前的数据transition cache,然后在之前的checkpoint上actor critic。然后把最后这几个采集到actor_critic的重复几遍
+
+# new task
+Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area.
+
