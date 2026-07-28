@@ -65,18 +65,32 @@ class RemoteOnlineRLSession:
         *,
         base_url: str,
         auth_token: str | None = None,
-        timeout_s: float = 30.0,
+        # The first /predict call on a freshly started server pays for CUDA
+        # context init + loading the VLA/RL-token backbones + the first (slow,
+        # uncompiled) forward pass, which can easily take well over 30s -- a
+        # short timeout here reads as a hang/dead-server when the service is
+        # actually just cold-starting. Later calls are much faster (see
+        # RLTActionModifier's action queue), so this is a one-time cost, not
+        # the steady-state per-frame latency.
+        timeout_s: float = 120.0,
         jpeg_quality: int = 90,
     ):
         self.base_url = base_url.rstrip("/")
         self.auth_token = auth_token
         self.timeout_s = timeout_s
         self.jpeg_quality = jpeg_quality
-        # Only `.device`/`.use_amp` are ever read locally (loop.py, to build a
+        # `.device`/`.use_amp` are read locally (loop.py, to build a
         # torch.device passed into _predict_policy_action_with_acp_inference)
         # -- the remote branch there (see hil.py) returns before touching
         # either, so these values are never actually used for compute.
-        self.config = SimpleNamespace(device="cpu", use_amp=False)
+        # `.input_features={}` makes record_loop()'s _validate_policy_image_
+        # features() a no-op (it only checks non-empty policy_image_keys):
+        # this session doesn't know the VLA's real camera-key schema without
+        # an extra round trip, so that local early-friendly-error check is
+        # skipped in remote mode -- a camera-name mismatch would instead
+        # surface later as a less friendly error from the actual VLA forward
+        # pass on the server.
+        self.config = SimpleNamespace(device="cpu", use_amp=False, input_features={})
         self._last_chunk_tensors: tuple[torch.Tensor, torch.Tensor] | None = None
         self._last_step_metadata: _RemoteStepMetadata | None = None
 
@@ -133,11 +147,23 @@ class RemoteOnlineRLSession:
         )
         return action
 
-    def set_rl_mode(self) -> None:
-        self._post("/policy/set_rl_mode", {})
+    def __getattr__(self, name: str):
+        """Forward any other zero-arg, no-return policy method (`set_rl_mode`,
+        `reset`, `set_vla_mode`, `trigger_critical_phase`, `interrupt_chunk`,
+        ...) to the server's real `ChunkACPolicy`/`RLTActionModifier` via one
+        generic endpoint, instead of hand-listing (and inevitably missing) one
+        HTTP method per policy method here. Only reached for names Python
+        didn't already find as a real attribute/method on this class -- never
+        intercepts dunders or `_`-prefixed names, so debugger/pickling/repr
+        probes and genuine typos still raise AttributeError normally.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
 
-    def reset(self) -> None:
-        self._post("/policy/reset", {})
+        def _call() -> None:
+            self._post("/policy/call", {"method": name})
+
+        return _call
 
     def get_last_chunk_tensors(self) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Peek (non-consuming), matching RLTActionModifier.get_last_chunk_tensors():

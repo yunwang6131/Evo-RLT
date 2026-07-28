@@ -113,3 +113,4 @@ python diagnostics/check_config_consistency.py \
 --stratified-sampling（默认开）   训练batch按成功/失败/人工干预/最近数据分层采样
 --gamma/--beta/--tau/--actor-update-interval   TD3+BC超参，跟离线训练那套一样
 ```
+export TORCHDYNAMO_DISABLE=1

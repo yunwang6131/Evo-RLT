@@ -341,6 +341,12 @@ class OnlineRLConfig:
     # only allows the robot host to reach it regardless -- this token is not a
     # substitute for network-level access control.
     remote_token: str | None = None
+    # HTTP request timeout for every call to `remote_server`. The first
+    # /predict call on a freshly started server pays for CUDA init + loading
+    # the VLA/RL-token backbones + an uncompiled first forward pass, which can
+    # take well over the default -- raise this if warmup times out even
+    # though the server is up (check its own logs/`GET /health` first).
+    remote_timeout_s: float = 120.0
 
 
 @dataclass
@@ -658,6 +664,19 @@ def _write_schema_metadata(
     write_info(dataset.meta.info, dataset.root)
 
 
+class _NullProcessor:
+    """No-op stand-in for `preprocessor`/`postprocessor` in remote mode
+    (see `online_rl.remote_server`): the real pre/post-processing pipelines
+    never run locally there (see hil.py's remote branch), but record_loop()
+    unconditionally calls `.reset()` on both at the start of every episode
+    and on every intervention release, whenever policy/preprocessor/
+    postprocessor are all non-None -- so they must be truthy AND provide a
+    working `.reset()`."""
+
+    def reset(self) -> None:
+        return None
+
+
 def _configure_rlt_record_policy(policy, cfg: RecordConfig) -> None:
     from evo_rlt.adapters.lerobot.policies.modeling_rlt_ac import ChunkACPolicy
 
@@ -803,16 +822,22 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             from evo_rlt.adapters.lerobot.serve.remote_client import RemoteOnlineRLSession
 
             policy = RemoteOnlineRLSession(
-                base_url=cfg.online_rl.remote_server, auth_token=cfg.online_rl.remote_token
+                base_url=cfg.online_rl.remote_server,
+                auth_token=cfg.online_rl.remote_token,
+                timeout_s=cfg.online_rl.remote_timeout_s,
             )
             online_trainer = policy
             online_collector = policy
             # Non-None placeholders only: _predict_policy_action_with_acp_inference's
             # remote branch (see hil.py) returns before ever touching these, but
-            # _warmup_rlt_path()'s `preprocessor is not None and postprocessor is
-            # not None` guard below needs them truthy to still prime the RL path.
-            preprocessor = object()
-            postprocessor = object()
+            # record_loop() unconditionally calls preprocessor.reset()/postprocessor.
+            # reset() at the start of every episode (and again on every intervention
+            # release) whenever policy/preprocessor/postprocessor are all non-None --
+            # a bare object() has no .reset() and would crash there. _warmup_rlt_
+            # path()'s similar `is not None` guard also needs them truthy to still
+            # prime the RL path.
+            preprocessor = _NullProcessor()
+            postprocessor = _NullProcessor()
         else:
             # Load pretrained policy
             policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)

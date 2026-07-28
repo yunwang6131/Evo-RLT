@@ -43,6 +43,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from evo_rlt.adapters.lerobot.policies.configuration_rlt_ac import ChunkACPolicyConfig  # noqa: E402
+from evo_rlt.adapters.lerobot.policies.modeling_rlt_ac import ChunkACPolicy  # noqa: E402
 from evo_rlt.adapters.lerobot.record.backend import OnlineRLConfig  # noqa: E402
 from evo_rlt.adapters.lerobot.record.hil import (  # noqa: E402
     ACPInferenceConfig,
@@ -50,7 +51,7 @@ from evo_rlt.adapters.lerobot.record.hil import (  # noqa: E402
 )
 from evo_rlt.adapters.lerobot.record.online_trainer import OnlineRLTrainer  # noqa: E402
 from evo_rlt.adapters.lerobot.serve.codec import decode_observation_frame, decode_tensor, encode_tensor  # noqa: E402
-from lerobot.policies.factory import make_policy, make_pre_post_processors  # noqa: E402
+from lerobot.policies.factory import make_pre_post_processors  # noqa: E402
 from lerobot.utils.device_utils import get_safe_torch_device  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,13 @@ logger = logging.getLogger(__name__)
 class OnlineRLService:
     def __init__(self, *, policy_cfg: ChunkACPolicyConfig, online_rl_cfg: OnlineRLConfig, vla_ref: bool = True):
         self.policy_cfg = policy_cfg
-        self.policy = make_policy(policy_cfg, ds_meta=None)
+        # This service has neither dataset metadata nor a simulation EnvConfig.
+        # LeRobot's make_policy() requires exactly one of those, even though
+        # ChunkACPolicyConfig already carries all state/action feature shapes.
+        # Construct the policy directly so remote online inference does not
+        # fail before startup with the factory's ds_meta/env_cfg validation.
+        policy_cfg.validate_features()
+        self.policy = ChunkACPolicy(policy_cfg).to(policy_cfg.device)
         self.policy.vla_ref = vla_ref
         if hasattr(self.policy, "set_rl_mode"):
             self.policy.set_rl_mode()
@@ -116,16 +123,26 @@ class OnlineRLService:
             "source_type": step_metadata.source_type if step_metadata is not None else None,
         }
 
-    def set_rl_mode(self) -> dict[str, Any]:
-        with self._lock:
-            if hasattr(self.policy, "set_rl_mode"):
-                self.policy.set_rl_mode()
-        return {"ok": True}
+    # Zero-arg, no-return ChunkACPolicy/RLTActionModifier methods the local
+    # HIL loop (see loop.py) calls on `rlt = policy` at various key-press
+    # transitions -- allowlisted (rather than a blind getattr(self.policy,
+    # name)()) so this network-facing endpoint can't be used to invoke
+    # arbitrary policy methods (e.g. save_pretrained, to, train) even if
+    # network isolation is ever misconfigured. Add a name here if a future
+    # evo_rlt version calls a new one on `rlt` and the client's generic
+    # __getattr__ forward (see remote_client.py) starts hitting "unknown
+    # method" for it.
+    _ALLOWED_POLICY_METHODS = frozenset(
+        {"set_rl_mode", "reset", "set_vla_mode", "trigger_critical_phase", "interrupt_chunk"}
+    )
 
-    def reset(self) -> dict[str, Any]:
+    def call_policy_method(self, payload: dict[str, Any]) -> dict[str, Any]:
+        method = payload["method"]
+        if method not in self._ALLOWED_POLICY_METHODS:
+            raise ValueError(f"Policy method {method!r} is not allowlisted for remote calls.")
         with self._lock:
-            if hasattr(self.policy, "reset"):
-                self.policy.reset()
+            if hasattr(self.policy, method):
+                getattr(self.policy, method)()
         return {"ok": True}
 
     def episode_start(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -175,8 +192,7 @@ class OnlineRLService:
 
 _POST_ROUTES = {
     "/predict": OnlineRLService.predict,
-    "/policy/set_rl_mode": lambda service, payload: service.set_rl_mode(),
-    "/policy/reset": lambda service, payload: service.reset(),
+    "/policy/call": OnlineRLService.call_policy_method,
     "/episode/start": OnlineRLService.episode_start,
     "/episode/frame": OnlineRLService.episode_frame,
     "/episode/flush": OnlineRLService.episode_flush,

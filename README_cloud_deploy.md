@@ -20,15 +20,13 @@ python runing_service/rlt_ac/online_serve.py \
 ```bash
 evo-rlt-online-train \
   --setup-json configs/my_so101_manifest.json \
-  --vla-path pretrained/pi05_full_ft/pretrained_model \
-  --rl-token-path outputs/pin_insert_rl_token/checkpoints/last/pretrained_model \
-  --tokenizer-path /path/to/paligemma-3b-pt-224/snapshots/xxx \
-  --task "..." \
+  --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 5 \
   --actor-action-clip-delta 0.05 \
   --save-dir outputs/pin_insert_online_rl \
-  --remote-server http://127.0.0.1:8600 \
-  --remote-token "<与云端 --auth-token 相同>"
+  --remote-server http://192.168.3.71:8600
 ```
 
-其余超参两边同名参数必须一致（`--gamma` `--beta` `--tau` `--utd-ratio` `--warmup-episodes` `--lr-actor` `--lr-critic` `--actor-hidden-dim` 等）。按键逻辑、go-home、reset 窗口见 [README_online.md](README_online.md)，不变。
+`--vla-path`/`--rl-token-path`/`--tokenizer-path` 在 `--remote-server` 模式下不再必填——本机不会加载这些文件，云端 `online_serve.py` 那边填了就够。
+
+其余超参两边同名参数必须一致[README_online.md](README_online.md)，不变。
