@@ -25,6 +25,7 @@ evo-rlt-online-train \
   --num-episodes 5 \
   --actor-action-clip-delta 0.05 \
   --go-home-time-s 0 \
+  --intervention-blend-time-s 1.0  \
   --save-dir outputs/pin_insert_online_rl \
   --remote-server http://192.168.3.71:8600
 ```

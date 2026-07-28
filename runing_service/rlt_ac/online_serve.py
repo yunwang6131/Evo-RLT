@@ -45,6 +45,7 @@ if str(SRC_DIR) not in sys.path:
 from evo_rlt.adapters.lerobot.policies.configuration_rlt_ac import ChunkACPolicyConfig  # noqa: E402
 from evo_rlt.adapters.lerobot.policies.modeling_rlt_ac import ChunkACPolicy  # noqa: E402
 from evo_rlt.adapters.lerobot.record.backend import OnlineRLConfig  # noqa: E402
+from evo_rlt.adapters.lerobot.record.common import load_dataset_stats_from_pretrained  # noqa: E402
 from evo_rlt.adapters.lerobot.record.hil import (  # noqa: E402
     ACPInferenceConfig,
     _predict_policy_action_with_acp_inference,
@@ -70,10 +71,17 @@ class OnlineRLService:
         self.policy.vla_ref = vla_ref
         if hasattr(self.policy, "set_rl_mode"):
             self.policy.set_rl_mode()
+        # Fresh rlt_ac policy, no dataset at all here -- load the REAL
+        # normalization the frozen VLA was actually trained with from its own
+        # checkpoint (policy_preprocessor.json + *_normalizer_processor.
+        # safetensors), instead of leaving state/action un-normalized. See
+        # load_dataset_stats_from_pretrained()'s docstring: without this the
+        # VLA reads as "acting randomly" even with zero RL/actor involvement.
+        dataset_stats = load_dataset_stats_from_pretrained(policy_cfg.vla_pretrained_path)
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             policy_cfg=policy_cfg,
             pretrained_path=None,
-            dataset_stats=None,
+            dataset_stats=dataset_stats,
             preprocessor_overrides={"device_processor": {"device": policy_cfg.device}},
         )
         self.trainer = OnlineRLTrainer(self.policy, online_rl_cfg, policy_cfg)

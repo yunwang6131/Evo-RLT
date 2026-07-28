@@ -41,14 +41,14 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
 ```bash
 evo-rlt-online-train \
   --setup-json configs/my_so101_manifest.json \
-  --vla-path pretrained/pi05_full_ft/pretrained_model \
-  --rl-token-path outputs/pin_insert_rl_token/checkpoints/last/pretrained_model \
+  --vla-path /home/wangyun/Evo-RLT/pretrained/pretrained_model \
+  --rl-token-path outputs/pin_insert_rl_token/checkpoints/010000/pretrained_model \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 5 \
   --actor-action-clip-delta 0.05 \
   --save-dir outputs/pin_insert_online_rl \
-  --save-every-episodes 5 \
+  --save-every-episodes 5
 ```
 
 --actor-action-clip-delta 用来限制 RLT Actor 输出相对于 VLA 参考动作的最大偏移

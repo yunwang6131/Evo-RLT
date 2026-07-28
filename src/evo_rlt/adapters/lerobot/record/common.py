@@ -390,6 +390,55 @@ def preflight_motor_connections(
         disconnect(teleop)
 
 
+def load_dataset_stats_from_pretrained(pretrained_path: str | Path) -> dict[str, dict[str, Any]] | None:
+    """Load the (feature -> {stat_name: tensor}) dataset_stats dict bundled
+    with a saved lerobot policy checkpoint's own preprocessor pipeline --
+    i.e. the normalization the model was actually TRAINED with.
+
+    For online RL (rlt_ac), the outer ChunkACPolicy wrapper is built fresh
+    every session (no --policy.path of its own) against a brand-new,
+    zero-episode dataset, so `make_pre_post_processors()`'s usual
+    `dataset_stats` source (the recording dataset's own stats) is always
+    empty. Without this, the frozen VLA -- which DOES expect properly
+    normalized state/action, per its own saved
+    `policy_preprocessor.json`/`*_normalizer_processor.safetensors` -- ends
+    up fed effectively un-normalized (or default-normalized) observations
+    despite loading the right weights, which reads as the VLA "acting
+    randomly" even outside any RL involvement. This loads that checkpoint's
+    real stats so they can be passed through instead.
+
+    Returns None if the checkpoint has no normalizer_processor step (e.g. a
+    non-lerobot-standard checkpoint, or one saved without normalization).
+    """
+    from safetensors.torch import load_file
+
+    pretrained_path = Path(pretrained_path)
+    preprocessor_json = pretrained_path / "policy_preprocessor.json"
+    if not preprocessor_json.is_file():
+        return None
+    with open(preprocessor_json) as fh:
+        spec = json.load(fh)
+    state_file = next(
+        (
+            step.get("state_file")
+            for step in spec.get("steps", [])
+            if step.get("registry_name") == "normalizer_processor"
+        ),
+        None,
+    )
+    if not state_file:
+        return None
+    flat = load_file(str(pretrained_path / state_file))
+    stats: dict[str, dict[str, Any]] = {}
+    for key, tensor in flat.items():
+        # Feature names themselves contain dots (observation.state,
+        # observation.images.left_wrist); stat names (mean/std/min/max/
+        # q01.../q99) never do, so the LAST dot always separates them.
+        feature_name, stat_name = key.rsplit(".", 1)
+        stats.setdefault(feature_name, {})[stat_name] = tensor
+    return stats
+
+
 def set_offline_env() -> None:
     os.environ["HF_HUB_OFFLINE"] = "1"
     _quiet_video_encoder_logs()

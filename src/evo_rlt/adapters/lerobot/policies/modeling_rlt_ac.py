@@ -19,6 +19,7 @@ from lerobot.policies.rtc.latency_tracker import LatencyTracker
 from evo_rlt.adapters.lerobot.policies.action_modifier import PrefixOutputCapture, RLTActionModifier
 from evo_rlt.adapters.lerobot.policies.configuration_rlt_ac import ChunkACPolicyConfig
 from evo_rlt.adapters.lerobot.policies.configuration_rlt_token import RLTokenPolicyConfig
+from lerobot.configs.policies import PreTrainedConfig
 from evo_rlt.adapters.lerobot.policies.modeling_rlt_token import RLTokenPolicy
 from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.critic import TwinCritic
@@ -134,7 +135,18 @@ class ChunkACPolicy(PreTrainedPolicy):
         # setting and resurrects the checkpoint's stale path. Besides failing
         # after checkpoints are copied between machines, this can make the
         # robot run a different VLA from the one supplied with --vla-path.
-        rl_token_cfg = RLTokenPolicyConfig.from_pretrained(self.config.rl_token_pretrained_path)
+        # Saved LeRobot policy configs contain a top-level ``type`` discriminator.
+        # Load through the base-class registry so draccus consumes that field and
+        # dispatches to RLTokenPolicyConfig.  Calling the concrete subclass loader
+        # directly makes ``type`` look like an unknown dataclass field on LeRobot
+        # 0.5.1.
+        rl_token_cfg = PreTrainedConfig.from_pretrained(self.config.rl_token_pretrained_path)
+        if not isinstance(rl_token_cfg, RLTokenPolicyConfig):
+            raise TypeError(
+                "Expected an rlt_token checkpoint at "
+                f"{self.config.rl_token_pretrained_path!r}, got config type "
+                f"{type(rl_token_cfg).__name__}."
+            )
         rl_token_cfg.vla_pretrained_path = self.config.vla_pretrained_path
         rl_token_cfg.vla_dtype = self.config.vla_dtype
         rl_token_cfg.device = self.config.device

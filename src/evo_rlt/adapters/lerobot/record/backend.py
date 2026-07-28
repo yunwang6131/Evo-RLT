@@ -100,6 +100,7 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
     unitree_g1 as unitree_g1_robot,
 )
+from evo_rlt.adapters.lerobot.record.common import load_dataset_stats_from_pretrained
 from evo_rlt.adapters.lerobot.record.hil import (
     ACPInferenceConfig,
     PolicySyncDualArmExecutor,
@@ -856,10 +857,21 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             if cfg.acp_inference.enable and cfg.policy is None:
                 raise ValueError("`acp_inference.enable=true` requires `policy` to be set.")
             if cfg.policy is not None:
+                dataset_stats = rename_stats(dataset.meta.stats, cfg.dataset.rename_map)
+                if not dataset_stats and getattr(cfg.policy, "vla_pretrained_path", None):
+                    # Fresh rlt_ac policy (online RL): no --policy.path checkpoint
+                    # of its own, and this dataset has zero episodes, so the
+                    # usual dataset_stats source is empty -- fall back to the
+                    # REAL normalization the frozen VLA was actually trained
+                    # with, from its own checkpoint. See
+                    # load_dataset_stats_from_pretrained()'s docstring for why
+                    # this matters (un-normalized state/action reads as the
+                    # VLA "acting randomly").
+                    dataset_stats = load_dataset_stats_from_pretrained(cfg.policy.vla_pretrained_path)
                 preprocessor, postprocessor = make_pre_post_processors(
                     policy_cfg=cfg.policy,
                     pretrained_path=cfg.policy.pretrained_path,
-                    dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
+                    dataset_stats=dataset_stats,
                     preprocessor_overrides={
                         "device_processor": {"device": cfg.policy.device},
                         "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
@@ -961,6 +973,40 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 robot_type=robot.robot_type,
                 acp_inference=cfg.acp_inference,
             )
+            # Warming up the RL path deliberately primes the actor's compute
+            # path once (see set_rl_mode() above) -- but nothing sent a robot
+            # action while doing so, and _reset_policy_for_episode() below is
+            # relied on to leave the policy back in VLA phase before the first
+            # real episode starts. Don't rely on that alone: explicitly force
+            # VLA mode back here too, so a bug/edge case in reset()'s phase
+            # handling can't leave a session starting in critical phase with
+            # no r ever pressed.
+            if hasattr(policy, "set_vla_mode"):
+                policy.set_vla_mode()
+            if hasattr(policy, "pop_step_metadata"):
+                # Don't just trust set_vla_mode() succeeded silently -- run one
+                # more prediction and directly read back the phase it actually
+                # computed under, so a bug here is impossible to misread (this
+                # log line either says phase=0.0 or it says phase=1.0, no
+                # inference required from downstream RLT_ACTOR prints).
+                _predict_policy_action_with_acp_inference(
+                    observation_frame=warmup_frame,
+                    policy=policy,
+                    device=get_safe_torch_device(policy.config.device),
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=policy.config.use_amp,
+                    task=cfg.dataset.single_task,
+                    robot_type=robot.robot_type,
+                    acp_inference=cfg.acp_inference,
+                )
+                confirm_meta = policy.pop_step_metadata()
+                if confirm_meta is not None:
+                    logging.info(
+                        "Post-warmup phase check: phase=%s (0.0=VLA, 1.0=critical) source=%s "
+                        "(should be 0.0/0.0 here -- if not, VLA mode is not taking effect)",
+                        confirm_meta.phase, confirm_meta.source_type,
+                    )
             log_say("Ready", cfg.play_sounds)
 
         def _start_episode_trackers() -> None:
@@ -972,6 +1018,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         def _reset_policy_for_episode() -> None:
             if policy is not None and hasattr(policy, "set_rl_mode"):
                 policy.reset()
+                # reset() already resets the phase controller to VLA (for
+                # phase_mode="manual", see ChunkACPolicy.reset()) -- this is
+                # a belt-and-suspenders explicit call on top, not a
+                # workaround for a known bug there. Every episode must start
+                # in VLA phase regardless of how the previous one ended.
+                if hasattr(policy, "set_vla_mode"):
+                    policy.set_vla_mode()
 
         def _record_episode() -> None:
             record_loop(
