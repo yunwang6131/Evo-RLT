@@ -204,7 +204,7 @@ evo-rlt-record full \
   --vla-path pretrained/pi05_full_ft/pretrained_model \
   --rl-token-path outputs/bimanual_rl_token/checkpoints/last/pretrained_model \
   --phase-mode always_rl \
-  --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area." \
+  --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --dataset-tag rlt_always_rl_eval \
   --num-episodes 20 \
   --episode-time-s 3000 \

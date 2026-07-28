@@ -14,18 +14,18 @@ task = "Pick up the black hexagonal part with the right arm, pull the gray pin o
 
 ```bash
 python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerobot.scripts.lerobot_train import main; main()' \
-  --dataset.repo_id=local/merged_pin_insert \
-  --dataset.root=data/bimanual/merged_pin_insert \
+  --dataset.repo_id=local/merged_screw_v1 \
+  --dataset.root=data/bimanual/merged_screw_v1 \
   --policy.type=rlt_token \
   --policy.repo_id=local/pin_insert_rlt_token \
   --policy.push_to_hub=false \
-  --policy.vla_pretrained_path=outputs/pin_insert_vla_ft/checkpoints/last/pretrained_model \
+  --policy.vla_pretrained_path=pretrained/pi05_full_ft/pretrained_model \
   --policy.vla_dtype=bfloat16 \
   --policy.rl_token_num_rl_tokens=1 \
   --policy.tokenizer_path=/home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --policy.token_pool_size=0 \
   --policy.device=cuda \
-  --batch_size=8 \
+  --batch_size=2 \
   --steps=10000 \
   --save_freq=2000 \
   --eval_freq=0 \
@@ -41,7 +41,7 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
 ```bash
 evo-rlt-online-train \
   --setup-json configs/my_so101_manifest.json \
-  --vla-path outputs/pin_insert_vla_ft/checkpoints/last/pretrained_model \
+  --vla-path pretrained/pi05_full_ft/pretrained_model \
   --rl-token-path outputs/pin_insert_rl_token/checkpoints/last/pretrained_model \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
@@ -49,7 +49,6 @@ evo-rlt-online-train \
   --actor-action-clip-delta 0.05 \
   --save-dir outputs/pin_insert_online_rl \
   --save-every-episodes 5 \
-  --dry-run   # 先跑一遍dry-run确认拼出来的argv和按键提示没问题，再去掉这行真跑
 ```
 
 --actor-action-clip-delta 用来限制 RLT Actor 输出相对于 VLA 参考动作的最大偏移
@@ -61,32 +60,31 @@ evo-rlt-online-train \
 r：进入/退出critical phase（单击=success，double-tap-window-s窗口内双击=failure）——
    只结束critical phase，不结束整个episode，reward就在这一刻写进replay buffer，
    之后自动切回VLA继续跑（比如把组装好的东西放到指定区域），这段VLA跑的不算训练数据
-s / f：整个episode真正结束（等VLA把后续动作做完、你确认整体OK了再按）
-space（或 -i）：teleop 接管（leader backdrive）
-x（estop-key）：强制接管，效果同上，多一个热键保险
+s / f：整个episode真正结束（等VLA把后续动作做完、确认整体OK了再按）
+space（或 -i）：teleop 接管
+  按r（第1次）→ 进入critical phase，actor开始控制
+    ↓（这期间可以按0次、1次或多次space）
+    按space → intervention开始，你用leader臂直接接管，actor被打断
+    再按space → intervention结束，如果critical phase还没结束，actor自动恢复接管
+    ↓（可以反复intervene任意次）
+  按r（第2次，0.6s确认窗口内不再按）→ critical phase结束，判定success，
+    reward在这一刻写进replay buffer；如果0.6s内又按了一次r，判定failure
+    ↓
+  VLA自动接管，继续做后面的步骤
+    ↓
+  按s或f → 整个episode真正结束
+备用x：强制接管，效果同上，多一个热键保险
 ```
 
 episode结束（按s/f）后依次发生两件事：
 
-1. **go-home**（`--go-home-time-s`秒，默认3）：机械臂自动ramp回标定时手动摆的那个"中间位置"（非夹爪关节角度归0，正好等于`lerobot-calibrate`时你按ENTER那一刻的姿态）。夹爪归到`--go-home-gripper-value`（默认100，**务必先确认这个值在你的硬件上是"松开"不是"夹紧"**，方向由夹爪安装朝向决定，不是lerobot固定的）。这一步只能复位机械臂自己，摆不动六边形件/销子/平台这些外部物件。
-2. **teleop reset窗口**（`--reset-time-s`秒，默认15）：纯teleop，VLA/RL都不发动作，只有leader臂能控制follower，用来手动把物件摆回去。
+1. **go-home**（`--go-home-time-s`秒，默认3）：机械臂自动ramp回标定时手动摆的那个"中间位置"夹爪归到`--go-home-gripper-value`
+2. **teleop reset窗口**（`--reset-time-s`秒，默认15）：纯teleop，用来手动把物件摆回去。
 
 这两段时间都不计入数据/replay buffer。`--go-home-time-s 0`可以关掉第一步。
 
-## 安全须知
 
-- `estop-key`/`space` 不是硬件急停，只是让policy停止发新动作、交还给leader臂，不断电。手一直放在leader臂附近，物理断电开关在触手可及的地方。
-- v1 不支持 RTC（`--rlt.rtc_enabled` 强制关闭）、不支持异步rollout/训练。
-- Human intervention期间VLA/RLT推理是关掉的（省算力），所以state/ref用的是intervention开始前最近一次真实编码，不是intervention那一刻的实时编码；intervention拖得越久这个近似越粗糙。
-
-## Checkpoint
-
-- `--save-dir/step_NNNNNN/`：每`--save-every-episodes`存一次完整policy权重（actor/critic/target_critic），跟平时部署用的checkpoint格式一样。
-- `--save-dir/latest_online_state.pt`：**每个episode**都原子写入一次，是一个内部一致的完整快照——actor/critic/target_critic权重、optimizer state（分开存）、完整replay buffer、已完成episode数、RNG状态全在一起（不是只存optimizer/buffer，那样会跟每5个episode才存一次的权重错位、没法配对复原）。
-- 注意：现在只做到"存"，没有`--resume-checkpoint`这种直接加载`latest_online_state.pt`接着跑的入口，真要断点续训得手动写脚本加载。
-## 诊断
-
-跟离线训练共用同一套诊断脚本：
+## 跑前检查
 
 ```bash
 python diagnostics/check_config_consistency.py \

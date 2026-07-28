@@ -141,13 +141,27 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
     ]
     if args.actor_action_clip_delta is not None:
         argv.append(f"--policy.actor_action_clip_delta={args.actor_action_clip_delta}")
+    if args.remote_server:
+        argv.append(f"--online_rl.remote_server={args.remote_server}")
+        if args.remote_token:
+            argv.append(f"--online_rl.remote_token={args.remote_token}")
     return argv
 
 
 def print_online_train_summary(args: argparse.Namespace, paths) -> None:
     print("\nOnline RL training (synchronous, real hardware)")
     print(f"Dataset (raw episodes, for record-keeping): {paths.dataset_name} -> {paths.dataset_root}")
-    print(f"Checkpoints: {args.save_dir}")
+    if args.remote_server:
+        print(
+            f"Mode: REMOTE -- inference + training run on {args.remote_server} "
+            "(this machine only drives the robot/teleop/dataset/keyboard loop, no local GPU needed)"
+        )
+        print(
+            "Checkpoints are saved on the remote host's --save-dir, NOT the --save-dir below "
+            "(that value is unused in remote mode)."
+        )
+    else:
+        print(f"Checkpoints: {args.save_dir}")
     print(f"VLA: {args.vla_path}")
     print(f"RL token: {args.rl_token_path}")
     print(
@@ -195,13 +209,8 @@ def run_online_train(args: argparse.Namespace) -> None:
 
     setup = load_robot_setup(args.setup_json)
     paths = resolve_run_paths(setup.setup, args.dataset_tag, DEFAULT_DATASET_TAG)
-    # A dry run is intended to be a read-only configuration check.  In
-    # particular, do not delete a previous dataset or connect to/torque-check
-    # real motors, or create a log directory just to print the generated
-    # LeRobot argv.
-    if not args.dry_run:
-        configure_logging(paths.log_file, args.log_level)
-        remove_existing_dataset(paths.dataset_root)
+    configure_logging(paths.log_file, args.log_level)
+    remove_existing_dataset(paths.dataset_root)
     teleop_argv = build_teleop_argv(setup.leaders, no_teleop=False)
     if not teleop_argv:
         raise ValueError(
@@ -213,7 +222,7 @@ def run_online_train(args: argparse.Namespace) -> None:
     with TemporaryDirectory(prefix="online-train-") as cal_dir:
         stage_follower_calibrations(setup.followers, cal_dir)
         leader_cal_dir = stage_leader_calibrations(setup.leaders, teleop_argv)
-        if args.preflight and not args.dry_run:
+        if args.preflight:
             preflight_motor_connections(
                 setup.followers, setup.leaders, cal_dir,
                 leader_cal_dir.name if leader_cal_dir is not None else None,
@@ -249,6 +258,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vla-path", required=True, help="Frozen pi0.5 VLA checkpoint (from demo adaptation).")
     parser.add_argument("--rl-token-path", required=True, help="Frozen RL token checkpoint (from demo adaptation).")
     parser.add_argument("--tokenizer-path", required=True)
+    parser.add_argument(
+        "--remote-server", default=None,
+        help="URL of a running runing_service/rlt_ac/online_serve.py process "
+        "(e.g. http://1.2.3.4:8600). When set, inference AND training run on that "
+        "machine instead of this one -- this process only drives the robot/teleop/"
+        "dataset/keyboard loop and needs no GPU. --vla-path/--rl-token-path/"
+        "--tokenizer-path and the policy hyperparameter flags below are still "
+        "required (for config validation) but are NOT sent to the server; they "
+        "must independently match how the server was started, or training "
+        "silently runs with different hyperparameters than this session's logs "
+        "suggest.",
+    )
+    parser.add_argument(
+        "--remote-token", default=None,
+        help="Bearer token for --remote-server, if it was started with --auth-token. "
+        "Put the server behind a firewall/security group restricting access to this "
+        "robot host regardless -- this token is not a substitute for that.",
+    )
     parser.add_argument("--task", default=DEFAULT_TASK)
     parser.add_argument("--num-episodes", type=int, default=50)
     parser.add_argument("--episode-time-s", type=int, default=3000)

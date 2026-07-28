@@ -129,6 +129,25 @@ def _predict_policy_action_with_acp_inference(
     cond_runtime_state: dict[str, Any] | None = None,
     uncond_runtime_state: dict[str, Any] | None = None,
 ) -> PolicyAction:
+    remote_predict = getattr(policy, "predict_from_observation_frame", None)
+    if callable(remote_predict):
+        # Remote inference/training (see runing_service/rlt_ac/): `policy` is a
+        # duck-typed RemoteOnlineRLSession forwarding to a cloud-hosted
+        # ChunkACPolicy over HTTP, not a real PreTrainedPolicy -- bypass
+        # predict_action()/preprocessor/postprocessor entirely and hand it the
+        # raw observation_frame dict, exactly like pi05_http_server.py's
+        # `/predict` contract (JPEG images + float state in, action out). CFG
+        # requires two conditioned/unconditioned forward passes and per-call
+        # policy runtime-state snapshotting (see below), neither of which the
+        # remote session exposes -- not supported in remote mode.
+        if acp_inference.enable and acp_inference.use_cfg:
+            raise NotImplementedError(
+                "ACP classifier-free guidance (`acp_inference.use_cfg=true`) is not "
+                "supported with a remote policy session (online_rl.remote_server)."
+            )
+        remote_task = build_acp_tagged_task(task, is_positive=True) if acp_inference.enable else task
+        return remote_predict(observation_frame, task=remote_task, robot_type=robot_type)
+
     if not acp_inference.enable:
         return predict_action(
             observation=observation_frame,
