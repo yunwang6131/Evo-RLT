@@ -283,6 +283,19 @@ def record_loop(
     last_policy_action_for_blend: RobotAction | None = None
     intervention_blend_start_t: float | None = None
     intervention_blend_start_action: RobotAction | None = None
+    # Symmetric counterpart of the takeover blend above, but for the release
+    # (space let go): without this, the first post-release frame jumps
+    # straight to a freshly recomputed policy action with no transition from
+    # wherever the leader arm was just released, which reads as a sudden
+    # snap. Blends FROM that last teleop position TOWARD the policy's output
+    # over the same intervention_action_blend_time_s window.
+    # release_blend_pending=True means "armed but not yet ticking" -- the
+    # clock only starts on the first post-release frame that actually has a
+    # fresh action to blend toward (see _apply_release_blend), not at the
+    # release keypress itself.
+    release_blend_pending = False
+    release_blend_start_t: float | None = None
+    release_blend_start_action: RobotAction | None = None
     teleop_fallback_warned = False
 
     teleop_arm_for_mode_switch: Any | None = None
@@ -425,11 +438,28 @@ def record_loop(
 
     def _release_intervention() -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
+        nonlocal release_blend_pending, release_blend_start_t, release_blend_start_action
         if rlt_intervention_tracker is not None:
             rlt_intervention_tracker.stop(get_episode_frame_index())
         intervention_state = INTERVENTION_STATE_RELEASE
         intervention_blend_start_t = None
         intervention_blend_start_action = None
+        if intervention_action_blend_time_s > 0 and last_teleop_action is not None:
+            # Capture the start position now, but don't start the clock yet
+            # (see _apply_release_blend): with a remote policy, the first
+            # post-release action can take a real network round trip + a
+            # full re-inference (interrupt_chunk() just cleared the queue),
+            # which can itself exceed the blend window -- starting the timer
+            # here would let that wait alone burn through the whole blend
+            # before it's ever visually applied.
+            release_blend_pending = True
+            release_blend_start_action = _clone_robot_action(last_teleop_action)
+            release_blend_start_t = None
+            logging.info("Release action blend armed for %.2fs.", intervention_action_blend_time_s)
+        else:
+            release_blend_pending = False
+            release_blend_start_t = None
+            release_blend_start_action = None
         set_teleop_manual_control(False)
         _reset_policy_after_intervention_release()
         if rlt is not None:
@@ -591,6 +621,15 @@ def record_loop(
         _release_active_intervention_after_phase_end()
         log_say(outcome, play_sounds=True)
         logging.info("RL phase ended (%s)", outcome)
+        # s/f are bound both as phase-end keys and whole-episode outcome keys.
+        # Record the outcome here, in the same listener path that ends the
+        # frame loop. Relying on the separate outcome listener races with the
+        # backend: exit_early can be observed before that listener writes the
+        # label, causing the completed episode to abort the entire recording
+        # run with "Missing episode_success label" instead of advancing to the
+        # next episode.
+        events["episode_outcome"] = outcome
+        events["exit_early"] = True
 
     def _select_action_values(
         act_processed_policy: RobotAction | None,
@@ -627,6 +666,30 @@ def record_loop(
             return _blend_robot_actions(action_feature_names, intervention_blend_start_action, action_values, alpha)
         intervention_blend_start_t = None
         intervention_blend_start_action = None
+        return action_values
+
+    def _apply_release_blend(is_intervention: float, action_values: RobotAction) -> RobotAction:
+        """Symmetric counterpart of _apply_intervention_blend(): smooths the
+        first `intervention_action_blend_time_s` seconds AFTER intervention
+        ends, blending from the leader's last commanded position toward the
+        freshly recomputed policy action -- see release_blend_start_t/action's
+        setup in _release_intervention()."""
+        nonlocal release_blend_pending, release_blend_start_t, release_blend_start_action
+        if is_intervention or release_blend_start_action is None:
+            return action_values
+        if release_blend_pending:
+            # First post-release frame that actually has a fresh action_values
+            # to blend toward -- start the clock now (not at the release
+            # keypress), so a slow first remote inference call doesn't burn
+            # through the blend window before it's ever visually applied.
+            release_blend_start_t = time.perf_counter()
+            release_blend_pending = False
+        elapsed_s = time.perf_counter() - release_blend_start_t
+        alpha = min(elapsed_s / intervention_action_blend_time_s, 1.0)
+        if alpha < 1.0:
+            return _blend_robot_actions(action_feature_names, release_blend_start_action, action_values, alpha)
+        release_blend_start_t = None
+        release_blend_start_action = None
         return action_values
 
     def _write_recovery_row(frame: dict[str, Any]) -> None:
@@ -753,6 +816,7 @@ def record_loop(
 
         is_intervention, action_values = _select_action_values(act_processed_policy, act_processed_teleop)
         action_values = _apply_intervention_blend(is_intervention, action_values)
+        action_values = _apply_release_blend(is_intervention, action_values)
 
         # Applies a pipeline to the action, default is IdentityProcessor
         robot_action_to_send = robot_action_processor((action_values, obs))

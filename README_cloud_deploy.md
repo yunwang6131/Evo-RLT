@@ -11,6 +11,7 @@ python runing_service/rlt_ac/online_serve.py \
   --tokenizer-path /path/to/paligemma-3b-pt-224/snapshots/xxx \
   --action-dim 12 --proprio-dim 12 --chunk-length 10 --chunk-exec-steps 25 \
   --actor-action-clip-delta 0.05 \
+  --beta 50 \
   --save-dir outputs/pin_insert_online_rl_remote \
   --save-every-episodes 5
 ```
@@ -23,6 +24,7 @@ evo-rlt-online-train \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 5 \
   --actor-action-clip-delta 0.05 \
+  --go-home-time-s 0 \
   --save-dir outputs/pin_insert_online_rl \
   --remote-server http://192.168.3.71:8600
 ```

@@ -1152,6 +1152,21 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 logging.info("Discarding unlabeled episode %s.", dataset.num_episodes)
                 dataset.clear_episode_buffer()
                 return recorded_episodes
+            if _current_episode_frame_count() == 0:
+                # Can happen with rlt.skip_prefix_recording=true if the
+                # episode-outcome key (s/f) is pressed before ever entering
+                # critical phase (r): every frame so far was PHASE_PREFIX and
+                # none were added to the dataset, so save_episode() would
+                # crash on lerobot's "must add_frame before add_episode"
+                # check. Treat it the same as a labeled-but-empty attempt --
+                # discard, don't count it, and don't crash the session.
+                logging.warning(
+                    "Discarding episode %s: outcome '%s' was recorded but it has zero frames "
+                    "(likely s/f pressed before entering critical phase with r).",
+                    dataset.num_episodes, episode_success,
+                )
+                dataset.clear_episode_buffer()
+                return recorded_episodes
             dataset.save_episode(extra_episode_metadata=_extra_episode_metadata(episode_success))
             return recorded_episodes + 1
 

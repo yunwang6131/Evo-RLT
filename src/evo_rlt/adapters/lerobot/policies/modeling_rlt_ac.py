@@ -18,6 +18,7 @@ from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.rtc.latency_tracker import LatencyTracker
 from evo_rlt.adapters.lerobot.policies.action_modifier import PrefixOutputCapture, RLTActionModifier
 from evo_rlt.adapters.lerobot.policies.configuration_rlt_ac import ChunkACPolicyConfig
+from evo_rlt.adapters.lerobot.policies.configuration_rlt_token import RLTokenPolicyConfig
 from evo_rlt.adapters.lerobot.policies.modeling_rlt_token import RLTokenPolicy
 from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.critic import TwinCritic
@@ -126,7 +127,21 @@ class ChunkACPolicy(PreTrainedPolicy):
                 "ChunkACPolicy requires config.rl_token_pretrained_path "
                 "pointing at a saved RLTokenPolicy checkpoint dir."
             )
-        policy = RLTokenPolicy.from_pretrained(self.config.rl_token_pretrained_path)
+        # The RL-token checkpoint records the VLA path used while learning the
+        # bottleneck, but deployment may deliberately select a relocated or
+        # newer SFT VLA through ChunkACPolicyConfig.vla_pretrained_path. Loading
+        # RLTokenPolicy without an explicit config silently ignores that AC
+        # setting and resurrects the checkpoint's stale path. Besides failing
+        # after checkpoints are copied between machines, this can make the
+        # robot run a different VLA from the one supplied with --vla-path.
+        rl_token_cfg = RLTokenPolicyConfig.from_pretrained(self.config.rl_token_pretrained_path)
+        rl_token_cfg.vla_pretrained_path = self.config.vla_pretrained_path
+        rl_token_cfg.vla_dtype = self.config.vla_dtype
+        rl_token_cfg.device = self.config.device
+        policy = RLTokenPolicy.from_pretrained(
+            self.config.rl_token_pretrained_path,
+            config=rl_token_cfg,
+        )
         for p in policy.parameters():
             p.requires_grad = False
         policy.eval()

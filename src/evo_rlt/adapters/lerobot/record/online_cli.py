@@ -115,6 +115,7 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         "--rlt.enable=true",
         f"--rlt.rl_phase_key={args.rlt_toggle_key}",
         f"--rlt.rl_phase_double_tap_window_s={args.double_tap_window_s}",
+        f"--rlt.intervention_action_blend_time_s={args.intervention_blend_time_s}",
         "--rlt.skip_prefix_recording=true",
         "--rlt.rl_phase_key_toggles_critical_phase=true",
         "--rlt.start_in_teleop=false",
@@ -338,6 +339,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vcodec", default="h264")
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--double-tap-window-s", type=float, default=0.6)
+    parser.add_argument(
+        "--intervention-blend-time-s", type=float, default=0.3,
+        help="Smooth both transitions across a human intervention -- takeover (space "
+        "pressed, blends from the last policy action to teleop) and release (space "
+        "released, blends from the last teleop position back to the freshly "
+        "recomputed policy action) -- over this many seconds, instead of jumping "
+        "instantly. 0 disables both blends.",
+    )
     parser.add_argument("--vla-ref", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--play-sounds", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rlt-toggle-key", default="r")
