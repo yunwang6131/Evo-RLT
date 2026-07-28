@@ -54,6 +54,9 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         # a brand-new ChunkACPolicy (random actor/critic init) instead of
         # loading a checkpoint. VLA + RL token are frozen pretrained backbones.
         "--policy.type=rlt_ac",
+        f"--policy.vla_pretrained_path={args.vla_path}",
+        f"--policy.rl_token_pretrained_path={args.rl_token_path}",
+        f"--policy.tokenizer_path={args.tokenizer_path}",
         "--policy.phase_mode=manual",
         f"--policy.chunk_exec_steps={args.chunk_exec_steps}",
         f"--policy.chunk_length={args.chunk_length}",
@@ -148,40 +151,15 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
     ]
     if args.actor_action_clip_delta is not None:
         argv.append(f"--policy.actor_action_clip_delta={args.actor_action_clip_delta}")
-    # Omitted (rather than passed as literal "None") when --remote-server is set
-    # and these weren't given -- record() never calls make_policy() in remote
-    # mode, so ChunkACPolicyConfig's own dataclass defaults are never loaded
-    # from disk and are harmless placeholders.
-    if args.vla_path:
-        argv.append(f"--policy.vla_pretrained_path={args.vla_path}")
-    if args.rl_token_path:
-        argv.append(f"--policy.rl_token_pretrained_path={args.rl_token_path}")
-    if args.tokenizer_path:
-        argv.append(f"--policy.tokenizer_path={args.tokenizer_path}")
-    if args.remote_server:
-        argv.append(f"--online_rl.remote_server={args.remote_server}")
-        if args.remote_token:
-            argv.append(f"--online_rl.remote_token={args.remote_token}")
-        argv.append(f"--online_rl.remote_timeout_s={args.remote_timeout_s}")
     return argv
 
 
 def print_online_train_summary(args: argparse.Namespace, paths) -> None:
     print("\nOnline RL training (synchronous, real hardware)")
     print(f"Dataset (raw episodes, for record-keeping): {paths.dataset_name} -> {paths.dataset_root}")
-    if args.remote_server:
-        print(
-            f"Mode: REMOTE -- inference + training run on {args.remote_server} "
-            "(this machine only drives the robot/teleop/dataset/keyboard loop, no local GPU needed)"
-        )
-        print(
-            "Checkpoints are saved on the remote host's --save-dir, NOT the --save-dir below "
-            "(that value is unused in remote mode)."
-        )
-    else:
-        print(f"Checkpoints: {args.save_dir}")
-    print(f"VLA: {args.vla_path or '(loaded remotely)'}")
-    print(f"RL token: {args.rl_token_path or '(loaded remotely)'}")
+    print(f"Checkpoints: {args.save_dir}")
+    print(f"VLA: {args.vla_path}")
+    print(f"RL token: {args.rl_token_path}")
     print(
         f"RL: warmup_episodes={args.warmup_episodes} (+min_transitions={args.min_warmup_transitions} "
         f"min_successes={args.min_warmup_successes} min_failures={args.min_warmup_failures}) "
@@ -224,18 +202,6 @@ def run_online_train(args: argparse.Namespace) -> None:
     keys = {args.teleop_toggle_key, args.estop_key, args.rlt_toggle_key}
     if len(keys) != 3:
         raise ValueError("--teleop-toggle-key, --estop-key, and --rlt-toggle-key must be distinct.")
-    if not args.remote_server:
-        missing = [
-            name for name, value in (
-                ("--vla-path", args.vla_path),
-                ("--rl-token-path", args.rl_token_path),
-                ("--tokenizer-path", args.tokenizer_path),
-            ) if not value
-        ]
-        if missing:
-            raise ValueError(
-                f"{', '.join(missing)} required when --remote-server is not set."
-            )
 
     setup = load_robot_setup(args.setup_json)
     paths = resolve_run_paths(setup.setup, args.dataset_tag, DEFAULT_DATASET_NAME_PREFIX)
@@ -285,45 +251,9 @@ def run_online_train(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Synchronous online RL training on real hardware")
-    parser.add_argument(
-        "--vla-path", default=None,
-        help="Frozen pi0.5 VLA checkpoint (from demo adaptation). Required unless "
-        "--remote-server is set (in remote mode this machine never loads it).",
-    )
-    parser.add_argument(
-        "--rl-token-path", default=None,
-        help="Frozen RL token checkpoint (from demo adaptation). Required unless "
-        "--remote-server is set (in remote mode this machine never loads it).",
-    )
-    parser.add_argument(
-        "--tokenizer-path", default=None,
-        help="Required unless --remote-server is set (in remote mode this machine never loads it).",
-    )
-    parser.add_argument(
-        "--remote-server", default=None,
-        help="URL of a running runing_service/rlt_ac/online_serve.py process "
-        "(e.g. http://1.2.3.4:8600). When set, inference AND training run on that "
-        "machine instead of this one -- this process only drives the robot/teleop/"
-        "dataset/keyboard loop and needs no GPU, so --vla-path/--rl-token-path/"
-        "--tokenizer-path are not required here. The policy hyperparameter flags "
-        "below still must independently match how the server was started, or "
-        "training silently runs with different hyperparameters than this "
-        "session's logs suggest.",
-    )
-    parser.add_argument(
-        "--remote-token", default=None,
-        help="Bearer token for --remote-server, if it was started with --auth-token. "
-        "Put the server behind a firewall/security group restricting access to this "
-        "robot host regardless -- this token is not a substitute for that.",
-    )
-    parser.add_argument(
-        "--remote-timeout-s", type=float, default=120.0,
-        help="HTTP timeout for every call to --remote-server. The first /predict call "
-        "on a freshly started server pays for CUDA init + loading the VLA/RL-token "
-        "backbones + an uncompiled first forward pass, which can take well over the "
-        "default -- raise this if warmup times out even though the server is up "
-        "(check its logs / `GET /health` first).",
-    )
+    parser.add_argument("--vla-path", required=True, help="Frozen pi0.5 VLA checkpoint (from demo adaptation).")
+    parser.add_argument("--rl-token-path", required=True, help="Frozen RL token checkpoint (from demo adaptation).")
+    parser.add_argument("--tokenizer-path", required=True)
     parser.add_argument("--task", default=DEFAULT_TASK)
     parser.add_argument("--num-episodes", type=int, default=50)
     parser.add_argument("--episode-time-s", type=int, default=3000)

@@ -327,27 +327,6 @@ class OnlineRLConfig:
     # this -- sending the wrong direction closes the gripper instead of
     # opening it.
     go_home_gripper_value: float = 100.0
-    # When set, inference AND training run on a cloud/remote
-    # `runing_service/rlt_ac/online_serve.py` process instead of in this local
-    # process -- this machine only drives the robot/teleop/dataset/keyboard
-    # loop and needs no GPU. Example: "http://1.2.3.4:8600". All other
-    # `online_rl.*`/`policy.*` fields above (warmup thresholds, lr, hidden
-    # dims, ...) are still validated here for sanity but are NOT sent to or
-    # enforced against the server -- they must be configured to match on the
-    # server's own invocation, or training will silently run with different
-    # hyperparameters than this session's logs/summary suggest.
-    remote_server: str | None = None
-    # Bearer token sent as `Authorization: Bearer <token>` on every request to
-    # `remote_server`. Put the service behind a firewall/security group that
-    # only allows the robot host to reach it regardless -- this token is not a
-    # substitute for network-level access control.
-    remote_token: str | None = None
-    # HTTP request timeout for every call to `remote_server`. The first
-    # /predict call on a freshly started server pays for CUDA init + loading
-    # the VLA/RL-token backbones + an uncompiled first forward pass, which can
-    # take well over the default -- raise this if warmup times out even
-    # though the server is up (check its own logs/`GET /health` first).
-    remote_timeout_s: float = 120.0
 
 
 @dataclass
@@ -594,8 +573,6 @@ class RecordConfig:
                 raise ValueError("`online_rl.go_home_time_s` must be >= 0.")
             if not (0 <= self.online_rl.go_home_gripper_value <= 100):
                 raise ValueError("`online_rl.go_home_gripper_value` must be in [0, 100].")
-            if self.online_rl.remote_token and not self.online_rl.remote_server:
-                raise ValueError("`online_rl.remote_token` requires `online_rl.remote_server` to be set.")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -663,19 +640,6 @@ def _write_schema_metadata(
         }
     dataset.meta.info["recording_schema_version"] = 2
     write_info(dataset.meta.info, dataset.root)
-
-
-class _NullProcessor:
-    """No-op stand-in for `preprocessor`/`postprocessor` in remote mode
-    (see `online_rl.remote_server`): the real pre/post-processing pipelines
-    never run locally there (see hil.py's remote branch), but record_loop()
-    unconditionally calls `.reset()` on both at the start of every episode
-    and on every intervention release, whenever policy/preprocessor/
-    postprocessor are all non-None -- so they must be truthy AND provide a
-    working `.reset()`."""
-
-    def reset(self) -> None:
-        return None
 
 
 def _configure_rlt_record_policy(policy, cfg: RecordConfig) -> None:
@@ -811,72 +775,43 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             include_rlt_episode_metadata=cfg.rlt.enable,
         )
 
-        if cfg.online_rl.enable and cfg.online_rl.remote_server:
-            # Cloud-hosted inference + training (see runing_service/rlt_ac/): the
-            # VLA + rlt_ac actor/critic, replay buffer, and optimizers all live in
-            # a service process on the remote host -- this machine only drives the
-            # robot/teleop/dataset/keyboard loop below and never loads a real
-            # policy or touches a GPU. `policy`, `online_trainer`, and
-            # `online_collector` are all the SAME session object here since
-            # record_loop()/this function only ever call disjoint method names on
-            # each of those three roles.
-            from evo_rlt.adapters.lerobot.serve.remote_client import RemoteOnlineRLSession
+        # Load pretrained policy
+        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
+        _configure_rlt_record_policy(policy, cfg)
 
-            policy = RemoteOnlineRLSession(
-                base_url=cfg.online_rl.remote_server,
-                auth_token=cfg.online_rl.remote_token,
-                timeout_s=cfg.online_rl.remote_timeout_s,
+        online_trainer = None
+        online_collector = None
+        if cfg.online_rl.enable:
+            from evo_rlt.adapters.lerobot.record.online_trainer import OnlineRLTrainer
+
+            online_trainer = OnlineRLTrainer(policy, cfg.online_rl, cfg.policy)
+            online_collector = online_trainer.collector
+
+        preprocessor = None
+        postprocessor = None
+        if cfg.acp_inference.enable and cfg.policy is None:
+            raise ValueError("`acp_inference.enable=true` requires `policy` to be set.")
+        if cfg.policy is not None:
+            dataset_stats = rename_stats(dataset.meta.stats, cfg.dataset.rename_map)
+            if not dataset_stats and getattr(cfg.policy, "vla_pretrained_path", None):
+                # Fresh rlt_ac policy (online RL): no --policy.path checkpoint
+                # of its own, and this dataset has zero episodes, so the
+                # usual dataset_stats source is empty -- fall back to the
+                # REAL normalization the frozen VLA was actually trained
+                # with, from its own checkpoint. See
+                # load_dataset_stats_from_pretrained()'s docstring for why
+                # this matters (un-normalized state/action reads as the
+                # VLA "acting randomly").
+                dataset_stats = load_dataset_stats_from_pretrained(cfg.policy.vla_pretrained_path)
+            preprocessor, postprocessor = make_pre_post_processors(
+                policy_cfg=cfg.policy,
+                pretrained_path=cfg.policy.pretrained_path,
+                dataset_stats=dataset_stats,
+                preprocessor_overrides={
+                    "device_processor": {"device": cfg.policy.device},
+                    "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
+                },
             )
-            online_trainer = policy
-            online_collector = policy
-            # Non-None placeholders only: _predict_policy_action_with_acp_inference's
-            # remote branch (see hil.py) returns before ever touching these, but
-            # record_loop() unconditionally calls preprocessor.reset()/postprocessor.
-            # reset() at the start of every episode (and again on every intervention
-            # release) whenever policy/preprocessor/postprocessor are all non-None --
-            # a bare object() has no .reset() and would crash there. _warmup_rlt_
-            # path()'s similar `is not None` guard also needs them truthy to still
-            # prime the RL path.
-            preprocessor = _NullProcessor()
-            postprocessor = _NullProcessor()
-        else:
-            # Load pretrained policy
-            policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
-            _configure_rlt_record_policy(policy, cfg)
-
-            online_trainer = None
-            online_collector = None
-            if cfg.online_rl.enable:
-                from evo_rlt.adapters.lerobot.record.online_trainer import OnlineRLTrainer
-
-                online_trainer = OnlineRLTrainer(policy, cfg.online_rl, cfg.policy)
-                online_collector = online_trainer.collector
-
-            preprocessor = None
-            postprocessor = None
-            if cfg.acp_inference.enable and cfg.policy is None:
-                raise ValueError("`acp_inference.enable=true` requires `policy` to be set.")
-            if cfg.policy is not None:
-                dataset_stats = rename_stats(dataset.meta.stats, cfg.dataset.rename_map)
-                if not dataset_stats and getattr(cfg.policy, "vla_pretrained_path", None):
-                    # Fresh rlt_ac policy (online RL): no --policy.path checkpoint
-                    # of its own, and this dataset has zero episodes, so the
-                    # usual dataset_stats source is empty -- fall back to the
-                    # REAL normalization the frozen VLA was actually trained
-                    # with, from its own checkpoint. See
-                    # load_dataset_stats_from_pretrained()'s docstring for why
-                    # this matters (un-normalized state/action reads as the
-                    # VLA "acting randomly").
-                    dataset_stats = load_dataset_stats_from_pretrained(cfg.policy.vla_pretrained_path)
-                preprocessor, postprocessor = make_pre_post_processors(
-                    policy_cfg=cfg.policy,
-                    pretrained_path=cfg.policy.pretrained_path,
-                    dataset_stats=dataset_stats,
-                    preprocessor_overrides={
-                        "device_processor": {"device": cfg.policy.device},
-                        "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
-                    },
-                )
 
         collector_policy_id_policy = cfg.collector_policy_id_policy
         collector_policy_id_human = cfg.collector_policy_id_human

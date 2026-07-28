@@ -1,9 +1,6 @@
 """Standalone online-RL "brain": replay buffer + TD3+BC gradient updates for
-`rlt_ac`, extracted out of `backend.record()`'s closures so the SAME logic can
-run either in-process (unchanged local behavior, see `backend.py`) or from a
-network-facing service (see `runing_service/rlt_ac/online_serve.py`) without
-duplicating the training math in two places -- future changes to warmup/
-critic-only/TD3+BC logic only need to happen here.
+`rlt_ac`, extracted out of `backend.record()`'s closures into their own
+testable unit (see `backend.py`, which calls this unchanged).
 
 This is a pure extraction: the control flow and math below are copied
 verbatim from the closures that used to live inside `record()`
