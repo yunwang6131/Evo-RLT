@@ -315,6 +315,28 @@ class OnlineRLConfig:
     # Directory to save periodic online-training checkpoints. Required when enable=true.
     save_dir: str | None = None
     save_every_episodes: int = 5
+    # Path to a latest_online_state.pt written by a previous run's
+    # save_latest_state() (crash recovery / continuing a session after a
+    # stop). Restores actor/critic/target_critic weights, optimizer
+    # momentum, the full replay buffer, and the warmup/critic-only anchor,
+    # and resumes the episode counter from where it left off. None (default)
+    # starts a fresh session as before. This is unrelated to the top-level
+    # `resume` field, which is LeRobot's own dataset-append resume.
+    resume_from: str | None = None
+    # Log actor/critic training curves (loss, buffer growth, warmup progress)
+    # to Weights & Biases -- one point per recorded episode. No model
+    # weights/checkpoints are ever uploaded, only scalars. Requires the
+    # `wandb` extra (`pip install evo-rlt[wandb]`) and `wandb login` done
+    # beforehand; if the import fails this is treated the same as wandb=False
+    # (a warning is logged, training is not blocked on it).
+    wandb: bool = False
+    wandb_project: str = "evo-rlt"
+    wandb_entity: str | None = None
+    wandb_run_name: str | None = None
+    # Stable W&B run identity is separate from the display name. Pass both
+    # fields when resuming if the metrics must continue on the same run.
+    wandb_run_id: str | None = None
+    wandb_resume: str | None = None
     # After each recorded episode ends (s/f pressed), before the teleop reset
     # window, smoothly ramp the follower back to the calibrated middle
     # position (all non-gripper joints = 0 degrees -- exactly the pose set by
@@ -327,6 +349,15 @@ class OnlineRLConfig:
     # this -- sending the wrong direction closes the gripper instead of
     # opening it.
     go_home_gripper_value: float = 100.0
+    # Per-joint go-home targets as RAW motor ticks -- i.e. paste the POS
+    # column straight from lerobot-calibrate's "recording positions" screen,
+    # no manual conversion needed. Keyed by action-feature name, e.g.
+    # "shoulder_pan.pos" (single arm) or "left_shoulder_pan.pos" /
+    # "right_shoulder_pan.pos" (bimanual). Any joint not listed here (e.g.
+    # wrist_roll, which lerobot-calibrate excludes from ROM recording) falls
+    # back to the calibrated-midpoint default (0 degrees), same as before.
+    # Overrides go_home_gripper_value for any gripper joint it lists.
+    go_home_positions: dict[str, float] | None = None
 
 
 @dataclass
@@ -686,6 +717,24 @@ def _configure_rlt_record_policy(policy, cfg: RecordConfig) -> None:
     )
 
 
+def _raw_ticks_to_normalized(robot, action_name: str, raw_value: float) -> float:
+    """Convert a raw motor tick (the POS column from lerobot-calibrate) to
+    the normalized [-100, 100] value robot.send_action() expects, using that
+    motor's own recorded range_min/range_max/drive_mode -- mirrors
+    MotorsBus._normalize()."""
+    motor_name = action_name.removesuffix(".pos")
+    arm = robot
+    for prefix, attr in (("left_", "left_arm"), ("right_", "right_arm")):
+        if motor_name.startswith(prefix) and hasattr(robot, attr):
+            arm = getattr(robot, attr)
+            motor_name = motor_name[len(prefix) :]
+            break
+    cal = arm.bus.calibration[motor_name]
+    bounded = min(cal.range_max, max(cal.range_min, raw_value))
+    norm = ((bounded - cal.range_min) / (cal.range_max - cal.range_min)) * 200 - 100
+    return -norm if cal.drive_mode else norm
+
+
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging()
@@ -732,6 +781,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     policy_sync_executor = None
     critical_phase_tracker = None
     intervention_tracker = None
+    online_trainer = None
+    online_rl_resume_episodes = None
 
     try:
         if cfg.resume:
@@ -779,13 +830,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
         _configure_rlt_record_policy(policy, cfg)
 
-        online_trainer = None
         online_collector = None
         if cfg.online_rl.enable:
             from evo_rlt.adapters.lerobot.record.online_trainer import OnlineRLTrainer
 
             online_trainer = OnlineRLTrainer(policy, cfg.online_rl, cfg.policy)
             online_collector = online_trainer.collector
+            if cfg.online_rl.resume_from is not None:
+                online_rl_resume_episodes = online_trainer.load_latest_state(cfg.online_rl.resume_from)
 
         preprocessor = None
         postprocessor = None
@@ -1041,10 +1093,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         def _run_go_home_if_needed() -> None:
             """After the recorded episode ends (s/f pressed), before the
             teleop reset window, smoothly ramp the follower back to the
-            calibrated middle position (see OnlineRLConfig.go_home_time_s).
-            Only resets the robot's OWN joint configuration -- it can't move
-            external task objects, which is what the teleop reset window
-            (if any) is still for."""
+            go-home position (see OnlineRLConfig.go_home_positions /
+            go_home_time_s). Joints not listed in go_home_positions fall back
+            to the calibrated middle position (0 degrees), except the
+            gripper which defaults to go_home_gripper_value. Only resets the
+            robot's OWN joint configuration -- it can't move external task
+            objects, which is what the teleop reset window (if any) is
+            still for."""
             if not cfg.online_rl.enable or cfg.online_rl.go_home_time_s <= 0:
                 return
             try:
@@ -1054,9 +1109,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 start_action = robot.get_observation()
                 action_names = list(robot.action_features.keys())
+                raw_targets = cfg.online_rl.go_home_positions or {}
                 home_action = {
                     name: (
-                        cfg.online_rl.go_home_gripper_value
+                        _raw_ticks_to_normalized(robot, name, raw_targets[name])
+                        if name in raw_targets
+                        else cfg.online_rl.go_home_gripper_value
                         if name.endswith("gripper.pos")
                         else 0.0
                     )
@@ -1164,8 +1222,19 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             and NOT keyed off the whole recorded episode's outcome label (see
             OnlineRLConfig's docstring). online_trainer.maybe_update() just
             checks whether that happened (via the total_added delta) and, if
-            so, trains -- see OnlineRLTrainer for the actual TD3+BC logic."""
+            so, trains -- see OnlineRLTrainer for the actual TD3+BC logic.
+
+            If this whole episode is being rerecorded (left arrow), roll back
+            instead: whatever flush_episode() already committed to the buffer
+            this cycle is undone here, before _finish_recorded_episode()'s
+            _discard_rerecord_episode() clears the raw dataset episode below
+            -- otherwise the discarded attempt's transitions (and any
+            gradient step already taken on them) would silently survive in
+            the replay buffer even though the episode itself was thrown out."""
             if online_trainer is None:
+                return
+            if events["rerecord_episode"]:
+                online_trainer.discard_episode(buffer_total_added_before)
                 return
             online_trainer.maybe_update(recorded_episodes, buffer_total_added_before)
 
@@ -1176,7 +1245,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         with VideoEncodingManager(dataset):
             _warmup_rlt_path()
-            recorded_episodes = 0
+            # online_rl_resume_episodes carries over the online-RL episode
+            # counter from a resumed session (see online_rl.resume_from
+            # above) -- dataset.num_episodes (this run's own, freshly created
+            # video dataset) intentionally starts at 0 regardless; the two
+            # counters are independent and only coincide in a fresh session.
+            # --dataset.num_episodes is then a total target inclusive of the
+            # resumed count, not "N more episodes".
+            recorded_episodes = online_rl_resume_episodes if online_rl_resume_episodes is not None else 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 events["episode_outcome"] = None
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)
@@ -1190,8 +1266,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 # total_added here (not inside _run_online_rl_update, after
                 # rollout already happened) is what makes the delta actually
                 # cover the whole episode.
+                # recorded_episodes, not dataset.num_episodes: the replay
+                # buffer's ChunkTransition.episode_id must stay monotonic
+                # across a resume_from (see online_rl.resume_from above) --
+                # dataset.num_episodes restarts at 0 for this run's own fresh
+                # video dataset, which would collide with episode_ids already
+                # present in a resumed replay buffer and corrupt
+                # episode_outcomes()'s per-episode success/failure grouping.
+                # In a non-resumed run the two counters are always equal here
+                # (both only advance together via _finish_recorded_episode()),
+                # so this is a no-op change for that case.
                 buffer_total_added_before = (
-                    online_trainer.start_episode(dataset.num_episodes) if online_trainer is not None else 0
+                    online_trainer.start_episode(recorded_episodes) if online_trainer is not None else 0
                 )
                 _record_episode()
                 _finish_episode_trackers()
@@ -1200,6 +1286,26 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 )
                 _notify_episode_outcome(episode_success)
                 _run_online_rl_update(recorded_episodes, buffer_total_added_before)
+                # Safety net: a gradient update (and the warmup-satisfied
+                # transition, if this was the episode that crossed it) has
+                # already happened in memory at this point, but go-home and
+                # the reset window below are real robot motion that can take
+                # 15-20+ seconds and are exactly where a hardware fault (e.g.
+                # a motor bus voltage error) can kill the process -- without
+                # this, that update is silently lost: --resume-from would
+                # restart from the save made after the *previous* episode,
+                # re-doing warmup satisfaction and this update's work.
+                # completed_episodes uses +1 (not the actual, possibly-
+                # rerecorded final count from _finish_recorded_episode below,
+                # which needs go-home/reset to have already happened) so a
+                # resume from *this* save starts the next new episode at an
+                # id that doesn't collide with the one just flushed into the
+                # buffer above -- the trade-off is that a rerecord after this
+                # point makes this interim save overcount by one episode
+                # versus the authoritative save at the end of this loop body,
+                # which harmlessly just gets overwritten by that later save
+                # in the common (non-crash) case.
+                _save_online_rl_latest_state(recorded_episodes + 1)
                 _run_go_home_if_needed()
                 _run_reset_loop_if_needed(recorded_episodes)
                 recorded_episodes = _finish_recorded_episode(recorded_episodes, episode_success)
@@ -1242,6 +1348,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             if policy_sync_executor is not None:
                 policy_sync_executor.shutdown()
 
+        def _close_online_trainer() -> None:
+            if online_trainer is not None:
+                online_trainer.close()
+
         def _disconnect_devices() -> None:
             if robot.is_connected:
                 robot.disconnect()
@@ -1266,6 +1376,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         _finalize_dataset()
         _save_critical_phase_intervals()
         _shutdown_policy_sync()
+        _close_online_trainer()
         _disconnect_devices()
         _stop_listener()
         _push_dataset_to_hub()

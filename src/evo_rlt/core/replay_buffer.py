@@ -53,6 +53,25 @@ class ReplayBuffer:
         self.buffer.append(transition)
         self.total_added += 1
 
+    def rollback(self, total_added_before: int) -> int:
+        """Undo every add() since `total_added_before` by popping them back
+        off the right end of the deque -- add() only ever appends, so the
+        most recent entries are exactly the ones to remove (e.g. a
+        rerecorded/discarded episode's already-flushed transitions). If some
+        of those were already evicted by capacity, only what's still
+        physically present is removed (total_added is decremented to match,
+        not reset to total_added_before, so it stays an accurate count of
+        what's actually in the buffer's history). Returns how many were
+        removed."""
+        n_to_remove = self.total_added - total_added_before
+        if n_to_remove <= 0:
+            return 0
+        n_removed = min(n_to_remove, len(self.buffer))
+        for _ in range(n_removed):
+            self.buffer.pop()
+        self.total_added -= n_removed
+        return n_removed
+
     def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
         """Sample a batch uniformly and collate into a dict of stacked tensors."""
         n = min(batch_size, len(self.buffer))

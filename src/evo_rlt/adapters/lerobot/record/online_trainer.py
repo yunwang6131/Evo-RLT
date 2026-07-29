@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -69,11 +71,71 @@ class OnlineRLTrainer:
         # warmup_satisfied(). None means warmup hasn't completed yet.
         self.warmup_completed_at_episode: int | None = None
 
+        self.wandb_run = self._init_wandb(online_rl_cfg, policy_cfg)
+
+    def _init_wandb(self, online_rl_cfg: Any, policy_cfg: Any) -> Any | None:
+        if not getattr(online_rl_cfg, "wandb", False):
+            return None
+        try:
+            import wandb
+        except ImportError:
+            logging.warning(
+                "online_rl.wandb=true but the `wandb` package is not installed "
+                "(pip install evo-rlt[wandb]) -- continuing without wandb logging."
+            )
+            return None
+        return wandb.init(
+            project=online_rl_cfg.wandb_project,
+            entity=online_rl_cfg.wandb_entity,
+            name=online_rl_cfg.wandb_run_name,
+            id=online_rl_cfg.wandb_run_id,
+            resume=online_rl_cfg.wandb_resume,
+            config={
+                "warmup_episodes": online_rl_cfg.warmup_episodes,
+                "critic_only_episodes": online_rl_cfg.critic_only_episodes,
+                "min_warmup_transitions": online_rl_cfg.min_warmup_transitions,
+                "min_warmup_successes": online_rl_cfg.min_warmup_successes,
+                "min_warmup_failures": online_rl_cfg.min_warmup_failures,
+                "replay_capacity": online_rl_cfg.replay_capacity,
+                "batch_size": online_rl_cfg.batch_size,
+                "lr_actor": online_rl_cfg.lr_actor,
+                "lr_critic": online_rl_cfg.lr_critic,
+                "utd_ratio": policy_cfg.utd_ratio,
+                "max_updates_per_episode": online_rl_cfg.max_updates_per_episode,
+                "use_stratified_sampling": online_rl_cfg.use_stratified_sampling,
+                "chunk_length": policy_cfg.chunk_length,
+                "action_dim": policy_cfg.action_dim,
+                "actor_hidden_dim": policy_cfg.actor_hidden_dim,
+                "critic_hidden_dim": policy_cfg.critic_hidden_dim,
+            },
+            settings=wandb.Settings(save_code=False),
+        )
+
+    def _log(self, data: dict[str, Any], step: int) -> None:
+        if self.wandb_run is None:
+            return
+        self.wandb_run.log(data, step=step)
+
+    def close(self) -> None:
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
+
     def start_episode(self, episode_id: int) -> int:
         """Call at the start of every rollout episode. Returns the replay
         buffer's `total_added` baseline to pass back into `maybe_update()`."""
         self.collector.start_episode(episode_id)
         return self.replay_buffer.total_added
+
+    def discard_episode(self, buffer_total_added_before: int) -> None:
+        """Roll back every transition this cycle's critical-phase attempt(s)
+        already flushed into the replay buffer -- call this instead of
+        maybe_update() when the whole episode is being rerecorded/discarded
+        (left arrow), so a redo doesn't leave the discarded attempt's
+        transitions (correctly labeled or not) permanently mixed into
+        training data."""
+        n_removed = self.replay_buffer.rollback(buffer_total_added_before)
+        if n_removed:
+            logging.info("Online RL: discarded %d transition(s) from rerecorded episode.", n_removed)
 
     def warmup_satisfied(self, recorded_episodes: int) -> bool:
         if self.warmup_completed_at_episode is not None:
@@ -88,6 +150,11 @@ class OnlineRLTrainer:
         # Record when warmup actually finished -- the critic-only window
         # below anchors to this, not a fixed offset (see its comment).
         self.warmup_completed_at_episode = recorded_episodes
+        logging.info(
+            "=" * 70 + "\nOnline RL: warmup satisfied after episode %d -- gradient updates "
+            "start now (critic-only for the next %d episodes, then actor unfreezes).\n" + "=" * 70,
+            recorded_episodes, self.cfg.critic_only_episodes,
+        )
         return True
 
     def maybe_update(self, recorded_episodes: int, buffer_total_added_before: int) -> dict | None:
@@ -116,6 +183,15 @@ class OnlineRLTrainer:
                 recorded_episodes, len(self.replay_buffer), self.cfg.min_warmup_transitions,
                 successes, self.cfg.min_warmup_successes,
                 failures, self.cfg.min_warmup_failures,
+            )
+            self._log(
+                {
+                    "online_rl/warmup_satisfied": 0,
+                    "online_rl/buffer_transitions": len(self.replay_buffer),
+                    "online_rl/buffer_successes": successes,
+                    "online_rl/buffer_failures": failures,
+                },
+                step=recorded_episodes,
             )
             return None
         if len(self.replay_buffer) < self.cfg.batch_size:
@@ -212,14 +288,31 @@ class OnlineRLTrainer:
             {k: (v.item() if torch.is_tensor(v) else v) for k, v in (info or {}).items()},
         )
 
+        loss_dict = {k: (v.item() if torch.is_tensor(v) else v) for k, v in (info or {}).items()}
         stats: dict[str, Any] = {
             "new_transitions": new_transitions,
             "requested_updates": requested_updates,
             "actual_updates": num_updates,
             "training_time_s": training_time_s,
-            "loss": {k: (v.item() if torch.is_tensor(v) else v) for k, v in (info or {}).items()},
+            "loss": loss_dict,
             "checkpoint_path": None,
         }
+        successes, failures = self.replay_buffer.count_outcomes()
+        self._log(
+            {
+                "online_rl/warmup_satisfied": 1,
+                "online_rl/critic_only": float(recorded_episodes < critic_only_until),
+                "online_rl/new_transitions": new_transitions,
+                "online_rl/actual_updates": num_updates,
+                "online_rl/effective_utd": (num_updates / new_transitions) if new_transitions > 0 else 0.0,
+                "online_rl/training_time_s": training_time_s,
+                "online_rl/buffer_transitions": len(self.replay_buffer),
+                "online_rl/buffer_successes": successes,
+                "online_rl/buffer_failures": failures,
+                **{f"online_rl/{k}": v for k, v in loss_dict.items() if k != "critic_step"},
+            },
+            step=recorded_episodes,
+        )
         completed_episodes = recorded_episodes + 1
         if completed_episodes % self.cfg.save_every_episodes == 0:
             save_path = Path(self.cfg.save_dir) / f"step_{completed_episodes:06d}"
@@ -241,9 +334,7 @@ class OnlineRLTrainer:
         temp file then atomically renamed so a crash mid-write never
         leaves a half-written file behind.
 
-        Loading this back into a running session (full resume) is not
-        wired up yet -- this is crash-survivability for the data, not a
-        `--resume` CLI path.
+        See load_latest_state() for the corresponding resume path.
         """
         save_dir = Path(self.cfg.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -258,13 +349,85 @@ class OnlineRLTrainer:
             "replay_buffer": list(self.replay_buffer.buffer),
             "replay_buffer_total_added": self.replay_buffer.total_added,
             "replay_capacity": self.replay_buffer.capacity,
+            "warmup_completed_at_episode": self.warmup_completed_at_episode,
             "torch_rng_state": torch.get_rng_state(),
         }
         final_path = save_dir / "latest_online_state.pt"
         tmp_path = save_dir / "latest_online_state.pt.tmp"
         torch.save(state, tmp_path)
         os.replace(tmp_path, final_path)
+        archive_path = None
+        if completed_episodes % self.cfg.save_every_episodes == 0:
+            # Keep a selectable, internally-consistent training snapshot next
+            # to the inference-only policy checkpoint. A hard link avoids
+            # writing the often-large replay buffer twice; later replacement
+            # of latest_online_state.pt does not modify this historical inode.
+            archive_path = save_dir / f"step_{completed_episodes:06d}" / "online_state.pt"
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            archive_tmp = archive_path.with_suffix(".pt.tmp")
+            try:
+                archive_tmp.unlink(missing_ok=True)
+                os.link(final_path, archive_tmp)
+            except OSError:
+                # Some filesystems do not support hard links. Preserve the
+                # same interface with a regular copy in that case.
+                shutil.copy2(final_path, archive_tmp)
+            os.replace(archive_tmp, archive_path)
         logging.info(
-            "Online RL latest state saved to %s (episodes=%d, buffer=%d transitions)",
-            final_path, completed_episodes, len(self.replay_buffer),
+            "Online RL state saved to %s%s (episodes=%d, buffer=%d transitions)",
+            final_path,
+            f" and selectable snapshot {archive_path}" if archive_path is not None else "",
+            completed_episodes,
+            len(self.replay_buffer),
         )
+
+    def load_latest_state(self, path: str | Path) -> int:
+        """Restore a snapshot written by save_latest_state(): model weights,
+        optimizer momentum, the full replay buffer, and the warmup/critic-only
+        anchor -- so training resumes exactly where it left off instead of
+        re-entering warmup (or re-freezing the actor for another
+        critic_only_episodes window) from the resume point. Does NOT restore
+        torch_rng_state onto CUDA generators if the snapshot was saved on a
+        different device configuration; this only affects exploration noise
+        reproducibility, not correctness.
+
+        Returns the recorded_episodes count to resume the outer episode loop
+        from.
+        """
+        path = Path(path)
+        # map_location="cpu", NOT the policy's device: the replay buffer's
+        # ChunkTransition tensors must stay on CPU, matching the invariant
+        # every other write path relies on (_emit_transition() always calls
+        # .cpu() before storing; maybe_update() is what moves a *batch* to
+        # device, right before the forward pass). Loading straight onto the
+        # policy's device would leave resumed transitions on GPU while
+        # newly-collected ones are CPU, and ReplayBuffer._collate()'s
+        # torch.stack() crashes the moment a sampled batch mixes both.
+        # actor_state_dict/critic_state_dict/optimizer state loaded below are
+        # unaffected -- load_state_dict() copies values onto the existing
+        # (already correctly-placed) parameters regardless of the source
+        # tensors' device.
+        #
+        # weights_only=False: this snapshot embeds ChunkTransition dataclass
+        # instances (the replay buffer) and optimizer state, not just plain
+        # tensors -- torch>=2.6 defaults weights_only=True and refuses to
+        # unpickle those. Safe here since this is our own save_latest_state()
+        # output, not a third-party checkpoint.
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        self.policy.actor.load_state_dict(state["actor_state_dict"])
+        self.policy.critic.load_state_dict(state["critic_state_dict"])
+        self.policy.target_critic.load_state_dict(state["target_critic_state_dict"])
+        self.policy._critic_step = state["critic_step"]
+        self.actor_optimizer.load_state_dict(state["actor_optimizer"])
+        self.critic_optimizer.load_state_dict(state["critic_optimizer"])
+        self.replay_buffer.buffer = deque(state["replay_buffer"], maxlen=self.replay_buffer.capacity)
+        self.replay_buffer.total_added = state["replay_buffer_total_added"]
+        self.warmup_completed_at_episode = state.get("warmup_completed_at_episode")
+        if "torch_rng_state" in state:
+            torch.set_rng_state(state["torch_rng_state"].cpu())
+        recorded_episodes = state["recorded_episodes"]
+        logging.info(
+            "Online RL resumed from %s (episodes=%d, buffer=%d transitions, warmup_completed_at_episode=%s)",
+            path, recorded_episodes, len(self.replay_buffer), self.warmup_completed_at_episode,
+        )
+        return recorded_episodes

@@ -1,16 +1,12 @@
+python -m pip install -e ".[lerobot]"
 # online RL 训练（真机，同步版）
 
-
 actor 用 zero-init 残差头（mu = ref + delta，delta 最后一层零初始化），没训练之前 actor 输出 == VLA 参考，第一轮就是安全的——不需要offline先训一版actor-critic再warm start，直接从零开始在线训也是安全的。
-
-## 新任务完整步骤
 
 ```
 task = "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area."
 ```
 ### 1. 训练 RL Token（冻结VLA，只训一个encoder做特征压缩）
-
-不需要成功/失败标签，用上面同一批或另采一批teleop demo都可。
 
 ```bash
 python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerobot.scripts.lerobot_train import main; main()' \
@@ -45,14 +41,76 @@ evo-rlt-online-train \
   --rl-token-path outputs/pin_insert_rl_token/checkpoints/010000/pretrained_model \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
-  --num-episodes 5 \
+  --num-episodes 200 \
   --actor-action-clip-delta 0.05 \
-  --save-dir outputs/pin_insert_online_rl \
+  --warmup-episodes 5 \
+  --min-warmup-transitions 1000 \
+  --min-warmup-successes 3 \
+  --min-warmup-failures 3  \
+  --go-home-positions '{"left_shoulder_pan.pos": 2054, "left_shoulder_lift.pos": 2099, "left_elbow_flex.pos": 3041, "left_wrist_flex.pos": 1448, "left_gripper.pos": 1789, "right_shoulder_pan.pos": 2095, "right_shoulder_lift.pos": 2132, "right_elbow_flex.pos": 2984, "right_wrist_flex.pos": 1428, "right_gripper.pos": 1991}' \
+  --wandb \
+  --wandb-project pin-insert-rl \
+  --wandb-run-name run1 \
   --save-every-episodes 5
 ```
 
+`--save-dir` 现在可以不传——不传会自动生成 `outputs/online_rl/<MMDD>_<dataset-tag>/<HHMMSS>/`（跟数据集文件夹用同一个时间戳，方便对应），每次全新跑都不会互相覆盖。**续训(`--resume-from`)时必须显式传 `--save-dir`**，指向原来那次跑用的目录，不然会直接报错拦住——续训不该新开一个跟历史checkpoint不连续的目录。
+
+# 恢复训练，从明确选择的历史训练状态继续：
+step_000100/ 目录本身只适合推理，不能恢复 optimizer 和 replay buffer。
+
+evo-rlt-online-train \
+  --setup-json configs/my_so101_manifest.json \
+  --vla-path /home/wangyun/Evo-RLT/pretrained/pretrained_model \
+  --rl-token-path outputs/pin_insert_rl_token/checkpoints/010000/pretrained_model \
+  --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
+  --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
+  --num-episodes 200 \
+  --actor-action-clip-delta 0.05 \
+  --resume-from outputs/pin_insert_online_rl/step_000100/online_state.pt \
+  --save-dir outputs/pin_insert_online_rl \
+  --wandb \
+  --wandb-project pin-insert-rl \
+  --wandb-run-id run1 \
+  --wandb-resume must \
+  --save-every-episodes 5
+
+
+这个可以调reset之后的位置：
+  --go-home-positions '{"left_shoulder_pan.pos": 2054, "left_shoulder_lift.pos": 2099, "left_elbow_flex.pos": 3041, "left_wrist_flex.pos": 1448, "left_gripper.pos": 1789, "right_shoulder_pan.pos": 2095, "right_shoulder_lift.pos": 2132, "right_elbow_flex.pos": 2984, "right_wrist_flex.pos": 1428, "right_gripper.pos": 1991}' \
+
+`--num-episodes` 是续训后的总 episode 目标。例如从
+`step_000100/online_state.pt` 恢复并传 `--num-episodes 200`，会从 100 继续到 200
 --actor-action-clip-delta 用来限制 RLT Actor 输出相对于 VLA 参考动作的最大偏移
-看到Online RL update after episode ...`且loss不是NaN，再加大`--num-episodes`跑正式session
+
+# 评测
+
+evo-rlt-record full \
+  --initial-source vla \
+  --setup-json configs/my_so101_manifest.json \
+  --policy-path outputs/pin_insert_online_rl/step_000100 \
+  --vla-path /home/wangyun/Evo-RLT/pretrained/pretrained_model \
+  --rl-token-path outputs/pin_insert_rl_token/checkpoints/010000/pretrained_model \
+  --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
+  --split-critical-phase \
+  --no-rtc \
+  --num-episodes 10 \
+  --dataset-tag eval_pin_insert
+
+phase mode可以选择：always_rl/always_vla/manual
+
+# 删除bufferl里面的某个episode
+会先把原文件备份成 latest_online_state.pt.bak，再把episode 41的所有transition从buffer里删掉、覆写回 latest_online_state.pt。跑完会打印删了多少条、buffer从多少条变成多少条。
+
+evo-rlt-prune-online-state \
+  --state-path outputs/pin_insert_online_rl/latest_online_state.pt \
+  --episode-id 41 \
+  --in-place
+
+如果不想直接覆写、想先看看结果对不对，去掉 --in-place 就行，会另外写一个 latest_online_state.pt.pruned.pt，原文件不动：
+evo-rlt-prune-online-state \
+  --state-path outputs/pin_insert_online_rl/latest_online_state.pt \
+  --episode-id 41
 
 ## 按键 + episode之间的reset窗口
 
@@ -84,7 +142,7 @@ episode结束（按s/f）后依次发生两件事：
 这两段时间都不计入数据/replay buffer。`--go-home-time-s 0`可以关掉第一步。
 
 
-## 跑前检查
+## 跑前检查（不用）
 
 ```bash
 python diagnostics/check_config_consistency.py \
@@ -92,6 +150,21 @@ python diagnostics/check_config_consistency.py \
   --cache-build-chunk-length 10 --cache-build-frame-stride 2 \
   --deploy-chunk-exec-steps 25 --deploy-phase-mode manual
 ```
+
+
+## warmup 门槛
+# recorded_episodes >= 5 
+至少完成 5 个有效 episode，避免刚启动、数据量过少时立刻训练。
+# transitions >= 1000 
+Replay Buffer 中至少要有 1000 条状态转移。一条 transition 大致包括：
+当前状态 + 执行动作 + reward + 下一状态 + 是否结束
+它不是图像帧数，也不是 episode 数。一个 episode 可以产生几十或几百条 transition，具体数量取决于 critical phase 持续时间和 transition 构造方式。
+# successes >= 3 
+Replay Buffer 中至少包含 3 个成功的 critical-phase episode。成功数据让 critic 学会哪些状态和动作具有较高价值
+# failures >= 3 
+至少包含 3 个失败的 critical-phase episode。失败数据让 critic 能够区分“好动作”和“坏动作”。
+# critic only
+warm_up结束之后会跑10个只更新crtic的不更新actor的
 
 ## 关键参数速查
 

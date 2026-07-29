@@ -143,6 +143,22 @@ def build_parser() -> argparse.ArgumentParser:
     full.add_argument("--pedal-outcome", action=argparse.BooleanOptionalAction, default=False)
     full.add_argument("--episode-outcome-key", default="r")
     full.add_argument("--double-tap-window-s", type=float, default=0.6)
+    full.add_argument(
+        "--split-critical-phase", action=argparse.BooleanOptionalAction, default=False,
+        help="Toggle just the critical sub-phase with --rlt-toggle-key (r) instead of using "
+        "it as the whole-episode outcome key -- VLA drives the rest of the episode before "
+        "and after it, and the human separately labels the whole episode's outcome with "
+        "s/f. This is what actually lets --phase-mode manual do anything when loading a "
+        "trained rlt_ac --policy-path for evaluation; --episode-outcome-key/--pedal-outcome "
+        "are ignored when this is set. Forces --phase-mode manual (default when omitted). "
+        "Off by default -- full's existing behavior is unchanged.",
+    )
+    full.add_argument("--rlt-toggle-key", default="r", help="Only used with --split-critical-phase.")
+    full.add_argument(
+        "--teleop-toggle-key", default="space",
+        help="Only used with --split-critical-phase (grabs manual control as a safety net).",
+    )
+    full.add_argument("--estop-key", default="x", help="Only used with --split-critical-phase.")
     full.set_defaults(func=run_full)
 
     live = subparsers.add_parser("live", help="Run policy live on the robot without saving a dataset.")

@@ -70,8 +70,17 @@ class RLTOnlineCollector:
             # Capture state at chunk start. During intervention state_vec may be None;
             # fall back to the previous transition's state so human chunks are not dropped.
             if state_vec is not None:
-                self._chunk_state = state_vec
-                self._chunk_ref = ref_chunk
+                # rlt.get_last_chunk_tensors() returns compute_chunk()'s raw
+                # batched tensors ((1, D) / (1, C, action_dim), B is always 1
+                # for live single-robot inference) -- squeeze the leading
+                # batch dim here so stored state/ref match exec_chunk's
+                # unbatched (C, action_dim) shape. Without this, a chunk
+                # never touched by human intervention keeps the (1, C, D)
+                # shape while an intervened chunk gets (C, D) from
+                # exec_chunk.clone() below, and ReplayBuffer._collate()'s
+                # torch.stack() crashes the first time a batch mixes both.
+                self._chunk_state = state_vec.squeeze(0) if state_vec.dim() > 1 else state_vec
+                self._chunk_ref = ref_chunk.squeeze(0) if ref_chunk is not None and ref_chunk.dim() > 2 else ref_chunk
             elif self._prev_transition is not None:
                 self._chunk_state = self._prev_transition.next_state_vec
                 self._chunk_ref = self._prev_transition.next_ref_chunk

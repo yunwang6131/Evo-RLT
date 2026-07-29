@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from evo_rlt.adapters.lerobot.record.common import (
@@ -148,9 +149,23 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--online_rl.save_every_episodes={args.save_every_episodes}",
         f"--online_rl.go_home_time_s={args.go_home_time_s}",
         f"--online_rl.go_home_gripper_value={args.go_home_gripper_value}",
+        f"--online_rl.wandb={'true' if args.wandb else 'false'}",
+        f"--online_rl.wandb_project={args.wandb_project}",
     ]
     if args.actor_action_clip_delta is not None:
         argv.append(f"--policy.actor_action_clip_delta={args.actor_action_clip_delta}")
+    if args.go_home_positions is not None:
+        argv.append(f"--online_rl.go_home_positions={args.go_home_positions}")
+    if args.wandb_entity is not None:
+        argv.append(f"--online_rl.wandb_entity={args.wandb_entity}")
+    if args.wandb_run_name is not None:
+        argv.append(f"--online_rl.wandb_run_name={args.wandb_run_name}")
+    if args.wandb_run_id is not None:
+        argv.append(f"--online_rl.wandb_run_id={args.wandb_run_id}")
+    if args.wandb_resume is not None:
+        argv.append(f"--online_rl.wandb_resume={args.wandb_resume}")
+    if args.resume_from is not None:
+        argv.append(f"--online_rl.resume_from={args.resume_from}")
     return argv
 
 
@@ -195,16 +210,37 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
         "(success or failure) before the next one starts -- use it to physically "
         "reposition task objects (go-home does not move them)."
     )
+    if args.wandb:
+        print(
+            f"Wandb: project={args.wandb_project} entity={args.wandb_entity} "
+            f"run_name={args.wandb_run_name} run_id={args.wandb_run_id} "
+            f"resume={args.wandb_resume}"
+        )
+    if args.resume_from:
+        print(f"Resuming online-RL state from: {args.resume_from}")
 
 
 def run_online_train(args: argparse.Namespace) -> None:
     set_offline_env()
+    if args.wandb_resume is not None and args.wandb_run_id is None:
+        raise ValueError("--wandb-resume requires --wandb-run-id (the original W&B run ID).")
     keys = {args.teleop_toggle_key, args.estop_key, args.rlt_toggle_key}
     if len(keys) != 3:
         raise ValueError("--teleop-toggle-key, --estop-key, and --rlt-toggle-key must be distinct.")
 
     setup = load_robot_setup(args.setup_json)
     paths = resolve_run_paths(setup.setup, args.dataset_tag, DEFAULT_DATASET_NAME_PREFIX)
+    if args.save_dir is None:
+        if args.resume_from is not None:
+            raise ValueError(
+                "--resume-from requires --save-dir pointing at the same directory the "
+                "resumed run used (so new checkpoints land alongside its history) -- pass "
+                "it explicitly instead of relying on the auto-generated default."
+            )
+        # Mirrors the dataset run folder's own <MMDD>_<tag>/<prefix>_<HHMMSS> timestamp so
+        # a session's checkpoints and its raw dataset are easy to correlate, and so
+        # back-to-back fresh runs never collide/overwrite each other's checkpoints.
+        args.save_dir = str(Path("outputs/online_rl") / paths.day_dir.name / paths.dataset_root.name)
     configure_logging(paths.log_file, args.log_level)
     remove_existing_dataset(paths.dataset_root)
     teleop_argv = build_teleop_argv(setup.leaders, no_teleop=False)
@@ -370,7 +406,16 @@ def build_parser() -> argparse.ArgumentParser:
     # actor -- which directly drives the robot -- should not.
     parser.add_argument("--lr-actor", type=float, default=3e-5)
     parser.add_argument("--lr-critic", type=float, default=1e-4)
-    parser.add_argument("--save-dir", required=True)
+    parser.add_argument(
+        "--save-dir", default=None,
+        help="Where to write step_NNNNNN checkpoints, selectable "
+        "step_NNNNNN/online_state.pt training snapshots, and latest_online_state.pt. If omitted, "
+        "auto-generated under outputs/online_rl/<MMDD>_<dataset-tag>/<HHMMSS>/, timestamped "
+        "the same way as the raw dataset folder so a fresh session never collides with a "
+        "previous one. Required (not auto-generated) when --resume-from is set, so new "
+        "checkpoints land alongside the resumed run's history instead of a disconnected "
+        "new folder -- pass the same --save-dir the original run used.",
+    )
     parser.add_argument("--save-every-episodes", type=int, default=5)
     parser.add_argument(
         "--go-home-time-s", type=float, default=3.0,
@@ -382,6 +427,55 @@ def build_parser() -> argparse.ArgumentParser:
         "--go-home-gripper-value", type=float, default=100.0,
         help="Gripper target (0-100) during go-home. VERIFY which end means 'open' for "
         "your specific hardware (mounting-dependent) before relying on this.",
+    )
+    parser.add_argument(
+        "--go-home-positions",
+        default=(
+            '{"left_shoulder_pan.pos": 2054, "left_shoulder_lift.pos": 2099, '
+            '"left_elbow_flex.pos": 3041, "left_wrist_flex.pos": 1448, "left_gripper.pos": 1789, '
+            '"right_shoulder_pan.pos": 2095, "right_shoulder_lift.pos": 2132, '
+            '"right_elbow_flex.pos": 2984, "right_wrist_flex.pos": 1428, "right_gripper.pos": 1991}'
+        ),
+        help="Per-joint go-home targets as raw motor ticks, as a JSON object -- paste the "
+        "POS column straight from lerobot-calibrate's \"recording positions\" screen, no "
+        "manual conversion needed. Defaults to this rig's own calibrated reset pose (the "
+        "one recorded in README_online.md) -- NOT portable to a different physical robot "
+        "or a re-calibration; pass --go-home-positions explicitly to override, or "
+        '--go-home-positions "{}" to fall back to the calibrated midpoint (0 degrees) for '
+        "every joint. Joints not listed fall back to the calibrated midpoint; gripper "
+        "joints listed here override --go-home-gripper-value.",
+    )
+    parser.add_argument(
+        "--resume-from", default=None,
+        help="Explicit path to a complete online_state.pt snapshot from a previous run "
+        "(e.g. outputs/pin_insert_online_rl/step_000100/online_state.pt). "
+        "latest_online_state.pt is also accepted for crash recovery, but is not required. "
+        "Restores actor/critic/"
+        "target_critic weights, optimizer momentum, the full replay buffer, and the "
+        "warmup/critic-only anchor, then resumes the episode counter from there -- "
+        "--num-episodes is a total target inclusive of the resumed count, not "
+        "'N more episodes'. Recording still starts a fresh video dataset; only the "
+        "online-RL training state is carried over. Omit to start a fresh session "
+        "(default).",
+    )
+    parser.add_argument(
+        "--wandb", action=argparse.BooleanOptionalAction, default=False,
+        help="Log actor/critic loss and replay-buffer/warmup progress to Weights & Biases, "
+        "one point per recorded episode. Requires `pip install evo-rlt[wandb]` and "
+        "`wandb login` beforehand. No model weights/checkpoints are uploaded.",
+    )
+    parser.add_argument("--wandb-project", default="evo-rlt")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument(
+        "--wandb-run-id", default=None,
+        help="Stable W&B run ID (not the display name). Reuse the original ID to append "
+        "metrics to the same run.",
+    )
+    parser.add_argument(
+        "--wandb-resume", choices=["allow", "must", "never", "auto"], default=None,
+        help="W&B resume policy. For an intentional continuation, pass --wandb-run-id "
+        "<original-id> --wandb-resume must.",
     )
     return parser
 

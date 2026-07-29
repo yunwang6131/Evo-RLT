@@ -415,6 +415,29 @@ single tap    success, end current episode, start next episode
 double tap    failure, end current episode, start next episode
 ```
 
+Evaluating a trained `rlt_ac` checkpoint with manual critical-phase control:
+
+`--phase-mode manual` alone does **not** let you toggle into the critical
+phase mid-episode -- with no `--split-critical-phase`, nothing ever calls the
+policy's phase controller, so a loaded checkpoint's actor is never invoked
+even though `phase_mode=manual` was requested. Add `--split-critical-phase`
+to get a second, independent control scheme: `--rlt-toggle-key` (`r` by
+default) toggles *only* the critical sub-phase -- VLA drives the rest of the
+episode before and after it -- while the whole episode's outcome is labeled
+separately with `s`/`f`. `space` grabs manual control as a safety net.
+
+```bash
+evo-rlt-record full \
+  --initial-source vla \
+  --setup-json <ROBOT_SETUP_JSON> \
+  --policy-path <TRAINED_RLT_AC_CHECKPOINT> \
+  --vla-path <BASE_OR_FINETUNED_VLA_PT> \
+  --rl-token-path <RL_TOKEN_CHECKPOINT> \
+  --split-critical-phase \
+  --num-episodes 10 \
+  --dataset-tag eval_manual_critical
+```
+
 <a id="repository-layout"></a>
 
 ## 🗂️ Repository Layout

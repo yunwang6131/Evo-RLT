@@ -24,7 +24,8 @@ lerobot = [
     "feetech-servo-sdk>=1.0.0",
 ]
 test = ["pytest>=8.1", "pytest-timeout>=2.4"]
-dev = ["evo-rlt[lerobot,test]", "ruff>=0.6"]
+wandb = ["wandb>=0.16"]
+dev = ["evo-rlt[lerobot,test,wandb]", "ruff>=0.6"]
 
 [project.scripts]
 evo-rlt-build-transition-cache = "evo_rlt.cli.build_transition_cache:main"
@@ -38,6 +39,7 @@ evo-rlt-train-rl-token = "evo_rlt.cli.train_rl_token:main"
 evo-rlt-collect-default = "evo_rlt.adapters.lerobot.record.cli:collect_default_main"
 evo-rlt-record = "evo_rlt.adapters.lerobot.record.cli:main"
 evo-rlt-online-train = "evo_rlt.adapters.lerobot.record.online_cli:main"
+evo-rlt-prune-online-state = "evo_rlt.adapters.lerobot.record.prune_state_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

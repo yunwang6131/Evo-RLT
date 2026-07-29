@@ -806,7 +806,44 @@ def print_segment_summary(args: argparse.Namespace, paths) -> None:
 
 
 def run_full(args: argparse.Namespace) -> None:
+    """Record the full trajectory. Default behavior (--split-critical-phase
+    off) is unchanged: --episode-outcome-key (r by default) is the single
+    whole-episode outcome key, and --phase-mode controls the policy's phase
+    for the whole episode with no mid-episode toggle.
+
+    --split-critical-phase switches to a second, independent control scheme
+    (matching evo-rlt-online-train's): --rlt-toggle-key (r) toggles ONLY the
+    critical sub-phase -- VLA drives the rest of the episode before and
+    after it -- and the whole episode's outcome is labeled separately with
+    s/f. This is what actually lets --phase-mode manual do anything when
+    loading a trained rlt_ac --policy-path for evaluation: without it,
+    nothing ever calls the policy's PhaseController.trigger_critical(), so a
+    loaded checkpoint's actor is never invoked even though phase_mode=manual
+    was requested (see backend.py's rlt_active/rl_phase_key_binding gating).
+    online_rl stays disabled either way (default) -- pure inference, no
+    reward flush, no replay buffer, no gradient updates.
+    """
     set_offline_env()
+    split = args.split_critical_phase
+    if split:
+        if args.phase_mode not in (None, "manual"):
+            raise ValueError("--split-critical-phase requires --phase-mode manual (or omit --phase-mode).")
+        _validate_distinct_keys(
+            rlt_toggle_key=args.rlt_toggle_key,
+            teleop_toggle_key=args.teleop_toggle_key,
+            estop_key=args.estop_key,
+        )
+        if args.reset_time_s is None:
+            args.reset_time_s = 15
+        # full's own add_rtc_args(full) call (build_parser()) doesn't set
+        # these two -- only apply the validated defaults the standalone eval
+        # command used to have when the user hasn't overridden them, without
+        # changing add_rtc_args' shared defaults for non-split full users.
+        if args.vla_rtc_execution_horizon is None:
+            args.vla_rtc_execution_horizon = 25
+        if args.rtc_action_queue_size_to_get_new_actions is None:
+            args.rtc_action_queue_size_to_get_new_actions = 30
+
     setup = load_robot_setup(args.setup_json)
     # LeRobot reserves dataset names beginning with ``eval_`` for policy
     # rollouts.  A teleoperation-only recording has no policy, so using that
@@ -821,6 +858,8 @@ def run_full(args: argparse.Namespace) -> None:
         raise ValueError("full recording with --initial-source vla requires --policy-path")
     if args.initial_source == "teleop" and not teleop_argv:
         raise ValueError("full recording with --initial-source teleop requires leader teleop arms")
+    if split and args.policy_path is None:
+        raise ValueError("--split-critical-phase requires --policy-path (a trained rlt_ac checkpoint).")
 
     leader_cal_dir = None
     with TemporaryDirectory(prefix="record-full-") as cal_dir:
@@ -834,7 +873,7 @@ def run_full(args: argparse.Namespace) -> None:
                 policy_path=args.policy_path,
                 vla_path=args.vla_path,
                 rl_token_path=args.rl_token_path,
-                phase_mode=args.phase_mode,
+                phase_mode="manual" if split else args.phase_mode,
                 chunk_exec_steps=args.chunk_exec_steps,
             ),
             *build_dataset_argv(
@@ -855,27 +894,59 @@ def run_full(args: argparse.Namespace) -> None:
                 vla_execution_horizon=args.vla_rtc_execution_horizon,
                 action_queue_size_to_get_new_actions=args.rtc_action_queue_size_to_get_new_actions,
             ),
-            *_episode_outcome_argv(
-                True,
-                args.default_episode_success,
-                args.discard_unlabeled_episodes,
-            ),
-            "--intervention_state_machine_enabled=true",
-            f"--policy_sync_to_teleop={'true' if teleop_argv and args.initial_source == 'vla' else 'false'}",
-            "--play_sounds=true",
         ]
+        if split:
+            sys.argv += [
+                # rl_phase_key toggles ONLY the critical sub-phase
+                # (rl_phase_key_toggles_episode left false) -- the whole
+                # episode keeps recording under VLA before and after it,
+                # ended separately by episode_success_key/episode_failure_key
+                # (s/f defaults, see RecordConfig). skip_prefix_recording=
+                # false (unlike online-train) so the full task video is kept
+                # for review, not just the critical clip.
+                "--rlt.enable=true",
+                f"--rlt.rl_phase_key={_keyboard_key_arg(args.rlt_toggle_key)}",
+                f"--rlt.rl_phase_double_tap_window_s={args.double_tap_window_s}",
+                "--rlt.rl_phase_key_toggles_critical_phase=true",
+                "--rlt.rl_phase_key_toggles_episode=false",
+                "--rlt.skip_prefix_recording=false",
+                "--rlt.start_in_teleop=false",
+                *_episode_outcome_argv(True, args.default_episode_success, args.discard_unlabeled_episodes),
+                "--intervention_state_machine_enabled=true",
+                f"--policy_sync_to_teleop={'true' if teleop_argv else 'false'}",
+                "--play_sounds=true",
+                f"--estop_key={args.estop_key}",
+            ]
+        else:
+            sys.argv += [
+                *_episode_outcome_argv(
+                    True,
+                    args.default_episode_success,
+                    args.discard_unlabeled_episodes,
+                ),
+                "--intervention_state_machine_enabled=true",
+                f"--policy_sync_to_teleop={'true' if teleop_argv and args.initial_source == 'vla' else 'false'}",
+                "--play_sounds=true",
+            ]
         if args.dry_run:
             print(" ".join(sys.argv))
             return
-        prepare_lerobot_runtime(
-            double_tap_episode_outcome_key=(
-                args.episode_outcome_key if args.pedal_outcome else None
-            ),
-            double_tap_episode_outcome_window_s=(
-                args.double_tap_window_s if args.pedal_outcome else None
-            ),
-            background_episode_video_encoding=True,
-        )
+        if split:
+            prepare_lerobot_runtime(
+                intervention_toggle_key=args.teleop_toggle_key,
+                skip_policyless_reset_loop=False,
+                background_episode_video_encoding=True,
+            )
+        else:
+            prepare_lerobot_runtime(
+                double_tap_episode_outcome_key=(
+                    args.episode_outcome_key if args.pedal_outcome else None
+                ),
+                double_tap_episode_outcome_window_s=(
+                    args.double_tap_window_s if args.pedal_outcome else None
+                ),
+                background_episode_video_encoding=True,
+            )
         from evo_rlt.adapters.lerobot.record.backend import record
 
         record()
