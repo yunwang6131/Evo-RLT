@@ -71,7 +71,6 @@ def add_default_collect_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vcodec", default="h264")
     parser.add_argument("--no-teleop", action="store_true", default=False)
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--double-tap-window-s", type=float, default=0.6)
     parser.add_argument("--vla-ref", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--play-sounds", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rlt-toggle-key", default="r")
@@ -125,7 +124,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_record_args(segment)
     add_rtc_args(segment)
     segment.add_argument("--critical-source", choices=["rlt", "vla"], required=True)
-    segment.add_argument("--double-tap-window-s", type=float, default=0.6)
     segment.add_argument("--vla-ref", action=argparse.BooleanOptionalAction, default=True)
     segment.add_argument("--chunk-exec-steps", type=int, default=25)
     segment.add_argument("--intervention-action-blend-time-s", type=float, default=0.4)
@@ -142,7 +140,6 @@ def build_parser() -> argparse.ArgumentParser:
     full.add_argument("--chunk-exec-steps", type=int, default=None)
     full.add_argument("--pedal-outcome", action=argparse.BooleanOptionalAction, default=False)
     full.add_argument("--episode-outcome-key", default="r")
-    full.add_argument("--double-tap-window-s", type=float, default=0.6)
     full.add_argument(
         "--split-critical-phase", action=argparse.BooleanOptionalAction, default=False,
         help="Toggle just the critical sub-phase with --rlt-toggle-key (r) instead of using "

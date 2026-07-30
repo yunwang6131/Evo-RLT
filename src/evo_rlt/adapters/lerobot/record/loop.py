@@ -216,7 +216,6 @@ def record_loop(
     skip_prefix_recording: bool = False,
     rl_phase_key_toggles_episode: bool = False,
     rl_phase_key_toggles_critical_phase: bool = False,
-    rl_phase_double_tap_window_s: float = 1.0,
     start_in_teleop: bool = False,
     intervention_action_blend_time_s: float = 0.0,
 ):
@@ -394,7 +393,6 @@ def record_loop(
     start_episode_t = time.perf_counter()
     prev_phase = PHASE_PREFIX
     rl_phase_started = False
-    pending_end_press_time: float | None = None
     final_outcome: str | None = None
     _frame_idx = 0
     _cuda_cleanup_interval = 500  # defrag CUDA allocator every N frames
@@ -406,7 +404,6 @@ def record_loop(
 
     def _start_intervention() -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
-        nonlocal pending_end_press_time
         intervention_state = INTERVENTION_STATE_ACTIVE
         set_teleop_manual_control(True)
         if rlt_intervention_tracker is not None:
@@ -421,7 +418,6 @@ def record_loop(
         if rlt is not None:
             rlt.interrupt_chunk()
             log_say("intervene", play_sounds=True)
-        pending_end_press_time = None
         logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
 
     def _reset_policy_after_intervention_release() -> None:
@@ -506,13 +502,8 @@ def record_loop(
                 from lerobot.utils.audio_feedback import say_failure
                 say_failure()
 
-    def _finish_active_rl_phase(toggles_episode: bool, toggles_cp: bool) -> None:
-        nonlocal final_outcome, pending_end_press_time, rl_phase_started
-        if pending_end_press_time is None:
-            pending_end_press_time = time.perf_counter()
-            log_say("RL end", play_sounds=True)
-            logging.info("RL end pending - tap r again within %.1fs to mark failure", rl_phase_double_tap_window_s)
-            return
+    def _mark_rl_phase_failure(toggles_episode: bool, toggles_cp: bool) -> None:
+        nonlocal final_outcome, rl_phase_started
         if toggles_episode:
             final_outcome = EPISODE_FAILURE
             events["exit_early"] = True
@@ -522,18 +513,33 @@ def record_loop(
             if critical_phase_tracker is not None and dataset is not None:
                 critical_phase_tracker.mark_failure(dataset.episode_buffer["size"])
             if rlt_online_collector is not None:
-                # Reward the critical phase's OWN outcome, not whatever
-                # happens in the rest of the (still-recording) episode --
-                # see the matching comment in _resolve_pending_rl_phase_end.
+                # Reward the critical phase independently of the full episode.
                 rlt_online_collector.flush_episode(False)
             rl_phase_started = False
-        pending_end_press_time = None
         log_say("failure", play_sounds=True)
-        logging.info("RL phase ended via double-tap (failure)")
+        logging.info("RL phase ended via failure key (failure)")
+
+    def _mark_rl_phase_success(toggles_episode: bool, toggles_cp: bool) -> None:
+        nonlocal final_outcome, rl_phase_started
+        if toggles_episode:
+            final_outcome = EPISODE_SUCCESS
+            events["exit_early"] = True
+        elif toggles_cp:
+            if rlt is not None:
+                rlt.set_vla_mode()
+            if critical_phase_tracker is not None and dataset is not None:
+                critical_phase_tracker.mark_success(dataset.episode_buffer["size"])
+            if rlt_online_collector is not None:
+                # Flush at critical-phase end; the later VLA tail belongs only
+                # to the recorded dataset, not this actor-controlled reward.
+                rlt_online_collector.flush_episode(True)
+            rl_phase_started = False
+        log_say("success", play_sounds=True)
+        logging.info("RL phase ended via success key (success)")
 
     def _start_rl_phase_from_key() -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
-        nonlocal rl_phase_started, pending_end_press_time
+        nonlocal rl_phase_started
         if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
             intervention_state = INTERVENTION_STATE_RELEASE
             intervention_blend_start_t = None
@@ -544,7 +550,6 @@ def record_loop(
         if critical_phase_tracker is not None and dataset is not None:
             critical_phase_tracker.toggle(dataset.episode_buffer["size"])
         rl_phase_started = True
-        pending_end_press_time = None
         log_say("RL start", play_sounds=True)
         logging.info("RL phase started (r key)")
 
@@ -562,38 +567,21 @@ def record_loop(
         toggles_episode = rl_phase_key_toggles_episode
         toggles_cp = rl_phase_key_toggles_critical_phase
         if (toggles_episode or toggles_cp) and rl_phase_started:
-            _finish_active_rl_phase(toggles_episode, toggles_cp)
+            _mark_rl_phase_success(toggles_episode, toggles_cp)
             return
         _start_rl_phase_from_key()
 
-    def _resolve_pending_rl_phase_end() -> None:
-        nonlocal final_outcome, pending_end_press_time, rl_phase_started
-        if pending_end_press_time is None or final_outcome is not None:
+    def _handle_rl_phase_failure_event() -> None:
+        if not events.get("mark_rl_phase_failure", False):
             return
-        if (time.perf_counter() - pending_end_press_time) < rl_phase_double_tap_window_s:
+        events["mark_rl_phase_failure"] = False
+        if not rl_phase_started:
             return
-        if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+        toggles_episode = rl_phase_key_toggles_episode
+        toggles_cp = rl_phase_key_toggles_critical_phase
+        if not (toggles_episode or toggles_cp):
             return
-        if rl_phase_key_toggles_episode:
-            final_outcome = EPISODE_SUCCESS
-            events["exit_early"] = True
-        elif rl_phase_key_toggles_critical_phase and rlt is not None:
-            rlt.set_vla_mode()
-            if critical_phase_tracker is not None and dataset is not None:
-                critical_phase_tracker.mark_success(dataset.episode_buffer["size"])
-            if rlt_online_collector is not None:
-                # Flush the online replay buffer right here, at the moment
-                # the critical phase itself resolves -- NOT at whole-episode
-                # end. The episode keeps recording afterward (e.g. VLA
-                # autonomously finishing a subsequent placement step), but
-                # that tail is for the dataset only: RLTOnlineCollector stops
-                # accumulating once flushed (see its `_flushed` guard) so the
-                # RL reward reflects only what the actor actually controlled.
-                rlt_online_collector.flush_episode(True)
-            rl_phase_started = False
-        pending_end_press_time = None
-        log_say("success", play_sounds=True)
-        logging.info("RL phase ended via single press (success)")
+        _mark_rl_phase_failure(toggles_episode, toggles_cp)
 
     def _release_active_intervention_after_phase_end() -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
@@ -743,7 +731,7 @@ def record_loop(
         _handle_intervention_toggle()
         _handle_critical_phase_events()
         _handle_rl_phase_start_event()
-        _resolve_pending_rl_phase_end()
+        _handle_rl_phase_failure_event()
         _handle_end_phase_event("end_phase_success", EPISODE_SUCCESS)
         _handle_end_phase_event("end_phase_failure", EPISODE_FAILURE)
 

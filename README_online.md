@@ -43,16 +43,18 @@ evo-rlt-online-train \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 200 \
   --actor-action-clip-delta 0.1 \
-  --beta 0.1 \
+  --beta 0.3 \
   --warmup-episodes 5 \
   --min-warmup-transitions 1000 \
   --min-warmup-successes 3 \
   --min-warmup-failures 3  \
+  --utd-ratio 5 \
   --gamma 0.9995 \
+  --max-updates-per-episode 800 \
   --wandb \
   --wandb-project pin-insert-rl \
-  --wandb-run-name run1 \
-  --save-every-episodes 5
+  --wandb-run-name jump4 \
+  --save-every-episodes 2
 ```
 
 `--save-dir` 现在可以不传——不传会自动生成 `outputs/online_rl/<MMDD>_<dataset-tag>/<HHMMSS>/`（跟数据集文件夹用同一个时间戳，方便对应），每次全新跑都不会互相覆盖。**续训(`--resume-from`)时必须显式传 `--save-dir`**，指向原来那次跑用的目录，不然会直接报错拦住——续训不该新开一个跟历史checkpoint不连续的目录。
@@ -67,11 +69,12 @@ evo-rlt-online-train \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 200 \
   --actor-action-clip-delta 0.1 \
-  --resume-from outputs/pin_insert_online_rl/step_000100/online_state.pt \
-  --save-dir outputs/pin_insert_online_rl \
+  --resume-from \outputs/pin_insert_online_rl/step_000050/online_state.pt --save-dir outputs/pin_insert_online_rl \
+  --beta 0.3 \
   --wandb \
   --wandb-project pin-insert-rl \
-  --wandb-run-id run1 \
+  --gamma 0.9995 \
+  --wandb-run-id 50nvh69z \
   --wandb-resume must \
   --save-every-episodes 5
 
@@ -80,7 +83,7 @@ evo-rlt-online-train \
   --go-home-positions '{"left_shoulder_pan.pos": 2054, "left_shoulder_lift.pos": 2099, "left_elbow_flex.pos": 3041, "left_wrist_flex.pos": 1448, "left_gripper.pos": 1789, "right_shoulder_pan.pos": 2095, "right_shoulder_lift.pos": 2132, "right_elbow_flex.pos": 2984, "right_wrist_flex.pos": 1428, "right_gripper.pos": 1991}' \
 
 `--num-episodes` 是续训后的总 episode 目标。例如从
-`step_000100/online_state.pt` 恢复并传 `--num-episodes 200`，会从 100 继续到 200
+`step_000050/online_state.pt` 恢复并传 `--num-episodes 200`，会从 50 继续到 200
 --actor-action-clip-delta 用来限制 RLT Actor 输出相对于 VLA 参考动作的最大偏移
 
 # 评测
@@ -119,8 +122,10 @@ evo-rlt-prune-online-state \
 ## 按键 + episode之间的reset窗口
 
 ```text
-r：进入/退出critical phase（单击=success，double-tap-window-s窗口内双击=failure）——
-   只结束critical phase，不结束整个episode，reward就在这一刻写进replay buffer，
+r：第一次按进入critical phase，第二次按立即判定success
+u：立即把当前critical phase判定为failure
+   r的success和u的failure都只结束critical phase，不结束整个episode，
+   reward就在这一刻写进replay buffer，
    之后自动切回VLA继续跑（比如把组装好的东西放到指定区域），这段VLA跑的不算训练数据
 s / f：整个episode真正结束（等VLA把后续动作做完、确认整体OK了再按）
 space（或 -i）：teleop 接管
@@ -129,8 +134,8 @@ space（或 -i）：teleop 接管
     按space → intervention开始，你用leader臂直接接管，actor被打断
     再按space → intervention结束，如果critical phase还没结束，actor自动恢复接管
     ↓（可以反复intervene任意次）
-  按r（第2次，0.6s确认窗口内不再按）→ critical phase结束，判定success，
-    reward在这一刻写进replay buffer；如果0.6s内又按了一次r，判定failure
+  按r（第2次）→ critical phase立即结束，判定success，
+    reward在这一刻写进replay buffer；期间任意时刻按u则立即判定failure
     ↓
   VLA自动接管，继续做后面的步骤
     ↓

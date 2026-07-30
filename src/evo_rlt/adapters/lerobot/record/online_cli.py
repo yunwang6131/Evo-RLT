@@ -108,17 +108,17 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         # physically reset the scene before the next episode's recording (and
         # possible autonomous critical-phase attempt) begins.
         f"--dataset.reset_time_s={args.reset_time_s}",
-        # rlt_toggle_key starts the critical-phase attempt; the next press (or
-        # double-tap) ends JUST the critical phase (success/failure), hands
-        # control back to VLA, and flushes that reward into the online replay
-        # buffer right there (see loop.py) -- it does NOT end the recorded
-        # episode. The episode keeps recording (e.g. VLA autonomously
-        # finishing a subsequent step like placing the object) until you
-        # press the whole-episode outcome key (episode_success_key/
-        # episode_failure_key, s/f by default) once that's done.
+        # rlt_toggle_key starts the critical-phase attempt; the next press
+        # ends it as success immediately, or the u key ends
+        # it as failure immediately -- either way hands control back to VLA
+        # and flushes that reward into the online replay buffer right there
+        # (see loop.py) -- it does NOT end the recorded episode. The episode
+        # keeps recording (e.g. VLA autonomously finishing a subsequent step
+        # like placing the object) until you press the whole-episode outcome
+        # key (episode_success_key/episode_failure_key, s/f by default) once
+        # that's done.
         "--rlt.enable=true",
         f"--rlt.rl_phase_key={args.rlt_toggle_key}",
-        f"--rlt.rl_phase_double_tap_window_s={args.double_tap_window_s}",
         f"--rlt.intervention_action_blend_time_s={args.intervention_blend_time_s}",
         "--rlt.skip_prefix_recording=true",
         "--rlt.rl_phase_key_toggles_critical_phase=true",
@@ -194,10 +194,10 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
         "stay near the leader arm / power cutoff)"
     )
     print(
-        f"Controls: {args.rlt_toggle_key}=start/end critical-phase attempt (double-tap "
-        f"within {args.double_tap_window_s:.1f}s = failure; reward flushed immediately, "
-        "recording continues under VLA afterward), s/f=end the whole recorded episode "
-        "once VLA finishes, "
+        f"Controls: {args.rlt_toggle_key}=start critical-phase attempt, then end it as "
+        "success immediately, or u=end it as failure "
+        "immediately (reward flushed immediately, recording continues under VLA "
+        "afterward), s/f=end the whole recorded episode once VLA finishes, "
         f"{args.teleop_toggle_key} or {args.estop_key}=grab manual control"
     )
     print(
@@ -224,9 +224,9 @@ def run_online_train(args: argparse.Namespace) -> None:
     set_offline_env()
     if args.wandb_resume is not None and args.wandb_run_id is None:
         raise ValueError("--wandb-resume requires --wandb-run-id (the original W&B run ID).")
-    keys = {args.teleop_toggle_key, args.estop_key, args.rlt_toggle_key}
-    if len(keys) != 3:
-        raise ValueError("--teleop-toggle-key, --estop-key, and --rlt-toggle-key must be distinct.")
+    keys = {args.teleop_toggle_key, args.estop_key, args.rlt_toggle_key, "u"}
+    if len(keys) != 4:
+        raise ValueError("--teleop-toggle-key, --estop-key, --rlt-toggle-key, and the fixed 'u' failure key must be distinct.")
 
     setup = load_robot_setup(args.setup_json)
     paths = resolve_run_paths(setup.setup, args.dataset_tag, DEFAULT_DATASET_NAME_PREFIX)
@@ -304,7 +304,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-tag", default=DEFAULT_DATASET_TAG)
     parser.add_argument("--vcodec", default="h264")
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--double-tap-window-s", type=float, default=0.6)
     parser.add_argument(
         "--intervention-blend-time-s", type=float, default=0.3,
         help="Smooth both transitions across a human intervention -- takeover (space "
