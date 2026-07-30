@@ -42,12 +42,13 @@ evo-rlt-online-train \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 200 \
-  --actor-action-clip-delta 0.05 \
+  --actor-action-clip-delta 0.1 \
+  --beta 0.1 \
   --warmup-episodes 5 \
   --min-warmup-transitions 1000 \
   --min-warmup-successes 3 \
   --min-warmup-failures 3  \
-  --go-home-positions '{"left_shoulder_pan.pos": 2054, "left_shoulder_lift.pos": 2099, "left_elbow_flex.pos": 3041, "left_wrist_flex.pos": 1448, "left_gripper.pos": 1789, "right_shoulder_pan.pos": 2095, "right_shoulder_lift.pos": 2132, "right_elbow_flex.pos": 2984, "right_wrist_flex.pos": 1428, "right_gripper.pos": 1991}' \
+  --gamma 0.9995 \
   --wandb \
   --wandb-project pin-insert-rl \
   --wandb-run-name run1 \
@@ -57,7 +58,6 @@ evo-rlt-online-train \
 `--save-dir` 现在可以不传——不传会自动生成 `outputs/online_rl/<MMDD>_<dataset-tag>/<HHMMSS>/`（跟数据集文件夹用同一个时间戳，方便对应），每次全新跑都不会互相覆盖。**续训(`--resume-from`)时必须显式传 `--save-dir`**，指向原来那次跑用的目录，不然会直接报错拦住——续训不该新开一个跟历史checkpoint不连续的目录。
 
 # 恢复训练，从明确选择的历史训练状态继续：
-step_000100/ 目录本身只适合推理，不能恢复 optimizer 和 replay buffer。
 
 evo-rlt-online-train \
   --setup-json configs/my_so101_manifest.json \
@@ -66,7 +66,7 @@ evo-rlt-online-train \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 200 \
-  --actor-action-clip-delta 0.05 \
+  --actor-action-clip-delta 0.1 \
   --resume-from outputs/pin_insert_online_rl/step_000100/online_state.pt \
   --save-dir outputs/pin_insert_online_rl \
   --wandb \
@@ -94,10 +94,14 @@ evo-rlt-record full \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --split-critical-phase \
   --no-rtc \
-  --num-episodes 10 \
+  --num-episodes 30 \
   --dataset-tag eval_pin_insert
 
 phase mode可以选择：always_rl/always_vla/manual
+
+# 收集SFT之后的pi05_baseline
+
+evo-rlt-record full   --initial-source vla   --setup-json configs/my_so101_manifest.json   --policy-path /home/wangyun/Evo-RLT/pretrained/pretrained_model   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area."   --dataset-tag pi05_baseline_eval   --num-episodes 30   --episode-time-s 600   --reset-time-s 6   --fps 30   --vcodec h264
 
 # 删除bufferl里面的某个episode
 会先把原文件备份成 latest_online_state.pt.bak，再把episode 41的所有transition从buffer里删掉、覆写回 latest_online_state.pt。跑完会打印删了多少条、buffer从多少条变成多少条。
@@ -168,17 +172,10 @@ warm_up结束之后会跑10个只更新crtic的不更新actor的
 
 ## 关键参数速查
 
-```text
---reset-time-s
---warmup-episodes / --min-warmup-transitions / --min-warmup-successes / --min-warmup-failures
-    只有episode数、transition数、成功数、失败数全部达标才真正开始训练（不是任一条件满足就行）
---critic-only-episodes   warmup**实际满足门槛那一刻**算起，再N个episode只更新critic，actor
-    继续冻结在=VLA的状态（不是warmup_episodes+critic_only_episodes这个固定offset——
-    如果warmup因为成功/失败数不够拖到很后面才达标，固定offset会导致critic-only被跳过）
 --utd-ratio（默认1）/ --max-updates-per-episode（默认200）
     更新次数 = min(本episode新增transition数 * utd_ratio, 上限)
 --lr-actor(3e-5) / --lr-critic(1e-4)   actor学得慢，critic学得快
---actor-action-clip-delta   RL actor单步动作相对VLA参考的最大偏移，安全兜底
+--actor-action-clip-delta   RL actor单步动作相对VLA参考的最大偏移
 --actor-hidden-dim/--actor-num-layers/--critic-hidden-dim/--critic-num-layers（默认512/3层）
     对齐ac_paper_screw.yaml的复杂任务档位
 --actor-fixed-std（默认0）   目前不生效——rollout和训练loss都只用actor的确定性均值，从不调用
@@ -187,3 +184,14 @@ warm_up结束之后会跑10个只更新crtic的不更新actor的
 --gamma/--beta/--tau/--actor-update-interval   TD3+BC超参，跟离线训练那套一样
 ```
 export TORCHDYNAMO_DISABLE=1
+
+
+buffer包含：
+  当前状态 state
+  实际执行动作 exec_chunk
+  VLA参考动作 ref_chunk
+  奖励 reward
+  下一状态 next_state
+  是否结束 done
+  是否人工接管 intervention
+  episode编号
