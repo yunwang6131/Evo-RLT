@@ -68,6 +68,17 @@ class ChunkACPolicy(PreTrainedPolicy):
 
         state_dim = config.rl_token_dim + config.proprio_dim
         chunk_dim = config.chunk_length * config.action_dim
+        actor_action_mask = None
+        if config.actor_rl_arm == "left":
+            # Flattening is time-major: [t0 left/right, t1 left/right, ...].
+            # Repeat a per-step mask rather than grouping all left dimensions.
+            per_step_mask = torch.cat(
+                [
+                    torch.ones(config.action_dim // 2),
+                    torch.zeros(config.action_dim // 2),
+                ]
+            )
+            actor_action_mask = per_step_mask.repeat(config.chunk_length)
 
         self.actor = ChunkActor(
             state_dim=state_dim,
@@ -80,6 +91,7 @@ class ChunkACPolicy(PreTrainedPolicy):
             layer_norm=config.actor_layer_norm,
             residual=config.actor_residual,
             residual_to_ref=config.actor_residual_to_ref,
+            action_mask=actor_action_mask,
         )
         self.critic = TwinCritic(
             state_dim=state_dim,

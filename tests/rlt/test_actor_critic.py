@@ -142,3 +142,56 @@ class TestCritic:
         q.sum().backward()
         for p in twin_critic.parameters():
             assert p.grad is not None
+
+
+def test_left_arm_action_mask_keeps_right_arm_at_reference_and_blocks_gradients():
+    chunk_length, action_dim = 3, 12
+    per_step = torch.tensor([1.0] * 6 + [0.0] * 6)
+    actor = ChunkActor(
+        state_dim=8,
+        chunk_dim=chunk_length * action_dim,
+        hidden_dim=16,
+        num_layers=1,
+        residual_to_ref=True,
+        action_mask=per_step.repeat(chunk_length),
+    )
+    # Move away from the zero-init policy so the allowed left-arm residual and
+    # its gradients are observable.
+    with torch.no_grad():
+        actor.net[-1].weight.normal_()
+        actor.net[-1].bias.normal_()
+
+    state = torch.randn(2, 8)
+    ref = torch.randn(2, chunk_length * action_dim)
+    mu, _ = actor(state, ref)
+    delta = (mu - ref).view(2, chunk_length, action_dim)
+    assert torch.count_nonzero(delta[..., :6]) > 0
+    assert torch.equal(delta[..., 6:], torch.zeros_like(delta[..., 6:]))
+
+    sampled, _ = actor.sample(state, ref)
+    sampled_delta = (sampled - ref).view(2, chunk_length, action_dim)
+    assert torch.equal(sampled_delta[..., 6:], torch.zeros_like(sampled_delta[..., 6:]))
+
+    mu.sum().backward()
+    out_grad = actor.net[-1].bias.grad.view(chunk_length, action_dim)
+    assert torch.count_nonzero(out_grad[:, :6]) > 0
+    assert torch.equal(out_grad[:, 6:], torch.zeros_like(out_grad[:, 6:]))
+
+
+def test_actor_action_mask_validates_flattened_size():
+    with pytest.raises(ValueError, match="action_mask"):
+        ChunkActor(state_dim=8, chunk_dim=24, action_mask=torch.ones(12))
+
+
+def test_action_mask_keeps_masked_dimensions_at_ref_for_non_residual_actor():
+    actor = ChunkActor(
+        state_dim=4,
+        chunk_dim=4,
+        hidden_dim=8,
+        num_layers=1,
+        residual_to_ref=False,
+        action_mask=torch.tensor([1.0, 1.0, 0.0, 0.0]),
+    )
+    ref = torch.randn(2, 4)
+    mu, _ = actor(torch.randn(2, 4), ref)
+    assert torch.equal(mu[:, 2:], ref[:, 2:])

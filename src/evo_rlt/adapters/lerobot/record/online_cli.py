@@ -64,6 +64,7 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--policy.action_dim={args.action_dim}",
         f"--policy.proprio_dim={args.proprio_dim}",
         "--policy.actor_residual_to_ref=true",
+        f"--policy.actor_rl_arm={args.rl_action_arms}",
         # With residual_to_ref, mu = ref + delta unconditionally -- the output
         # always gets the true (undropped) ref added back as a bias, even on
         # a dropout-masked training sample. So input-side reference dropout
@@ -339,8 +340,8 @@ def build_parser() -> argparse.ArgumentParser:
     # (vs. the paper/offline default 5) so a synchronous session doesn't
     # stall for a long training burst after every episode on modest
     # hardware; raise once the loop is confirmed stable.
-    parser.add_argument("--utd-ratio", type=int, default=1)
-    parser.add_argument("--max-updates-per-episode", type=int, default=200)
+    parser.add_argument("--utd-ratio", type=int, default=5)
+    parser.add_argument("--max-updates-per-episode", type=int, default=1000)
     parser.add_argument("--actor-update-interval", type=int, default=2)
 
     # Network size. Defaults match src/evo_rlt/core/configs/ac_paper_screw.yaml
@@ -350,6 +351,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--actor-num-layers", type=int, default=3)
     parser.add_argument("--actor-activation", default="relu")
     parser.add_argument("--actor-residual", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--rl-action-arms", choices=("left", "both"), default="left",
+        help="Arm(s) whose action residual may be learned. 'left' keeps every "
+        "right-arm action exactly equal to the frozen VLA reference.",
+    )
     # NOTE: currently inert. RLTActionModifier.compute_chunk() calls
     # actor.forward() (deterministic mean) for real-robot execution, never
     # actor.sample(); and actor_loss()/critic_loss() also only ever use the

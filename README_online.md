@@ -48,6 +48,7 @@ evo-rlt-online-train \
   --min-warmup-transitions 1000 \
   --min-warmup-successes 3 \
   --min-warmup-failures 3  \
+  --rl-action-arms left \
   --gamma 0.9995 \
   --wandb \
   --wandb-project pin-insert-rl \
@@ -176,6 +177,7 @@ warm_up结束之后会跑10个只更新crtic的不更新actor的
     更新次数 = min(本episode新增transition数 * utd_ratio, 上限)
 --lr-actor(3e-5) / --lr-critic(1e-4)   actor学得慢，critic学得快
 --actor-action-clip-delta   RL actor单步动作相对VLA参考的最大偏移
+--rl-action-arms（在线训练默认left）   left=仅左臂学习RL残差，右臂严格使用VLA动作；both=双臂都学习
 --actor-hidden-dim/--actor-num-layers/--critic-hidden-dim/--critic-num-layers（默认512/3层）
     对齐ac_paper_screw.yaml的复杂任务档位
 --actor-fixed-std（默认0）   目前不生效——rollout和训练loss都只用actor的确定性均值，从不调用

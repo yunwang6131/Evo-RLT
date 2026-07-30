@@ -56,6 +56,7 @@ class ChunkActor(nn.Module):
         layer_norm: bool = False,
         residual: bool = False,
         residual_to_ref: bool = False,
+        action_mask: torch.Tensor | None = None,
     ):
         super().__init__()
         if residual:
@@ -71,6 +72,15 @@ class ChunkActor(nn.Module):
         self.fixed_std = fixed_std
         self.ref_dropout_p = ref_dropout_p
         self.residual_to_ref = residual_to_ref
+        if action_mask is not None:
+            action_mask = torch.as_tensor(action_mask, dtype=torch.float32).flatten()
+            if action_mask.numel() != chunk_dim:
+                raise ValueError(
+                    f"action_mask must have {chunk_dim} entries, got {action_mask.numel()}"
+                )
+        # Derived from policy config, so it need not be stored in state_dict.
+        # This keeps checkpoints made before action masking load-compatible.
+        self.register_buffer("action_mask", action_mask, persistent=False)
         if residual_to_ref:
             # Zero-init the final layer so mu == ref_chunk exactly at init
             # (delta == 0), giving a safe starting policy for online RL on
@@ -96,7 +106,17 @@ class ChunkActor(nn.Module):
         x = torch.cat([state_vec, net_ref], dim=-1)
         delta = self.net(x)
         mu = ref_chunk_flat + delta if self.residual_to_ref else delta
+        if self.action_mask is not None:
+            # Masking is expressed relative to the VLA reference even for a
+            # non-residual actor: masked dimensions must remain VLA commands,
+            # never zero actions. For residual actors this simplifies to
+            # ref + mask * delta.
+            mask = self.action_mask.to(dtype=mu.dtype)
+            mu = ref_chunk_flat + mask * (mu - ref_chunk_flat)
         std = torch.full_like(mu, self.fixed_std)
+        if self.action_mask is not None:
+            # Sampling must not reintroduce noise on VLA-only dimensions.
+            std = std * self.action_mask.to(dtype=std.dtype)
         return mu, std
 
     def sample(

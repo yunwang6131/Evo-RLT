@@ -51,6 +51,10 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     # online RL on real hardware where a randomly-initialized actor would
     # otherwise be unsafe to run from step one.
     actor_residual_to_ref: bool = False
+    # Which arm the actor may refine. "left" masks the residual for the right
+    # half of each bimanual action vector, so those commands remain exactly the
+    # frozen VLA reference during training, target computation, and rollout.
+    actor_rl_arm: str = "both"
     # Optional safety clamp on the RL actor's per-step deviation from the VLA
     # reference chunk while in the critical/RL phase. None disables clamping
     # (existing deploy behavior). Only affects RLTActionModifier's RL branch.
@@ -113,6 +117,12 @@ class ChunkACPolicyConfig(PreTrainedConfig):
             raise ValueError(
                 f"phase_mode must be 'always_rl', 'always_vla', or 'manual', got {self.phase_mode!r}"
             )
+        if self.actor_rl_arm not in ("both", "left"):
+            raise ValueError(
+                f"actor_rl_arm must be 'both' or 'left', got {self.actor_rl_arm!r}"
+            )
+        if self.actor_rl_arm == "left" and self.action_dim % 2 != 0:
+            raise ValueError("actor_rl_arm='left' requires an even action_dim")
 
     @property
     def type(self) -> str:
