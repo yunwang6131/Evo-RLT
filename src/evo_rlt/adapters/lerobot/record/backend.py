@@ -291,6 +291,11 @@ class OnlineRLConfig:
     critic_only_episodes: int = 10
     replay_capacity: int = 20_000
     batch_size: int = 256
+    # Optional fixed demonstration cache. It is sampled separately from the
+    # online replay so a large offline dataset cannot drown out recent robot
+    # experience (and online eviction cannot erase the demonstrations).
+    offline_cache_path: str | None = None
+    offline_batch_fraction: float = 0.5
     # Actor lr is kept well below critic lr: the critic needs to adapt
     # quickly to new transitions, while the actor -- which directly drives
     # the robot -- should change slowly and conservatively online.
@@ -582,6 +587,8 @@ class RecordConfig:
                 raise ValueError("`online_rl.max_updates_per_episode` must be > 0.")
             if self.online_rl.batch_size <= 0:
                 raise ValueError("`online_rl.batch_size` must be > 0.")
+            if not (0 <= self.online_rl.offline_batch_fraction < 1):
+                raise ValueError("`online_rl.offline_batch_fraction` must be in [0, 1).")
             if self.online_rl.replay_capacity < self.online_rl.batch_size:
                 raise ValueError("`online_rl.replay_capacity` must be >= `online_rl.batch_size`.")
             if self.online_rl.save_every_episodes <= 0:

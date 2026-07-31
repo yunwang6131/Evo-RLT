@@ -143,6 +143,7 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--online_rl.use_stratified_sampling={'true' if args.stratified_sampling else 'false'}",
         f"--online_rl.replay_capacity={args.replay_capacity}",
         f"--online_rl.batch_size={args.batch_size}",
+        f"--online_rl.offline_batch_fraction={args.offline_batch_fraction}",
         f"--online_rl.lr_actor={args.lr_actor}",
         f"--online_rl.lr_critic={args.lr_critic}",
         f"--online_rl.save_dir={args.save_dir}",
@@ -154,6 +155,8 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
     ]
     if args.actor_action_clip_delta is not None:
         argv.append(f"--policy.actor_action_clip_delta={args.actor_action_clip_delta}")
+    if args.offline_cache_path is not None:
+        argv.append(f"--online_rl.offline_cache_path={args.offline_cache_path}")
     if args.go_home_positions is not None:
         argv.append(f"--online_rl.go_home_positions={args.go_home_positions}")
     if args.wandb_entity is not None:
@@ -175,6 +178,11 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
     print(f"Checkpoints: {args.save_dir}")
     print(f"VLA: {args.vla_path}")
     print(f"RL token: {args.rl_token_path}")
+    print(
+        f"Replay: online + "
+        f"{args.offline_cache_path or 'no offline cache'} "
+        f"(offline_batch_fraction={args.offline_batch_fraction if args.offline_cache_path else 0.0})"
+    )
     print(
         f"RL: warmup_episodes={args.warmup_episodes} (+min_transitions={args.min_warmup_transitions} "
         f"min_successes={args.min_warmup_successes} min_failures={args.min_warmup_failures}) "
@@ -408,6 +416,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--replay-capacity", type=int, default=20_000)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument(
+        "--offline-cache-path", default=None,
+        help="Fixed demonstration transition cache: either a cache directory "
+        "containing chunk_transitions_train.pt or that .pt file directly.",
+    )
+    parser.add_argument(
+        "--offline-batch-fraction", type=float, default=0.5,
+        help="Fraction of every gradient batch drawn from --offline-cache-path. "
+        "The remainder is sampled from online replay; ignored without a cache.",
+    )
     # Actor lr well below critic lr: the critic should adapt quickly, the
     # actor -- which directly drives the robot -- should not.
     parser.add_argument("--lr-actor", type=float, default=3e-5)

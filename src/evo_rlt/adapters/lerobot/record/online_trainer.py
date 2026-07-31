@@ -15,6 +15,7 @@ rather than a fixed offset) -- see the comments inline and on
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -26,6 +27,7 @@ from typing import Any
 import torch
 
 from evo_rlt.adapters.lerobot.online_collector import RLTOnlineCollector
+from evo_rlt.core.interfaces import ChunkTransition
 from evo_rlt.core.replay_buffer import ReplayBuffer
 from evo_rlt.core.utils import soft_update, unflatten_chunk
 
@@ -42,6 +44,10 @@ class OnlineRLTrainer:
         self.policy_cfg = policy_cfg
 
         self.replay_buffer = ReplayBuffer(capacity=online_rl_cfg.replay_capacity)
+        self.offline_buffer = self._load_offline_buffer(
+            online_rl_cfg.offline_cache_path,
+            policy_cfg=policy_cfg,
+        )
         self.collector = RLTOnlineCollector(
             replay_buffer=self.replay_buffer,
             chunk_length=policy_cfg.chunk_length,
@@ -73,6 +79,157 @@ class OnlineRLTrainer:
 
         self.wandb_run = self._init_wandb(online_rl_cfg, policy_cfg)
 
+    @staticmethod
+    def _resolve_offline_cache_path(path: str | Path) -> Path:
+        resolved = Path(path).expanduser()
+        if resolved.is_dir():
+            resolved = resolved / "chunk_transitions_train.pt"
+        return resolved
+
+    @staticmethod
+    def _checkpoint_identity(path: str) -> str:
+        candidate = Path(path).expanduser()
+        return str(candidate.resolve()) if candidate.exists() else path
+
+    @classmethod
+    def _load_offline_buffer(
+        cls,
+        path: str | None,
+        *,
+        policy_cfg: Any,
+    ) -> ReplayBuffer | None:
+        if path is None:
+            return None
+        cache_path = cls._resolve_offline_cache_path(path)
+        if not cache_path.exists():
+            raise FileNotFoundError(f"Offline transition cache not found: {cache_path}")
+        metadata_path = cache_path.parent / "cache_metadata.json"
+        if metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text())
+            if metadata.get("exec_chunk_source") != "demonstrated_action":
+                raise ValueError(
+                    f"Offline cache {cache_path} does not contain demonstrated exec_chunk data"
+                )
+            cached_arms = metadata.get("rl_action_arms")
+            policy_arms = getattr(policy_cfg, "actor_rl_arm", "both")
+            if cached_arms is not None and cached_arms != policy_arms:
+                raise ValueError(
+                    f"Offline cache was built for rl_action_arms={cached_arms!r}, "
+                    f"but policy actor_rl_arm={policy_arms!r}"
+                )
+            for metadata_key, policy_key in (
+                ("vla_pretrained_path", "vla_pretrained_path"),
+                ("rl_token_policy_path", "rl_token_pretrained_path"),
+            ):
+                cached_checkpoint = metadata.get(metadata_key)
+                current_checkpoint = getattr(policy_cfg, policy_key, None)
+                if (
+                    cached_checkpoint
+                    and current_checkpoint
+                    and cls._checkpoint_identity(cached_checkpoint)
+                    != cls._checkpoint_identity(current_checkpoint)
+                ):
+                    raise ValueError(
+                        f"Offline cache {metadata_key}={cached_checkpoint!r} does not "
+                        f"match policy {policy_key}={current_checkpoint!r}; state_vec and "
+                        "VLA references must be encoded by the deployed checkpoints"
+                    )
+        else:
+            raise ValueError(
+                f"Offline cache {cache_path} has no cache_metadata.json. It may be an "
+                "old v2 cache with exec_chunk == ref_chunk; rebuild it with the "
+                "current evo-rlt-build-transition-cache-v2."
+            )
+        raw_transitions = torch.load(cache_path, map_location="cpu", weights_only=False)
+        if not isinstance(raw_transitions, list) or not raw_transitions:
+            raise ValueError(f"Offline transition cache is empty or invalid: {cache_path}")
+
+        buffer = ReplayBuffer(capacity=len(raw_transitions))
+        required = {
+            "state_vec", "exec_chunk", "ref_chunk", "reward_seq",
+            "next_state_vec", "next_ref_chunk", "done", "intervention",
+            "actual_steps",
+        }
+        for index, raw in enumerate(raw_transitions):
+            if isinstance(raw, ChunkTransition):
+                transition = raw
+            elif isinstance(raw, dict):
+                missing = required - raw.keys()
+                if missing:
+                    raise ValueError(
+                        f"Offline transition {index} in {cache_path} is missing {sorted(missing)}"
+                    )
+                transition = ChunkTransition(
+                    **{
+                        key: value
+                        for key, value in raw.items()
+                        if key in ChunkTransition.__dataclass_fields__
+                    }
+                )
+            else:
+                raise TypeError(
+                    f"Offline transition {index} has unsupported type {type(raw).__name__}"
+                )
+            if transition.exec_chunk.shape != (
+                policy_cfg.chunk_length,
+                policy_cfg.action_dim,
+            ):
+                raise ValueError(
+                    f"Offline transition {index} exec_chunk shape "
+                    f"{tuple(transition.exec_chunk.shape)} != "
+                    f"({policy_cfg.chunk_length}, {policy_cfg.action_dim})"
+                )
+            buffer.add(transition)
+
+        logging.info(
+            "Loaded fixed offline replay: %d transitions from %s",
+            len(buffer),
+            cache_path,
+        )
+        return buffer
+
+    @staticmethod
+    def _concat_replay_batches(
+        first: dict[str, torch.Tensor],
+        second: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        if first.keys() != second.keys():
+            raise ValueError("Offline and online replay batches have different fields")
+        return {key: torch.cat([first[key], second[key]], dim=0) for key in first}
+
+    def _sample_training_batch(self) -> tuple[dict[str, torch.Tensor], int, int]:
+        """Sample a controlled offline/online mixture.
+
+        Offline demonstrations are fixed and uniformly sampled. Online data
+        keeps its outcome/intervention/recent stratification. The warmup and
+        UTD budget remain based solely on online experience.
+        """
+        batch_size = self.cfg.batch_size
+        if self.offline_buffer is None:
+            online_n = batch_size
+            offline_n = 0
+        else:
+            offline_n = round(batch_size * self.cfg.offline_batch_fraction)
+            offline_n = min(max(offline_n, 0), batch_size - 1)
+            online_n = batch_size - offline_n
+
+        if self.cfg.use_stratified_sampling:
+            online = self.replay_buffer.sample_stratified(online_n)
+        else:
+            online = self.replay_buffer.sample(online_n)
+        if offline_n == 0:
+            actual_online_n = next(iter(online.values())).shape[0]
+            return online, 0, actual_online_n
+        assert self.offline_buffer is not None
+        offline = self.offline_buffer.sample(offline_n)
+        actual_offline_n = next(iter(offline.values())).shape[0]
+        actual_online_n = next(iter(online.values())).shape[0]
+        return (
+            self._concat_replay_batches(offline, online),
+            actual_offline_n,
+            actual_online_n,
+        )
+
     def _init_wandb(self, online_rl_cfg: Any, policy_cfg: Any) -> Any | None:
         if not getattr(online_rl_cfg, "wandb", False):
             return None
@@ -98,6 +255,11 @@ class OnlineRLTrainer:
                 "min_warmup_failures": online_rl_cfg.min_warmup_failures,
                 "replay_capacity": online_rl_cfg.replay_capacity,
                 "batch_size": online_rl_cfg.batch_size,
+                "offline_cache_path": online_rl_cfg.offline_cache_path,
+                "offline_batch_fraction": online_rl_cfg.offline_batch_fraction,
+                "offline_buffer_transitions": (
+                    len(self.offline_buffer) if self.offline_buffer is not None else 0
+                ),
                 "lr_actor": online_rl_cfg.lr_actor,
                 "lr_critic": online_rl_cfg.lr_critic,
                 "utd_ratio": policy_cfg.utd_ratio,
@@ -228,6 +390,14 @@ class OnlineRLTrainer:
         self.policy.train()
         start_t = time.perf_counter()
         info = None
+        # policy.forward()'s do_actor gate (critic_step % actor_update_interval)
+        # fires on only some iterations of this loop, and `info` gets
+        # overwritten every iteration -- so if the very last iteration isn't
+        # a do_actor step, "loss_actor" silently disappears from the stats
+        # below even though the actor genuinely was updated earlier in this
+        # same loop. Remember the most recent do_actor iteration's info
+        # separately so its loss_actor survives to the log/wandb output.
+        last_actor_info = None
         try:
             for _ in range(num_updates):
                 # ReplayBuffer.sample()/sample_stratified() return core/losses.py's
@@ -235,10 +405,7 @@ class OnlineRLTrainer:
                 # ChunkACPolicy's forward()/_coerce_batch expects unflattened
                 # (B, C, action_dim) exec_chunk/ref_chunk/next_ref_chunk and
                 # flattens internally.
-                if self.cfg.use_stratified_sampling:
-                    raw = self.replay_buffer.sample_stratified(self.cfg.batch_size)
-                else:
-                    raw = self.replay_buffer.sample(self.cfg.batch_size)
+                raw, offline_batch_size, online_batch_size = self._sample_training_batch()
                 chunk_length = self.policy_cfg.chunk_length
                 batch = {
                     "state_vec": raw["state_vec"],
@@ -252,6 +419,8 @@ class OnlineRLTrainer:
                 }
                 batch = {k: v.to(device) for k, v in batch.items()}
                 loss, info = self.policy.forward(batch)
+                if "loss_actor" in info:
+                    last_actor_info = info
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
                 loss.backward()
@@ -279,21 +448,36 @@ class OnlineRLTrainer:
             self.policy_cfg.actor_update_interval = self.online_actor_update_interval
             self.policy.eval()
         training_time_s = time.perf_counter() - start_t
-        logging.info(
-            "Online RL update after episode %d: new_transitions=%d requested_updates=%d "
-            "actual_updates=%d effective_utd=%.2f training_time=%.1fs loss=%s",
-            recorded_episodes, new_transitions, requested_updates, num_updates,
-            (num_updates / new_transitions) if new_transitions > 0 else 0.0,
-            training_time_s,
-            {k: (v.item() if torch.is_tensor(v) else v) for k, v in (info or {}).items()},
-        )
 
         loss_dict = {k: (v.item() if torch.is_tensor(v) else v) for k, v in (info or {}).items()}
+        if last_actor_info is not None and "loss_actor" not in loss_dict:
+            # The last iteration of this call didn't happen to be a do_actor
+            # step, but an earlier one in the same call was -- surface that
+            # actor loss instead of silently dropping it (see the comment
+            # where last_actor_info is set, above).
+            loss_dict["loss_actor"] = (
+                last_actor_info["loss_actor"].item()
+                if torch.is_tensor(last_actor_info["loss_actor"])
+                else last_actor_info["loss_actor"]
+            )
+
+        logging.info(
+            "Online RL update after episode %d: new_transitions=%d requested_updates=%d "
+            "actual_updates=%d effective_utd=%.2f batch_mix=%d_offline/%d_online "
+            "training_time=%.1fs loss=%s",
+            recorded_episodes, new_transitions, requested_updates, num_updates,
+            (num_updates / new_transitions) if new_transitions > 0 else 0.0,
+            offline_batch_size, online_batch_size,
+            training_time_s,
+            loss_dict,
+        )
         stats: dict[str, Any] = {
             "new_transitions": new_transitions,
             "requested_updates": requested_updates,
             "actual_updates": num_updates,
             "training_time_s": training_time_s,
+            "offline_batch_size": offline_batch_size,
+            "online_batch_size": online_batch_size,
             "loss": loss_dict,
             "checkpoint_path": None,
         }
@@ -307,6 +491,11 @@ class OnlineRLTrainer:
                 "online_rl/effective_utd": (num_updates / new_transitions) if new_transitions > 0 else 0.0,
                 "online_rl/training_time_s": training_time_s,
                 "online_rl/buffer_transitions": len(self.replay_buffer),
+                "online_rl/offline_buffer_transitions": (
+                    len(self.offline_buffer) if self.offline_buffer is not None else 0
+                ),
+                "online_rl/offline_batch_size": offline_batch_size,
+                "online_rl/online_batch_size": online_batch_size,
                 "online_rl/buffer_successes": successes,
                 "online_rl/buffer_failures": failures,
                 **{f"online_rl/{k}": v for k, v in loss_dict.items() if k != "critic_step"},
@@ -349,6 +538,12 @@ class OnlineRLTrainer:
             "replay_buffer": list(self.replay_buffer.buffer),
             "replay_buffer_total_added": self.replay_buffer.total_added,
             "replay_capacity": self.replay_buffer.capacity,
+            "offline_cache_path": (
+                str(self._resolve_offline_cache_path(self.cfg.offline_cache_path).resolve())
+                if self.cfg.offline_cache_path is not None
+                else None
+            ),
+            "offline_batch_fraction": self.cfg.offline_batch_fraction,
             "warmup_completed_at_episode": self.warmup_completed_at_episode,
             "torch_rng_state": torch.get_rng_state(),
         }
@@ -414,6 +609,28 @@ class OnlineRLTrainer:
         # unpickle those. Safe here since this is our own save_latest_state()
         # output, not a third-party checkpoint.
         state = torch.load(path, map_location="cpu", weights_only=False)
+        saved_offline_path = state.get("offline_cache_path")
+        current_offline_path = (
+            str(self._resolve_offline_cache_path(self.cfg.offline_cache_path).resolve())
+            if self.cfg.offline_cache_path is not None
+            else None
+        )
+        if saved_offline_path != current_offline_path:
+            raise ValueError(
+                "Resumed online state used a different offline cache: "
+                f"saved={saved_offline_path!r}, current={self.cfg.offline_cache_path!r}. "
+                "Pass the same --offline-cache-path used by the original run."
+            )
+        saved_offline_fraction = state.get("offline_batch_fraction")
+        if (
+            saved_offline_fraction is not None
+            and saved_offline_fraction != self.cfg.offline_batch_fraction
+        ):
+            logging.warning(
+                "Changing offline_batch_fraction across resume: saved=%.3f current=%.3f",
+                saved_offline_fraction,
+                self.cfg.offline_batch_fraction,
+            )
         self.policy.actor.load_state_dict(state["actor_state_dict"])
         self.policy.critic.load_state_dict(state["critic_state_dict"])
         self.policy.target_critic.load_state_dict(state["target_critic_state_dict"])

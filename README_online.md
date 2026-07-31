@@ -32,6 +32,50 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
 
 到这里为止，跟离线流程（README_dualarm_rlt.md）是共用的——**在线训练不需要再做`build-transition-cache`和`train-actor-critic`这两步**，`evo-rlt-online-train`会现场构造一个全新初始化的actor/critic。
 
+### 1.5 可选：把 VLA 示范作为固定 offline replay
+
+需要用当前版本重新构建 cache。旧版 v2 cache 令
+`exec_chunk == ref_chunk`，没有保留真实示范修正，不适合双 buffer 在线训练。
+左臂 RL 模式下，新 builder 使用“示范左臂动作 + 当前 VLA 右臂动作”，
+与在线部署的控制权限完全一致：
+
+```bash
+evo-rlt-build-transition-cache-v2 \
+  --demo-dataset-repo-id local/merged_screw_v1 \
+  --demo-dataset-root data/bimanual/merged_screw_v1 \
+  --rl-token-policy-path outputs/pin_insert_rl_token/checkpoints/010000/pretrained_model \
+  --vla-pretrained-path /home/wangyun/Evo-RLT/pretrained/pretrained_model \
+  --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
+  --output-dir outputs/pin_insert_offline_cache \
+  --task-instruction "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
+  --default-episode-success success \
+  --chunk-length 10 \
+  --frame-stride 2 \
+  --rl-action-arms left \
+  --batch-size 32 \
+  --num-workers 2 \
+  --train-ratio 0.9 \
+  --tolerance-s 0.04 \
+  --device cuda
+```
+
+如果原始 VLA 数据包含整段长任务，最好先裁出与在线 `r` 键范围一致的
+插入 critical phase；否则大量抓取/搬运/放置状态会稀释离线 batch。没有
+`episode_success` 元数据时，上面的命令把标准 VLA 示范视为成功；如果数据中
+混有失败，必须先补正确标签，不能统一标成成功。
+
+然后给在线训练增加：
+
+```bash
+  --offline-cache-path outputs/pin_insert_offline_cache \
+  --offline-batch-fraction 0.5 \
+```
+
+每个 batch 默认一半来自固定离线示范，一半来自在线 replay。在线 warmup
+的 transition/success/failure 门槛以及 UTD 更新预算仍然只统计在线数据；
+离线成功示范不会让 actor 提前解冻。续训时必须传回同一个
+`--offline-cache-path`。
+
 ### 2. 跑在线RL训练
 
 ```bash
@@ -43,6 +87,9 @@ evo-rlt-online-train \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 200 \
   --actor-action-clip-delta 0.1 \
+  --rl-action-arms left \
+  --offline-cache-path outputs/pin_insert_offline_cache \
+  --offline-batch-fraction 0.5 \
   --beta 0.3 \
   --warmup-episodes 5 \
   --min-warmup-transitions 1000 \

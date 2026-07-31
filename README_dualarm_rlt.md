@@ -159,6 +159,7 @@ evo-rlt-build-transition-cache-v2 \
   --task-instruction "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area." \
   --chunk-length 10 \
   --frame-stride 2 \
+  --rl-action-arms left \
   --batch-size 32 \
   --num-workers 2 \
   --train-ratio 0.9 \
