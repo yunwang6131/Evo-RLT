@@ -44,6 +44,7 @@ POLICY_RUNTIME_STATE_KEYS = ("_action_queue", "_queues", "_prev_mean")
 INTERVENTION_STATE_POLICY = 0.0
 INTERVENTION_STATE_ACTIVE = 1.0
 INTERVENTION_STATE_RELEASE = 2.0
+INTERVENTION_STATE_LEFT_ACTIVE = 3.0
 
 
 def _get_torch_rng_state(device: torch.device) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -226,15 +227,15 @@ def _set_so_leader_manual_control(teleop: Teleoperator, enabled: bool) -> None:
         teleop._evo_rlt_manual_control_enabled = False
 
 
-def set_teleop_manual_control(teleop: Teleoperator, enabled: bool) -> None:
+def set_teleop_manual_control(teleop: Teleoperator, enabled: bool, arm_scope: str = "both") -> None:
+    if _is_bi_so_leader(teleop):
+        set_teleop_manual_control(teleop.left_arm, enabled if arm_scope in {"left", "both"} else False)
+        set_teleop_manual_control(teleop.right_arm, enabled if arm_scope in {"right", "both"} else False)
+        return
+
     set_manual_control = getattr(teleop, "set_manual_control", None)
     if callable(set_manual_control):
         set_manual_control(enabled)
-        return
-
-    if _is_bi_so_leader(teleop):
-        set_teleop_manual_control(teleop.left_arm, enabled)
-        set_teleop_manual_control(teleop.right_arm, enabled)
         return
 
     if _is_so_leader_arm(teleop):
@@ -253,7 +254,7 @@ def _send_so_leader_feedback(teleop: Teleoperator, feedback: dict[str, float]) -
         _raise_so_leader_connection_error(teleop, "sending leader feedback goal position", error)
 
 
-def send_teleop_feedback(teleop: Teleoperator, feedback: RobotAction) -> None:
+def send_teleop_feedback(teleop: Teleoperator, feedback: RobotAction, arm_scope: str = "both") -> None:
     if _is_bi_so_leader(teleop):
         left_feedback = {
             key.removeprefix("left_"): value for key, value in feedback.items() if key.startswith("left_")
@@ -261,8 +262,10 @@ def send_teleop_feedback(teleop: Teleoperator, feedback: RobotAction) -> None:
         right_feedback = {
             key.removeprefix("right_"): value for key, value in feedback.items() if key.startswith("right_")
         }
-        _send_so_leader_feedback(teleop.left_arm, left_feedback)
-        _send_so_leader_feedback(teleop.right_arm, right_feedback)
+        if arm_scope in {"left", "both"}:
+            _send_so_leader_feedback(teleop.left_arm, left_feedback)
+        if arm_scope in {"right", "both"}:
+            _send_so_leader_feedback(teleop.right_arm, right_feedback)
         return
 
     if _is_so_leader_arm(teleop):
@@ -281,14 +284,16 @@ class PolicySyncDualArmExecutor:
         self.parallel_dispatch = parallel_dispatch
         self._pool = ThreadPoolExecutor(max_workers=2) if parallel_dispatch else None
 
-    def send_action(self, action: RobotAction) -> RobotAction:
+    def send_action(self, action: RobotAction, feedback_arm_scope: str = "both") -> RobotAction:
         if self._pool is None:
             sent_action = self.robot.send_action(action)
-            send_teleop_feedback(self.teleop, action)
+            send_teleop_feedback(self.teleop, action, arm_scope=feedback_arm_scope)
             return sent_action
 
         robot_future = self._pool.submit(self.robot.send_action, action)
-        teleop_future = self._pool.submit(send_teleop_feedback, self.teleop, action)
+        teleop_future = self._pool.submit(
+            send_teleop_feedback, self.teleop, action, feedback_arm_scope
+        )
         sent_action = robot_future.result()
         teleop_future.result()
         return sent_action

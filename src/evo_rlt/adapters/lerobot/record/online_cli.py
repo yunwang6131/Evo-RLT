@@ -109,8 +109,8 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         # physically reset the scene before the next episode's recording (and
         # possible autonomous critical-phase attempt) begins.
         f"--dataset.reset_time_s={args.reset_time_s}",
-        # rlt_toggle_key starts the critical-phase attempt; the next press (or
-        # double-tap) ends JUST the critical phase (success/failure), hands
+        # rlt_toggle_key starts the critical-phase attempt; the next press ends
+        # it as success, while u ends it as failure immediately. Either key hands
         # control back to VLA, and flushes that reward into the online replay
         # buffer right there (see loop.py) -- it does NOT end the recorded
         # episode. The episode keeps recording (e.g. VLA autonomously
@@ -119,7 +119,6 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         # episode_failure_key, s/f by default) once that's done.
         "--rlt.enable=true",
         f"--rlt.rl_phase_key={args.rlt_toggle_key}",
-        f"--rlt.rl_phase_double_tap_window_s={args.double_tap_window_s}",
         f"--rlt.intervention_action_blend_time_s={args.intervention_blend_time_s}",
         "--rlt.skip_prefix_recording=true",
         "--rlt.rl_phase_key_toggles_critical_phase=true",
@@ -129,10 +128,10 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         "--enable_episode_outcome_labeling=true",
         "--require_episode_success_label=true",
         "--intervention_state_machine_enabled=true",
+        f"--left_intervention_key={args.left_intervention_key}",
         f"--policy_sync_to_teleop={'true' if teleop_argv else 'false'}",
         f"--vla_ref={'true' if args.vla_ref else 'false'}",
         f"--play_sounds={'true' if args.play_sounds else 'false'}",
-        f"--estop_key={args.estop_key}",
         # Online RL training loop (see backend.OnlineRLConfig).
         "--online_rl.enable=true",
         f"--online_rl.warmup_episodes={args.warmup_episodes}",
@@ -190,16 +189,16 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
         f"num_layers={args.critic_num_layers}"
     )
     print(
-        f"Safety: actor_action_clip_delta={args.actor_action_clip_delta} "
-        f"estop_key={args.estop_key} (grabs manual control -- not a hardware E-stop; "
-        "stay near the leader arm / power cutoff)"
+        f"Safety: actor_action_clip_delta={args.actor_action_clip_delta}; "
+        "stay near the leader arm / physical power cutoff"
     )
     print(
-        f"Controls: {args.rlt_toggle_key}=start/end critical-phase attempt (double-tap "
-        f"within {args.double_tap_window_s:.1f}s = failure; reward flushed immediately, "
+        f"Controls: {args.rlt_toggle_key}=start/end critical-phase attempt as success, "
+        "u=end it as failure immediately (reward flushed immediately, "
         "recording continues under VLA afterward), s/f=end the whole recorded episode "
         "once VLA finishes, "
-        f"{args.teleop_toggle_key} or {args.estop_key}=grab manual control"
+        f"{args.left_intervention_key}=left-arm intervention, "
+        f"{args.teleop_toggle_key}=both-arm intervention/release"
     )
     print(
         f"Go-home: {args.go_home_time_s}s ramp to the calibrated middle position "
@@ -225,9 +224,11 @@ def run_online_train(args: argparse.Namespace) -> None:
     set_offline_env()
     if args.wandb_resume is not None and args.wandb_run_id is None:
         raise ValueError("--wandb-resume requires --wandb-run-id (the original W&B run ID).")
-    keys = {args.teleop_toggle_key, args.estop_key, args.rlt_toggle_key}
-    if len(keys) != 3:
-        raise ValueError("--teleop-toggle-key, --estop-key, and --rlt-toggle-key must be distinct.")
+    keys = {args.teleop_toggle_key, args.left_intervention_key, args.rlt_toggle_key, "u"}
+    if len(keys) != 4:
+        raise ValueError(
+            "--teleop-toggle-key, --left-intervention-key, --rlt-toggle-key, and the fixed 'u' failure key must be distinct."
+        )
 
     setup = load_robot_setup(args.setup_json)
     paths = resolve_run_paths(setup.setup, args.dataset_tag, DEFAULT_DATASET_NAME_PREFIX)
@@ -305,7 +306,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-tag", default=DEFAULT_DATASET_TAG)
     parser.add_argument("--vcodec", default="h264")
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--double-tap-window-s", type=float, default=0.6)
     parser.add_argument(
         "--intervention-blend-time-s", type=float, default=0.3,
         help="Smooth both transitions across a human intervention -- takeover (space "
@@ -318,7 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--play-sounds", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rlt-toggle-key", default="r")
     parser.add_argument("--teleop-toggle-key", default="space")
-    parser.add_argument("--estop-key", default="x")
+    parser.add_argument("--left-intervention-key", default="i")
     parser.add_argument(
         "--preflight", action=argparse.BooleanOptionalAction, default=True,
         help="Connect/torque-check follower+leader arms before loading the policy.",

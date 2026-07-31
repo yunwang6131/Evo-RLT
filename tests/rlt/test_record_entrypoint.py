@@ -1,6 +1,5 @@
 import json
 import sys
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +9,7 @@ from evo_rlt.adapters.lerobot.record.cli import build_parser
 from evo_rlt.adapters.lerobot.record import runner
 from evo_rlt.adapters.lerobot.record.runner import (
     _collect_external_episode_outcome_key,
-    _patch_double_tap_episode_outcome_listener,
+    _patch_episode_outcome_listener,
     _patch_skip_policyless_reset_loop,
     build_default_collect_record_argv,
     build_segment_record_argv,
@@ -56,7 +55,6 @@ def test_segment_rlt_argv_marks_key_segment_with_teleop_start_and_rtc():
         reset_time_s=None,
         fps=30,
         vcodec="h264",
-        double_tap_window_s=0.6,
         intervention_action_blend_time_s=0.4,
         rtc=True,
         rtc_execution_horizon=10,
@@ -115,27 +113,29 @@ def test_pedal_listener_routes_record_events_and_episode_outcome(monkeypatch):
     monkeypatch.setattr(control_utils, "init_keyboard_listener", original_init_keyboard_listener)
     monkeypatch.setattr(pedal_listener, "PedalListener", FakePedalListener)
 
-    _patch_double_tap_episode_outcome_listener(0.01, "e")
+    _patch_episode_outcome_listener("e")
     listener, events = control_utils.init_keyboard_listener(
         intervention_toggle_key=" ",
+        left_intervention_key="i",
         rl_phase_key="r",
     )
 
     captured["on_press"]("space")
     assert events["toggle_intervention"] is True
 
+    captured["on_press"]("i")
+    assert events["toggle_left_intervention"] is True
+
     captured["on_press"]("r")
     assert events["start_rl_phase"] is True
 
     captured["on_press"]("e")
-    time.sleep(0.03)
     assert events["episode_outcome"] == "success"
     assert events["exit_early"] is True
 
     events["episode_outcome"] = None
     events["exit_early"] = False
-    captured["on_press"]("e")
-    captured["on_press"]("e")
+    captured["on_press"]("u")
     assert events["episode_outcome"] == "failure"
     assert events["exit_early"] is True
     listener.stop()
@@ -240,7 +240,6 @@ def test_default_collect_argv_matches_best_real_robot_rtc_chunks():
         episode_time_s=3000,
         fps=30,
         vcodec="h264",
-        double_tap_window_s=0.6,
         rtc=True,
         rtc_execution_horizon=10,
         vla_rtc_execution_horizon=25,
@@ -307,7 +306,6 @@ def test_default_collect_only_critical_starts_recording_on_first_r_and_ends_on_s
         episode_time_s=3000,
         fps=30,
         vcodec="h264",
-        double_tap_window_s=0.6,
         rtc=True,
         rtc_execution_horizon=10,
         vla_rtc_execution_horizon=25,
@@ -355,7 +353,6 @@ def test_default_collect_start_with_teleop_sets_episode_initial_source():
         episode_time_s=3000,
         fps=30,
         vcodec="h264",
-        double_tap_window_s=0.6,
         rtc=True,
         rtc_execution_horizon=10,
         vla_rtc_execution_horizon=25,
@@ -549,6 +546,36 @@ def test_official_bi_so_leader_feedback_splits_prefixed_actions():
     ]
 
 
+def test_left_only_manual_control_and_feedback_leave_right_leader_policy_driven():
+    from evo_rlt.adapters.lerobot.record.hil import send_teleop_feedback, set_teleop_manual_control
+
+    teleop = SimpleNamespace(left_arm=_FakeLeaderArm(), right_arm=_FakeLeaderArm())
+    set_teleop_manual_control(teleop, False)
+    set_teleop_manual_control(teleop, True, arm_scope="left")
+    send_teleop_feedback(
+        teleop,
+        {"left_shoulder_pan.pos": 1.0, "right_elbow_flex.pos": 2.0},
+        arm_scope="right",
+    )
+
+    assert teleop.left_arm.bus.calls == [("enable_torque",), ("disable_torque",)]
+    assert teleop.right_arm.bus.calls == [
+        ("enable_torque",),
+        ("sync_write", "Goal_Position", {"elbow_flex": 2.0}),
+    ]
+
+
+def test_left_only_intervention_merges_human_left_with_policy_right():
+    from evo_rlt.adapters.lerobot.record.loop import _merge_left_teleop_action
+
+    mixed = _merge_left_teleop_action(
+        {"left_joint.pos": 1.0, "right_joint.pos": 2.0},
+        {"left_joint.pos": 10.0, "right_joint.pos": 20.0},
+    )
+
+    assert mixed == {"left_joint.pos": 10.0, "right_joint.pos": 2.0}
+
+
 def test_default_collect_argv_accepts_headless_default_episode_success():
     args = SimpleNamespace(
         policy_path="/tmp/ac",
@@ -559,7 +586,6 @@ def test_default_collect_argv_accepts_headless_default_episode_success():
         episode_time_s=10,
         fps=30,
         vcodec="h264",
-        double_tap_window_s=0.6,
         rtc=True,
         rtc_execution_horizon=10,
         vla_rtc_execution_horizon=25,

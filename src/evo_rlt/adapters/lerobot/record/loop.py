@@ -38,6 +38,7 @@ from lerobot.processor import (
 from lerobot.robots import Robot
 from evo_rlt.adapters.lerobot.record.hil import (
     INTERVENTION_STATE_ACTIVE,
+    INTERVENTION_STATE_LEFT_ACTIVE,
     INTERVENTION_STATE_POLICY,
     INTERVENTION_STATE_RELEASE,
     ACPInferenceConfig,
@@ -77,6 +78,16 @@ def _clone_robot_action(action: RobotAction) -> RobotAction:
         else:
             cloned[key] = value
     return cloned
+
+
+def _merge_left_teleop_action(
+    policy_action: RobotAction,
+    teleop_action: RobotAction,
+) -> RobotAction:
+    """Use human commands for left-arm joints and policy commands elsewhere."""
+    mixed_action = dict(policy_action)
+    mixed_action.update({key: value for key, value in teleop_action.items() if key.startswith("left_")})
+    return mixed_action
 
 
 def _blend_robot_actions(
@@ -216,7 +227,6 @@ def record_loop(
     skip_prefix_recording: bool = False,
     rl_phase_key_toggles_episode: bool = False,
     rl_phase_key_toggles_critical_phase: bool = False,
-    rl_phase_double_tap_window_s: float = 1.0,
     start_in_teleop: bool = False,
     intervention_action_blend_time_s: float = 0.0,
 ):
@@ -280,6 +290,7 @@ def record_loop(
     else:
         intervention_state = INTERVENTION_STATE_POLICY
     last_teleop_action: RobotAction | None = None
+    last_intervention_action: RobotAction | None = None
     last_policy_action_for_blend: RobotAction | None = None
     intervention_blend_start_t: float | None = None
     intervention_blend_start_action: RobotAction | None = None
@@ -304,9 +315,9 @@ def record_loop(
     elif isinstance(teleop, list):
         teleop_arm_for_mode_switch = teleop_arm
 
-    def set_teleop_manual_control(enabled: bool) -> None:
+    def set_teleop_manual_control(enabled: bool, arm_scope: str = "both") -> None:
         if teleop_arm_for_mode_switch is not None:
-            apply_teleop_manual_control(teleop_arm_for_mode_switch, enabled)
+            apply_teleop_manual_control(teleop_arm_for_mode_switch, enabled, arm_scope=arm_scope)
 
     if policy is None:
         # During reset/teleop-only loops keep leader backdrivable for manual dragging.
@@ -394,7 +405,6 @@ def record_loop(
     start_episode_t = time.perf_counter()
     prev_phase = PHASE_PREFIX
     rl_phase_started = False
-    pending_end_press_time: float | None = None
     final_outcome: str | None = None
     _frame_idx = 0
     _cuda_cleanup_interval = 500  # defrag CUDA allocator every N frames
@@ -404,11 +414,14 @@ def record_loop(
             return 0
         return dataset.episode_buffer["size"]
 
-    def _start_intervention() -> None:
+    def _start_intervention(arm_scope: str) -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
-        nonlocal pending_end_press_time
-        intervention_state = INTERVENTION_STATE_ACTIVE
-        set_teleop_manual_control(True)
+        nonlocal last_intervention_action
+        last_intervention_action = None
+        intervention_state = (
+            INTERVENTION_STATE_LEFT_ACTIVE if arm_scope == "left" else INTERVENTION_STATE_ACTIVE
+        )
+        set_teleop_manual_control(True, arm_scope=arm_scope)
         if rlt_intervention_tracker is not None:
             rlt_intervention_tracker.start(get_episode_frame_index())
         if intervention_action_blend_time_s > 0 and last_policy_action_for_blend is not None:
@@ -421,8 +434,7 @@ def record_loop(
         if rlt is not None:
             rlt.interrupt_chunk()
             log_say("intervene", play_sounds=True)
-        pending_end_press_time = None
-        logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
+        logging.info("Intervention enabled (S1): scope=%s.", arm_scope)
 
     def _reset_policy_after_intervention_release() -> None:
         nonlocal cond_policy_runtime_state, uncond_policy_runtime_state
@@ -444,7 +456,7 @@ def record_loop(
         intervention_state = INTERVENTION_STATE_RELEASE
         intervention_blend_start_t = None
         intervention_blend_start_action = None
-        if intervention_action_blend_time_s > 0 and last_teleop_action is not None:
+        if intervention_action_blend_time_s > 0 and last_intervention_action is not None:
             # Capture the start position now, but don't start the clock yet
             # (see _apply_release_blend): with a remote policy, the first
             # post-release action can take a real network round trip + a
@@ -453,7 +465,7 @@ def record_loop(
             # here would let that wait alone burn through the whole blend
             # before it's ever visually applied.
             release_blend_pending = True
-            release_blend_start_action = _clone_robot_action(last_teleop_action)
+            release_blend_start_action = _clone_robot_action(last_intervention_action)
             release_blend_start_t = None
             logging.info("Release action blend armed for %.2fs.", intervention_action_blend_time_s)
         else:
@@ -471,17 +483,30 @@ def record_loop(
             logging.info("RLT chunk interrupted on release: next action recomputed.")
         logging.info("Intervention release requested (S2): returning control to policy.")
 
+    def _intervention_is_active() -> bool:
+        return intervention_state in {INTERVENTION_STATE_ACTIVE, INTERVENTION_STATE_LEFT_ACTIVE}
+
     def _handle_intervention_toggle() -> None:
         if not events.get("toggle_intervention", False):
+            pass
+        else:
+            events["toggle_intervention"] = False
+            if not intervention_enabled:
+                logging.info("Intervention toggle ignored because policy+teleop are not both active.")
+            elif intervention_state == INTERVENTION_STATE_POLICY:
+                _start_intervention("both")
+            else:
+                _release_intervention()
+
+        if not events.get("toggle_left_intervention", False):
             return
-        events["toggle_intervention"] = False
+        events["toggle_left_intervention"] = False
         if not intervention_enabled:
-            logging.info("Intervention toggle ignored because policy+teleop are not both active.")
-            return
-        if intervention_state == INTERVENTION_STATE_POLICY:
-            _start_intervention()
-            return
-        _release_intervention()
+            logging.info("Left intervention ignored because policy+teleop are not both active.")
+        elif intervention_state == INTERVENTION_STATE_POLICY:
+            _start_intervention("left")
+        else:
+            logging.info("Left intervention key ignored while an intervention is already active; use Space to release.")
 
     def _handle_critical_phase_events() -> None:
         if events.get("toggle_critical_phase", False):
@@ -506,13 +531,8 @@ def record_loop(
                 from lerobot.utils.audio_feedback import say_failure
                 say_failure()
 
-    def _finish_active_rl_phase(toggles_episode: bool, toggles_cp: bool) -> None:
-        nonlocal final_outcome, pending_end_press_time, rl_phase_started
-        if pending_end_press_time is None:
-            pending_end_press_time = time.perf_counter()
-            log_say("RL end", play_sounds=True)
-            logging.info("RL end pending - tap r again within %.1fs to mark failure", rl_phase_double_tap_window_s)
-            return
+    def _mark_rl_phase_failure(toggles_episode: bool, toggles_cp: bool) -> None:
+        nonlocal final_outcome, rl_phase_started
         if toggles_episode:
             final_outcome = EPISODE_FAILURE
             events["exit_early"] = True
@@ -522,19 +542,32 @@ def record_loop(
             if critical_phase_tracker is not None and dataset is not None:
                 critical_phase_tracker.mark_failure(dataset.episode_buffer["size"])
             if rlt_online_collector is not None:
-                # Reward the critical phase's OWN outcome, not whatever
-                # happens in the rest of the (still-recording) episode --
-                # see the matching comment in _resolve_pending_rl_phase_end.
+                # Reward the critical phase independently of the full episode.
                 rlt_online_collector.flush_episode(False)
             rl_phase_started = False
-        pending_end_press_time = None
         log_say("failure", play_sounds=True)
-        logging.info("RL phase ended via double-tap (failure)")
+        logging.info("RL phase ended via failure key (failure)")
+
+    def _mark_rl_phase_success(toggles_episode: bool, toggles_cp: bool) -> None:
+        nonlocal final_outcome, rl_phase_started
+        if toggles_episode:
+            final_outcome = EPISODE_SUCCESS
+            events["exit_early"] = True
+        elif toggles_cp:
+            if rlt is not None:
+                rlt.set_vla_mode()
+            if critical_phase_tracker is not None and dataset is not None:
+                critical_phase_tracker.mark_success(dataset.episode_buffer["size"])
+            if rlt_online_collector is not None:
+                rlt_online_collector.flush_episode(True)
+            rl_phase_started = False
+        log_say("success", play_sounds=True)
+        logging.info("RL phase ended via success key (success)")
 
     def _start_rl_phase_from_key() -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
-        nonlocal rl_phase_started, pending_end_press_time
-        if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+        nonlocal rl_phase_started
+        if intervention_enabled and _intervention_is_active():
             intervention_state = INTERVENTION_STATE_RELEASE
             intervention_blend_start_t = None
             intervention_blend_start_action = None
@@ -544,7 +577,6 @@ def record_loop(
         if critical_phase_tracker is not None and dataset is not None:
             critical_phase_tracker.toggle(dataset.episode_buffer["size"])
         rl_phase_started = True
-        pending_end_press_time = None
         log_say("RL start", play_sounds=True)
         logging.info("RL phase started (r key)")
 
@@ -553,7 +585,7 @@ def record_loop(
             return
         events["start_rl_phase"] = False
         r_key_active = rlt is not None or rl_phase_key_toggles_episode or rl_phase_key_toggles_critical_phase
-        active_intervention = intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE
+        active_intervention = intervention_enabled and _intervention_is_active()
         if rl_phase_started and active_intervention:
             logging.info("Ignoring r key: human intervention is active")
             return
@@ -562,42 +594,25 @@ def record_loop(
         toggles_episode = rl_phase_key_toggles_episode
         toggles_cp = rl_phase_key_toggles_critical_phase
         if (toggles_episode or toggles_cp) and rl_phase_started:
-            _finish_active_rl_phase(toggles_episode, toggles_cp)
+            _mark_rl_phase_success(toggles_episode, toggles_cp)
             return
         _start_rl_phase_from_key()
 
-    def _resolve_pending_rl_phase_end() -> None:
-        nonlocal final_outcome, pending_end_press_time, rl_phase_started
-        if pending_end_press_time is None or final_outcome is not None:
+    def _handle_rl_phase_failure_event() -> None:
+        if not events.get("mark_rl_phase_failure", False):
             return
-        if (time.perf_counter() - pending_end_press_time) < rl_phase_double_tap_window_s:
+        events["mark_rl_phase_failure"] = False
+        if not rl_phase_started:
             return
-        if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+        toggles_episode = rl_phase_key_toggles_episode
+        toggles_cp = rl_phase_key_toggles_critical_phase
+        if not (toggles_episode or toggles_cp):
             return
-        if rl_phase_key_toggles_episode:
-            final_outcome = EPISODE_SUCCESS
-            events["exit_early"] = True
-        elif rl_phase_key_toggles_critical_phase and rlt is not None:
-            rlt.set_vla_mode()
-            if critical_phase_tracker is not None and dataset is not None:
-                critical_phase_tracker.mark_success(dataset.episode_buffer["size"])
-            if rlt_online_collector is not None:
-                # Flush the online replay buffer right here, at the moment
-                # the critical phase itself resolves -- NOT at whole-episode
-                # end. The episode keeps recording afterward (e.g. VLA
-                # autonomously finishing a subsequent placement step), but
-                # that tail is for the dataset only: RLTOnlineCollector stops
-                # accumulating once flushed (see its `_flushed` guard) so the
-                # RL reward reflects only what the actor actually controlled.
-                rlt_online_collector.flush_episode(True)
-            rl_phase_started = False
-        pending_end_press_time = None
-        log_say("success", play_sounds=True)
-        logging.info("RL phase ended via single press (success)")
+        _mark_rl_phase_failure(toggles_episode, toggles_cp)
 
     def _release_active_intervention_after_phase_end() -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
-        if not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
+        if not (intervention_enabled and _intervention_is_active()):
             return
         if rlt_intervention_tracker is not None:
             rlt_intervention_tracker.stop(get_episode_frame_index())
@@ -636,9 +651,14 @@ def record_loop(
         act_processed_teleop: RobotAction | None,
     ) -> tuple[float, RobotAction]:
         nonlocal teleop_fallback_warned
-        if not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
+        if not (intervention_enabled and _intervention_is_active()):
             action = act_processed_policy if act_processed_policy is not None else act_processed_teleop
             return 0.0, action
+        if intervention_state == INTERVENTION_STATE_LEFT_ACTIVE:
+            policy_action = act_processed_policy or last_policy_action_for_blend
+            teleop_action = act_processed_teleop or last_teleop_action
+            if policy_action is not None and teleop_action is not None:
+                return 1.0, _merge_left_teleop_action(policy_action, teleop_action)
         if act_processed_teleop is not None:
             return 1.0, act_processed_teleop
         if last_teleop_action is not None:
@@ -743,7 +763,7 @@ def record_loop(
         _handle_intervention_toggle()
         _handle_critical_phase_events()
         _handle_rl_phase_start_event()
-        _resolve_pending_rl_phase_end()
+        _handle_rl_phase_failure_event()
         _handle_end_phase_event("end_phase_success", EPISODE_SUCCESS)
         _handle_end_phase_event("end_phase_failure", EPISODE_FAILURE)
 
@@ -813,10 +833,14 @@ def record_loop(
         policy_action_for_storage = (
             act_processed_policy if act_processed_policy is not None else zero_policy_action
         )
+        if act_processed_policy is not None:
+            last_policy_action_for_blend = _clone_robot_action(act_processed_policy)
 
         is_intervention, action_values = _select_action_values(act_processed_policy, act_processed_teleop)
         action_values = _apply_intervention_blend(is_intervention, action_values)
         action_values = _apply_release_blend(is_intervention, action_values)
+        if is_intervention:
+            last_intervention_action = _clone_robot_action(action_values)
 
         # Applies a pipeline to the action, default is IdentityProcessor
         robot_action_to_send = robot_action_processor((action_values, obs))
@@ -826,14 +850,14 @@ def record_loop(
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         selected_from_policy = act_processed_policy is not None and action_values is act_processed_policy
-        if selected_from_policy:
-            last_policy_action_for_blend = _clone_robot_action(action_values)
         _t0 = time.perf_counter()
-        if policy_sync_executor is not None and selected_from_policy:
+        sync_right_only = intervention_state == INTERVENTION_STATE_LEFT_ACTIVE
+        if policy_sync_executor is not None and (selected_from_policy or sync_right_only):
             _sent_action = run_with_connection_retry(
                 "policy_sync_executor.send_action",
-                lambda robot_action_to_send=robot_action_to_send: policy_sync_executor.send_action(
-                    robot_action_to_send
+                lambda robot_action_to_send=robot_action_to_send, sync_right_only=sync_right_only: policy_sync_executor.send_action(
+                    robot_action_to_send,
+                    feedback_arm_scope="right" if sync_right_only else "both",
                 ),
             )
         else:
@@ -847,7 +871,7 @@ def record_loop(
         # Only pop metadata when policy action was actually executed (not during intervention)
         # to keep _meta_queue in sync with _action_queue.
         rlt_meta = None
-        if rlt is not None and not is_intervention:
+        if rlt is not None and (not is_intervention or intervention_state == INTERVENTION_STATE_LEFT_ACTIVE):
             rlt_meta = rlt.pop_step_metadata()
 
         if rlt is None and skip_prefix_recording:
@@ -940,7 +964,7 @@ def record_loop(
     # VLA mode, and tag both the critical phase interval and the episode with
     # the resolved success/failure outcome.
     if final_outcome is not None:
-        if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+        if intervention_enabled and _intervention_is_active():
             if rlt_intervention_tracker is not None:
                 rlt_intervention_tracker.stop(get_episode_frame_index())
             intervention_state = INTERVENTION_STATE_RELEASE

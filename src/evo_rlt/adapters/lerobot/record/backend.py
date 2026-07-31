@@ -223,22 +223,22 @@ class RLTRecordConfig:
     actor_layer_norm: bool = False
     # Keyboard keys for RLT HIL mode
     rl_phase_key: str = "r"
+    # Marks the active RL phase/episode as failure immediately.
+    rl_phase_failure_key: str = "u"
     end_success_key: str = "s"
     end_failure_key: str = "f"
     # wo_prefix mode: drop frames captured during PHASE_PREFIX (before RL phase
     # starts). Used when the dataset should only contain the RL-driven segment.
     skip_prefix_recording: bool = False
     # wo_prefix mode: rl_phase_key toggles - first press starts the episode (and
-    # RL phase), second press ends the episode (sets exit_early). Single end
-    # press marks the episode as success; a follow-up press inside
-    # `rl_phase_double_tap_window_s` marks it as failure.
+    # RL phase), second press ends the episode and marks it as success;
+    # rl_phase_failure_key marks it as failure instead.
     rl_phase_key_toggles_episode: bool = False
     # With-prefix mode: rl_phase_key toggles the critical phase only - first
-    # press starts RL, second press ends RL and marks the critical phase
-    # (success by default, failure if a second press lands inside the
-    # double-tap window). Episode keeps going in VLA mode afterwards.
+    # press starts RL, second press ends RL and marks the critical phase as
+    # success; rl_phase_failure_key marks it as failure instead. Episode keeps
+    # going in VLA mode afterwards.
     rl_phase_key_toggles_critical_phase: bool = False
-    rl_phase_double_tap_window_s: float = 0.6
     # wo_prefix mode: start each episode in human-teleop state (leader drives
     # follower, no policy actions sent) until the user presses the rl_phase_key
     # to enter RL. Required for pure RL-only HIL recording where VLA should
@@ -386,17 +386,13 @@ class RecordConfig:
     policy_sync_parallel: bool = True
     # Enable S0/S1/S2 intervention state machine when policy + teleop are both available.
     intervention_state_machine_enabled: bool = True
-    # Keyboard key used to toggle entering/leaving intervention.
-    intervention_toggle_key: str = "i"
-    # Safety hotkey: bound to the same toggle-intervention event as
-    # `intervention_toggle_key`, giving a second always-available way to grab
-    # manual control (e.g. during autonomous RL-phase rollout in online
-    # training). Not a hardware E-stop -- physical supervision is still
-    # required.
-    estop_key: str = "x"
+    # Space enters bilateral intervention and releases any active intervention.
+    intervention_toggle_key: str = " "
+    # i enters left-arm-only intervention; Space releases it.
+    left_intervention_key: str = "i"
     # Pure-teleop mode: r key starts an episode (entering critical phase),
-    # second r press ends the episode and marks it success; a double-tap
-    # inside `rlt.rl_phase_double_tap_window_s` marks it failure. No VLA,
+    # second r press ends the episode and marks it success; u marks it as
+    # failure. No VLA,
     # no RL inference, no SPACE intervention - teleop drives the entire
     # time, r is the only episode-control input. Requires policy to be
     # None (teleop-only) and reuses the same underlying state machine as
@@ -484,10 +480,10 @@ class RecordConfig:
             raise ValueError("Choose a policy, a teleoperator, or enable RLT to control the robot")
         if not self.intervention_toggle_key or len(self.intervention_toggle_key) != 1:
             raise ValueError("`intervention_toggle_key` must be a single character.")
-        if not self.estop_key or len(self.estop_key) != 1:
-            raise ValueError("`estop_key` must be a single character.")
-        if self.estop_key.lower() == self.intervention_toggle_key.lower():
-            raise ValueError("`estop_key` must differ from `intervention_toggle_key`.")
+        if not self.left_intervention_key or len(self.left_intervention_key) != 1:
+            raise ValueError("`left_intervention_key` must be a single character.")
+        if self.left_intervention_key.lower() == self.intervention_toggle_key.lower():
+            raise ValueError("`left_intervention_key` must differ from `intervention_toggle_key`.")
 
         if self.enable_episode_outcome_labeling:
             label_key_bindings = {
@@ -500,31 +496,37 @@ class RecordConfig:
 
             normalized_keys = [
                 self.intervention_toggle_key.lower(),
-                self.estop_key.lower(),
+                self.left_intervention_key.lower(),
                 self.episode_success_key.lower(),
                 self.episode_failure_key.lower(),
             ]
             if len(set(normalized_keys)) != len(normalized_keys):
                 raise ValueError(
-                    "`intervention_toggle_key`, `estop_key`, `episode_success_key`, and "
+                    "`intervention_toggle_key`, `left_intervention_key`, `episode_success_key`, and "
                     "`episode_failure_key` must be distinct."
                 )
 
         if self.rlt.enable:
             if not self.rlt.critical_phase_toggle_key or len(self.rlt.critical_phase_toggle_key) != 1:
                 raise ValueError("`rlt.critical_phase_toggle_key` must be a single character.")
+            if not self.rlt.rl_phase_key or len(self.rlt.rl_phase_key) != 1:
+                raise ValueError("`rlt.rl_phase_key` must be a single character.")
+            if not self.rlt.rl_phase_failure_key or len(self.rlt.rl_phase_failure_key) != 1:
+                raise ValueError("`rlt.rl_phase_failure_key` must be a single character.")
 
             reserved_keys = [
                 self.rlt.critical_phase_toggle_key.lower(),
+                self.rlt.rl_phase_key.lower(),
+                self.rlt.rl_phase_failure_key.lower(),
                 self.intervention_toggle_key.lower(),
-                self.estop_key.lower(),
+                self.left_intervention_key.lower(),
             ]
             if self.enable_episode_outcome_labeling:
                 reserved_keys.append(self.episode_success_key.lower())
                 reserved_keys.append(self.episode_failure_key.lower())
             if len(set(reserved_keys)) != len(reserved_keys):
                 raise ValueError(
-                    "`rlt.critical_phase_toggle_key` must not collide with intervention or episode outcome keys."
+                    "RLT phase keys must not collide with intervention or episode outcome keys."
                 )
 
         if self.default_episode_success is not None:
@@ -917,25 +919,27 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         )
         if rlt_active and rlt_key_controls_phase:
             rl_phase_key_binding = cfg.rlt.rl_phase_key
+            rl_phase_failure_key_binding = cfg.rlt.rl_phase_failure_key
         elif teleop_r_key_mode:
             rl_phase_key_binding = "r"
+            rl_phase_failure_key_binding = "u"
         else:
             rl_phase_key_binding = None
+            rl_phase_failure_key_binding = None
         # In teleop_r_key_mode the r key is the single episode-control input;
         # unbind s/f so the user cannot accidentally end an episode out of
-        # the double-tap state machine.
+        # the r/u outcome state machine.
         bind_ep_outcome_keys = cfg.enable_episode_outcome_labeling and not teleop_r_key_mode
         listener, events = init_keyboard_listener(
-            intervention_toggle_key=(
-                (" " if rlt_hil_mode else cfg.intervention_toggle_key) if policy is not None else None
-            ),
-            estop_key=cfg.estop_key if policy is not None else None,
+            intervention_toggle_key=cfg.intervention_toggle_key if policy is not None else None,
+            left_intervention_key=cfg.left_intervention_key if rlt_hil_mode else None,
             critical_phase_toggle_key=cp_key if not rlt_active else None,
             episode_success_key=cfg.episode_success_key if bind_ep_outcome_keys else None,
             episode_failure_key=cfg.episode_failure_key if bind_ep_outcome_keys else None,
             cp_success_key="s" if cfg.enable_critical_phase_labeling and not rlt_active else None,
             cp_failure_key="f" if cfg.enable_critical_phase_labeling and not rlt_active else None,
             rl_phase_key=rl_phase_key_binding,
+            rl_phase_failure_key=rl_phase_failure_key_binding,
             end_success_key=cfg.rlt.end_success_key if rlt_active else None,
             end_failure_key=cfg.rlt.end_failure_key if rlt_active else None,
         )
@@ -1042,7 +1046,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 skip_prefix_recording=cfg.rlt.skip_prefix_recording or teleop_r_key_mode,
                 rl_phase_key_toggles_episode=cfg.rlt.rl_phase_key_toggles_episode or teleop_r_key_mode,
                 rl_phase_key_toggles_critical_phase=cfg.rlt.rl_phase_key_toggles_critical_phase,
-                rl_phase_double_tap_window_s=cfg.rlt.rl_phase_double_tap_window_s,
                 start_in_teleop=cfg.rlt.start_in_teleop,
                 intervention_action_blend_time_s=cfg.rlt.intervention_action_blend_time_s,
                 rlt_online_collector=online_collector,

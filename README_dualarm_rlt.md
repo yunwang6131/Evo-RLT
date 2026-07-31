@@ -234,7 +234,7 @@ evo-rlt-record collect \
   --vcodec h264 \frrirr
   --only-critical \
   --rlt-toggle-key r \
-  --teleop-toggle-key i \
+  --teleop-toggle-key space \
   --rtc-execution-horizon 10 \
   --vla-rtc-execution-horizon 25 \
   --rtc-action-queue-size-to-get-new-actions 40
@@ -244,15 +244,8 @@ evo-rlt-record collect \
 # 1. cache本身有没有问题（reward是不是全零、exec_chunk是不是等于ref_chunk）
 python diagnostics/inspect_transition_cache.py --cache-dir outputs/bimanual_cache --splits train val
 
-# 2. 训练/部署config是否对得上（chunk_length、chunk_exec_steps、phase_mode等）
-python diagnostics/check_config_consistency.py \
-  --ac-config-dir outputs/bimanual_ac/checkpoints/last/pretrained_model \
-  --cache-build-chunk-length 10 --cache-build-frame-stride 2 \
-  --deploy-chunk-exec-steps 25 --deploy-phase-mode always_rl
-
 # 整体流程
 从采集数据VLA开始，然后pi05微调，微调VLA之后再RL token，然后用SFT的VLA采集full里面有成功失败和认为干预的，然后transition cache,然后actor critic，然后用得到的模型采集Critical 片段，然后用这个片段制成数据集，然后累加之前的数据transition cache,然后在之前的checkpoint上actor critic。然后把最后这几个采集到actor_critic的重复几遍
 
 # new task
 Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area.
-

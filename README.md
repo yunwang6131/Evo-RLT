@@ -369,17 +369,19 @@ Default collection controls:
 
 ```text
 Full-trajectory mode:
-r              save the full episode as success after the double-tap window
-r+r            save the full episode as failure
-space          toggle teleop intervention; pressing again exits teleop
+r              save the full episode as success immediately
+u              save the full episode as failure immediately
+i              enter left-arm-only intervention
+space          enter both-arm intervention; release any active intervention
 left arrow     rerecord the current episode
 Esc            stop data collection
 
 Critical-segment mode (`--only-critical`):
 r              enter RLT mode and start recording the critical segment
-r              save the segment as success, exit RLT mode, then end the episode
-r+r            save the segment as failure, exit RLT mode, then end the episode
-space          toggle teleop intervention; pressing again exits teleop
+r              save the segment as success immediately, exit RLT mode, then end the episode
+u              save the segment as failure immediately, exit RLT mode, then end the episode
+i              enter left-arm-only intervention
+space          enter both-arm intervention; release any active intervention
 left arrow     rerecord the current episode
 Esc            stop data collection
 ```
@@ -395,7 +397,6 @@ evo-rlt-record full \
   --phase-mode always_vla \
   --chunk-exec-steps 25 \
   --pedal-outcome \
-  --double-tap-window-s 0.6 \
   --num-episodes 5 \
   --episode-time-s 3000 \
   --reset-time-s 0 \
@@ -411,8 +412,8 @@ For headless SSH runs where no keyboard or pedal outcome will be provided, add
 Pedal semantics in this mode:
 
 ```text
-single tap    success, end current episode, start next episode
-double tap    failure, end current episode, start next episode
+r             success, end current episode, start next episode
+u             failure, end current episode, start next episode
 ```
 
 Evaluating a trained `rlt_ac` checkpoint with manual critical-phase control:

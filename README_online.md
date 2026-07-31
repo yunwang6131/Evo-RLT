@@ -43,7 +43,7 @@ evo-rlt-online-train \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 200 \
   --actor-action-clip-delta 0.1 \
-  --beta 0.1 \
+  --beta 0.3 \
   --warmup-episodes 5 \
   --min-warmup-transitions 1000 \
   --min-warmup-successes 3 \
@@ -51,7 +51,7 @@ evo-rlt-online-train \
   --rl-action-arms left \
   --gamma 0.9995 \
   --wandb \
-  --wandb-project pin-insert-rl \
+  --wandb-project rlt-left-only \
   --wandb-run-name run1 \
   --save-every-episodes 5
 ```
@@ -117,45 +117,40 @@ evo-rlt-prune-online-state \
   --state-path outputs/pin_insert_online_rl/latest_online_state.pt \
   --episode-id 41
 
+# 人工标注VLA数据集中的critical phase
+conda activate evo-rlt
+python diagnostics/critical_segment_labeler_cv.py --dataset-root data/bimanual/merged_screw_v1
+
+r:不在critical里 → 标记当前帧为critical开始;已经在critical里 → 在当前帧收尾并存为成功
+u:在critical里的时候按 → 在当前帧收尾并存为失败(不在critical里按它没反应)
+z:重置——把这条episode当前标的段(不管是已经收尾的,还是刚按了r还没收尾的)清空,重新来
+x:标记"这条没有critical片段"(原来的x,没变)
+
+(space播放暂停、a/d单帧、A/D十帧、1/2/3慢放、enter保存下一条、b/n不保存切换、q退出)都没变。存的格式也从"多段列表"改成单个 segment: [start, end, "success"|"failure"] | null。
+
 ## 按键 + episode之间的reset窗口
 
-```text
-r：进入/退出critical phase（单击=success，double-tap-window-s窗口内双击=failure）——
-   只结束critical phase，不结束整个episode，reward就在这一刻写进replay buffer，
+r：第一次按进入critical phase，第二次按立即判定success
+u：立即把当前critical phase判定为failure
+   r的success和u的failure都只结束critical phase，不结束整个episode，
+   reward就在这一刻写进replay buffer，
    之后自动切回VLA继续跑（比如把组装好的东西放到指定区域），这段VLA跑的不算训练数据
 s / f：整个episode真正结束（等VLA把后续动作做完、确认整体OK了再按）
-space（或 -i）：teleop 接管
+i：仅左臂 teleop 接管
+space：无干预时接管左右双臂；任意干预状态下解除干预
   按r（第1次）→ 进入critical phase，actor开始控制
     ↓（这期间可以按0次、1次或多次space）
-    按space → intervention开始，你用leader臂直接接管，actor被打断
-    再按space → intervention结束，如果critical phase还没结束，actor自动恢复接管
+    按i → 仅左臂人工接管，右臂继续执行策略动作
+    或按space → 左右双臂人工接管
+    在任意干预状态再按space → intervention结束，actor自动恢复接管
     ↓（可以反复intervene任意次）
-  按r（第2次，0.6s确认窗口内不再按）→ critical phase结束，判定success，
-    reward在这一刻写进replay buffer；如果0.6s内又按了一次r，判定failure
+  按r（第2次）→ critical phase立即结束，判定success，
+    reward在这一刻写进replay buffer；期间任意时刻按u则立即判定failure
     ↓
   VLA自动接管，继续做后面的步骤
     ↓
   按s或f → 整个episode真正结束
-备用x：强制接管，效果同上，多一个热键保险
-```
-
 episode结束（按s/f）后依次发生两件事：
-
-1. **go-home**（`--go-home-time-s`秒，默认3）：机械臂自动ramp回标定时手动摆的那个"中间位置"夹爪归到`--go-home-gripper-value`
-2. **teleop reset窗口**（`--reset-time-s`秒，默认15）：纯teleop，用来手动把物件摆回去。
-
-这两段时间都不计入数据/replay buffer。`--go-home-time-s 0`可以关掉第一步。
-
-
-## 跑前检查（不用）
-
-```bash
-python diagnostics/check_config_consistency.py \
-  --ac-config-dir outputs/pin_insert_online_rl/step_000005 \
-  --cache-build-chunk-length 10 --cache-build-frame-stride 2 \
-  --deploy-chunk-exec-steps 25 --deploy-phase-mode manual
-```
-
 
 ## warmup 门槛
 # recorded_episodes >= 5 
