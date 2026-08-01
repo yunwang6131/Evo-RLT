@@ -64,7 +64,11 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     critic_hidden_dim: int = 256
     critic_num_layers: int = 2
     critic_activation: str = "relu"
-    critic_layer_norm: bool = False
+    # RLPD (Ball et al., 2023): LayerNorm bounds Q by the output layer's
+    # weight norm, mitigating catastrophic OOD value overestimation without
+    # constraining exploration. target_q_clip below remains as a coarse
+    # backstop, not the primary defense.
+    critic_layer_norm: bool = True
     critic_residual: bool = False
 
     # --- TD3+BC hyperparams ---
@@ -74,6 +78,18 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     utd_ratio: int = 5
     actor_update_interval: int = 2
     target_q_clip: float = 100.0
+
+    # --- RankQ self-supervised ranking loss (Choi & Xu, 2026) ---
+    # Augments the critic TD loss with a pairwise softplus ranking term over
+    # noisy/very-noisy/random/permuted variants of each executed action, so
+    # Q-gradients w.r.t. action point toward higher-quality behavior instead
+    # of just being clamped. Applied only where the sampled batch carries a
+    # resolved "outcome" label (see losses.rankq_ranking_loss); batches
+    # without one (e.g. offline lerobot-train pretraining) are unaffected.
+    # alpha0/alpha1 = 1.0, noise_scale = 0.15 match the paper's defaults.
+    rankq_alpha_success: float = 1.0
+    rankq_alpha_failure: float = 1.0
+    rankq_noise_scale: float = 0.15
 
     # --- Shapes ---
     chunk_length: int = 10

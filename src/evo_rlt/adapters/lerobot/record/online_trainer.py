@@ -217,11 +217,20 @@ class OnlineRLTrainer:
             online = self.replay_buffer.sample_stratified(online_n)
         else:
             online = self.replay_buffer.sample(online_n)
+        # RankQ ranking loss (see losses.rankq_ranking_loss): tag each online
+        # transition with its trajectory's resolved success/failure outcome.
+        online["outcome"] = self.replay_buffer.outcome_labels(online["episode_id"])
         if offline_n == 0:
             actual_online_n = next(iter(online.values())).shape[0]
             return online, 0, actual_online_n
         assert self.offline_buffer is not None
         offline = self.offline_buffer.sample(offline_n)
+        # The offline cache is contractually "demonstrated_action" only (see
+        # _load_offline_buffer's exec_chunk_source check), so every demo
+        # transition counts as a resolved success -- its episode_id is not
+        # reliable for episode_outcomes() lookup (often left at the default
+        # -1 sentinel by the cache builder).
+        offline["outcome"] = torch.ones(offline["state_vec"].shape[0])
         actual_offline_n = next(iter(offline.values())).shape[0]
         actual_online_n = next(iter(online.values())).shape[0]
         return (
@@ -271,6 +280,9 @@ class OnlineRLTrainer:
                 "actor_layer_norm": policy_cfg.actor_layer_norm,
                 "critic_hidden_dim": policy_cfg.critic_hidden_dim,
                 "critic_layer_norm": policy_cfg.critic_layer_norm,
+                "rankq_alpha_success": getattr(policy_cfg, "rankq_alpha_success", None),
+                "rankq_alpha_failure": getattr(policy_cfg, "rankq_alpha_failure", None),
+                "rankq_noise_scale": getattr(policy_cfg, "rankq_noise_scale", None),
             },
             settings=wandb.Settings(save_code=False),
         )
@@ -418,6 +430,7 @@ class OnlineRLTrainer:
                     "next_ref_chunk": unflatten_chunk(raw["next_ref_flat"], chunk_length),
                     "done": raw["done"],
                     "actual_steps": raw["actual_steps"],
+                    "outcome": raw["outcome"],
                 }
                 batch = {k: v.to(device) for k, v in batch.items()}
                 loss, info = self.policy.forward(batch)

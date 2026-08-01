@@ -88,6 +88,26 @@ class ReplayBuffer:
                 outcomes[eid] = "success" if t.reward_seq.sum().item() > 0 else "failure"
         return outcomes
 
+    def outcome_labels(self, episode_id: torch.Tensor) -> torch.Tensor:
+        """Map each transition's episode_id to its trajectory outcome, for
+        the RankQ ranking loss (see losses.rankq_ranking_loss): 1.0 =
+        success, 0.0 = failure, -1.0 = unresolved/unknown (e.g. the episode
+        has no terminal transition in the buffer yet). Looks up outcomes via
+        episode_outcomes(), so it reflects the *current* buffer contents,
+        not necessarily the episode_id tensor's own source buffer -- pass
+        the episode_id of a batch already sampled from this buffer.
+        """
+        outcomes = self.episode_outcomes()
+        return torch.tensor(
+            [
+                1.0 if outcomes.get(int(eid.item())) == "success"
+                else 0.0 if outcomes.get(int(eid.item())) == "failure"
+                else -1.0
+                for eid in episode_id
+            ],
+            dtype=torch.float32,
+        )
+
     def count_outcomes(self) -> tuple[int, int]:
         """Return (num_success_episodes, num_failure_episodes) represented in the buffer."""
         outcomes = self.episode_outcomes()

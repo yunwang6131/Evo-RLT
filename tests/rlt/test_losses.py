@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import pytest
 
-from evo_rlt.core.losses import discounted_chunk_return, critic_loss, actor_loss
+from evo_rlt.core.losses import discounted_chunk_return, critic_loss, actor_loss, rankq_ranking_loss
 from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.critic import TwinCritic
 from evo_rlt.core.utils import soft_update
@@ -187,3 +187,83 @@ def test_critic_loss_respects_target_q_clip():
 
     assert clipped.item() == pytest.approx(200.0)
     assert unclipped.item() == pytest.approx(2_000_000.0)
+
+
+class TestRankQRankingLoss:
+    def test_zero_when_no_resolved_outcome(self, critic):
+        B = 8
+        state = torch.randn(B, STATE_DIM)
+        action = torch.randn(B, CHUNK_DIM)
+        outcome = torch.full((B,), -1.0)  # all unresolved
+        loss = rankq_ranking_loss(critic, state, action, outcome)
+        assert loss.item() == pytest.approx(0.0)
+
+    def test_nonzero_and_finite_with_success_and_failure(self, critic):
+        B = 8
+        state = torch.randn(B, STATE_DIM)
+        action = torch.randn(B, CHUNK_DIM)
+        outcome = torch.tensor([1.0, 0.0] * (B // 2))
+        loss = rankq_ranking_loss(critic, state, action, outcome)
+        assert loss.shape == ()
+        assert torch.isfinite(loss)
+        assert loss.item() != 0.0
+
+    def test_success_action_preferred_after_training_step(self, critic):
+        """A single gradient step on the ranking loss should push Q(exec) up
+        relative to Q(random) for a success transition -- i.e. the loss is
+        actually informative, not a no-op that happens to be nonzero."""
+        torch.manual_seed(0)
+        state = torch.randn(4, STATE_DIM)
+        action = torch.randn(4, CHUNK_DIM)
+        outcome = torch.ones(4)
+
+        opt = torch.optim.SGD(critic.parameters(), lr=0.1)
+        with torch.no_grad():
+            q_before = critic.min_q(state, action).mean()
+        for _ in range(20):
+            opt.zero_grad()
+            loss = rankq_ranking_loss(critic, state, action, outcome)
+            loss.backward()
+            opt.step()
+        with torch.no_grad():
+            q_after = critic.min_q(state, action).mean()
+        assert q_after.item() > q_before.item()
+
+    def test_critic_loss_is_unaffected_by_default(self, actor, critic, target_critic, batch):
+        """No 'outcome' key and default alphas=0 -> byte-identical to before
+        the RankQ integration (backward compatibility)."""
+        torch.manual_seed(1)
+        loss_a = critic_loss(critic, target_critic, actor, batch, gamma=0.99, C=C)
+        torch.manual_seed(1)
+        loss_b = critic_loss(
+            critic, target_critic, actor, batch, gamma=0.99, C=C,
+            rankq_alpha_success=0.0, rankq_alpha_failure=0.0,
+        )
+        assert loss_a.item() == pytest.approx(loss_b.item())
+
+    def test_critic_loss_adds_ranking_term_when_enabled_and_outcome_present(
+        self, actor, critic, target_critic, batch
+    ):
+        batch_with_outcome = dict(batch)
+        batch_with_outcome["outcome"] = torch.tensor(
+            [1.0, 0.0] * (batch["state_vec"].shape[0] // 2)
+        )
+        base = critic_loss(critic, target_critic, actor, batch, gamma=0.99, C=C)
+        with_rankq = critic_loss(
+            critic, target_critic, actor, batch_with_outcome, gamma=0.99, C=C,
+            rankq_alpha_success=1.0, rankq_alpha_failure=1.0,
+        )
+        assert with_rankq.item() != pytest.approx(base.item())
+
+    def test_critic_loss_ignores_rankq_alphas_without_outcome_key(
+        self, actor, critic, target_critic, batch
+    ):
+        """Enabling the alphas without an 'outcome' key in the batch must
+        not crash or change the loss -- offline lerobot-train batches don't
+        carry outcome labels."""
+        base = critic_loss(critic, target_critic, actor, batch, gamma=0.99, C=C)
+        still_base = critic_loss(
+            critic, target_critic, actor, batch, gamma=0.99, C=C,
+            rankq_alpha_success=1.0, rankq_alpha_failure=1.0,
+        )
+        assert still_base.item() == pytest.approx(base.item())

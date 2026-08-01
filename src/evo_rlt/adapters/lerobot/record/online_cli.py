@@ -90,6 +90,9 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--policy.critic_activation={args.critic_activation}",
         f"--policy.critic_residual={'true' if args.critic_residual else 'false'}",
         f"--policy.critic_layer_norm={'true' if args.critic_layer_norm else 'false'}",
+        f"--policy.rankq_alpha_success={args.rankq_alpha_success}",
+        f"--policy.rankq_alpha_failure={args.rankq_alpha_failure}",
+        f"--policy.rankq_noise_scale={args.rankq_noise_scale}",
         "--policy.device=cuda",
         *build_dataset_argv(
             dataset_name=paths.dataset_name,
@@ -198,6 +201,10 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
         f"layer_norm={args.actor_layer_norm} fixed_std={args.actor_fixed_std} | "
         f"Critic: hidden_dim={args.critic_hidden_dim} "
         f"num_layers={args.critic_num_layers} layer_norm={args.critic_layer_norm}"
+    )
+    print(
+        f"RankQ: alpha_success={args.rankq_alpha_success} alpha_failure={args.rankq_alpha_failure} "
+        f"noise_scale={args.rankq_noise_scale}"
     )
     print(
         f"Safety: actor_action_clip_delta={args.actor_action_clip_delta}; "
@@ -389,6 +396,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--critic-layer-norm", action=argparse.BooleanOptionalAction, default=True,
         help="LayerNorm in both online and target Critic hidden blocks. Enabled by "
         "default for RLPD-style offline/online high-UTD stability.",
+    )
+    parser.add_argument(
+        "--rankq-alpha-success", type=float, default=1.0,
+        help="Weight of RankQ's ranking loss terms on successful-trajectory transitions "
+        "(executed action must outrank noisy/very-noisy/random/permuted variants, chained "
+        "in quality order). 0 disables it for success transitions.",
+    )
+    parser.add_argument(
+        "--rankq-alpha-failure", type=float, default=1.0,
+        help="Weight of RankQ's weak ranking constraint on failed-trajectory transitions "
+        "(executed action must only outrank a random action). 0 disables it for failures.",
+    )
+    parser.add_argument(
+        "--rankq-noise-scale", type=float, default=0.15,
+        help="Std of the Gaussian perturbation RankQ uses to build 'noisy'/'very-noisy' "
+        "negative actions from the executed action.",
     )
 
     # Safety.

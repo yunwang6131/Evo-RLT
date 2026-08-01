@@ -130,6 +130,17 @@ class TestEpisodeOutcomes:
         assert outcomes == {5: "success"}
 
 
+class TestOutcomeLabels:
+    def test_maps_success_failure_and_unresolved(self):
+        buf = ReplayBuffer(capacity=100)
+        buf.add(_make_episode_transition(1, done=True, success=True))
+        buf.add(_make_episode_transition(2, done=True, success=False))
+        buf.add(_make_episode_transition(3))  # no terminal transition yet
+        episode_id = torch.tensor([1, 2, 3, 999])  # 999 unknown to the buffer
+        labels = buf.outcome_labels(episode_id)
+        assert labels.tolist() == [1.0, 0.0, -1.0, -1.0]
+
+
 class TestStratifiedSampling:
     def test_falls_back_to_uniform_when_buffer_is_small(self):
         buf = ReplayBuffer(capacity=100)

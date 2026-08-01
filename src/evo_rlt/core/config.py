@@ -39,7 +39,11 @@ class CriticConfig:
     num_layers: int = 2
     lr: float = 3e-4
     activation: str = "relu"
-    layer_norm: bool = False
+    # RLPD (Ball et al., 2023): LayerNorm bounds Q by the output layer's
+    # weight norm, which mitigates catastrophic value overestimation on
+    # OOD actions without constraining exploration -- the mechanism this
+    # codebase previously only patched after the fact via target_q_clip.
+    layer_norm: bool = True
     residual: bool = False
 
 

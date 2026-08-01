@@ -215,6 +215,13 @@ class ChunkACPolicy(PreTrainedPolicy):
         out["exec_chunk_flat"] = out["exec_chunk"].flatten(start_dim=-2)
         out["ref_chunk_flat"] = out["ref_chunk"].flatten(start_dim=-2)
         out["next_ref_flat"] = out["next_ref_chunk"].flatten(start_dim=-2)
+        # Optional: per-transition trajectory outcome for the RankQ ranking
+        # loss (see losses.critic_loss). Absent for batches with no resolved
+        # outcome (e.g. offline lerobot-train pretraining), in which case
+        # critic_loss simply skips the ranking term.
+        if "outcome" in batch:
+            v = batch["outcome"]
+            out["outcome"] = v if isinstance(v, Tensor) else torch.as_tensor(v)
         return out
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
@@ -228,6 +235,12 @@ class ChunkACPolicy(PreTrainedPolicy):
             gamma=self.config.gamma,
             C=self.config.chunk_length,
             target_q_clip=self.config.target_q_clip,
+            # getattr, not self.config.rankq_*: some call sites (older
+            # checkpoints' configs, minimal test stand-ins) may predate
+            # these fields; default to "off" rather than raise.
+            rankq_noise_scale=getattr(self.config, "rankq_noise_scale", 0.15),
+            rankq_alpha_success=getattr(self.config, "rankq_alpha_success", 0.0),
+            rankq_alpha_failure=getattr(self.config, "rankq_alpha_failure", 0.0),
         )
         soft_update(self.target_critic, self.critic, self.config.tau)
         self._critic_step += 1

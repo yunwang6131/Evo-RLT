@@ -26,6 +26,71 @@ def discounted_chunk_return(
     return (reward_seq * discounts.unsqueeze(0)).sum(dim=1, keepdim=True)
 
 
+def rankq_ranking_loss(
+    critic: TwinCritic,
+    state_vec: torch.Tensor,
+    action_flat: torch.Tensor,
+    outcome: torch.Tensor,
+    noise_scale: float = 0.15,
+    alpha_success: float = 1.0,
+    alpha_failure: float = 1.0,
+) -> torch.Tensor:
+    """RankQ (Choi & Xu, 2026) self-supervised action-ranking loss.
+
+    Rather than uniformly penalizing every unseen action (CQL/Cal-QL-style
+    pessimism), this shapes the Q-landscape so that gradients w.r.t. action
+    point toward higher-quality regions: for a transition from a
+    *successful* trajectory, the executed action must outrank a small
+    perturbation of itself, which must outrank a larger perturbation, which
+    must outrank a random action -- plus the executed action must also
+    outrank an unrelated (permuted) action. For a *failed* trajectory's
+    action, only the weak constraint "beats a random action" is enforced,
+    since a failure action isn't necessarily bad everywhere. Transitions
+    whose trajectory outcome hasn't resolved (outcome not in {0, 1}) are
+    excluded. Mirrors RankQ Eq. 4-6 / Appendix A.
+
+    `outcome`: (B,) with 1.0 = success, 0.0 = failure, anything else =
+    unresolved/unknown (excluded).
+    """
+    success_mask = outcome == 1
+    failure_mask = outcome == 0
+    if not (bool(success_mask.any()) or bool(failure_mask.any())):
+        return action_flat.new_zeros(())
+
+    bs = action_flat.shape[0]
+    eps = torch.randn_like(action_flat)
+    perm = torch.roll(torch.arange(bs, device=action_flat.device), shifts=-1)
+    candidates = {
+        "exec": action_flat,
+        "noisy": action_flat + eps * noise_scale,
+        "very_noisy": action_flat + eps * (2.0 * noise_scale),
+        "random": torch.rand_like(action_flat) * 2.0 - 1.0,
+        "permuted": action_flat[perm],
+    }
+    q1, q2 = {}, {}
+    for name, action in candidates.items():
+        q1[name], q2[name] = critic(state_vec, action)
+
+    def _rank(q: dict[str, torch.Tensor], pos: str, neg: str, mask: torch.Tensor) -> torch.Tensor:
+        if not bool(mask.any()):
+            return action_flat.new_zeros(())
+        return F.softplus(q[neg][mask] - q[pos][mask]).mean()
+
+    # L^succ + L^chain (Eq. 4-5): executed action beats every suboptimal
+    # variant, and the variants are themselves chained in quality order.
+    success_pairs = [
+        ("exec", "noisy"), ("exec", "very_noisy"), ("exec", "random"), ("exec", "permuted"),
+        ("noisy", "very_noisy"), ("very_noisy", "random"),
+    ]
+    loss = action_flat.new_zeros(())
+    for q in (q1, q2):
+        for pos, neg in success_pairs:
+            loss = loss + alpha_success * _rank(q, pos, neg, success_mask)
+        # L^fail (Eq. 6): only the weak "beats random" constraint.
+        loss = loss + alpha_failure * _rank(q, "exec", "random", failure_mask)
+    return loss
+
+
 def critic_loss(
     critic: TwinCritic,
     target_critic: TwinCritic,
@@ -34,11 +99,19 @@ def critic_loss(
     gamma: float,
     C: int,
     target_q_clip: float | None = 100.0,
+    rankq_noise_scale: float = 0.15,
+    rankq_alpha_success: float = 0.0,
+    rankq_alpha_failure: float = 0.0,
 ) -> torch.Tensor:
     """TD3-style chunk-level TD loss with correct truncated-chunk handling.
 
     Uses actual_steps to compute the correct bootstrap exponent gamma^k
     instead of always using gamma^C.
+
+    If `batch["outcome"]` is present and either rankq_alpha_* is > 0, adds
+    RankQ's self-supervised ranking loss (see rankq_ranking_loss above) as
+    an additional term. Fully backward compatible: with the default alphas
+    (or no "outcome" key in batch) this is a no-op.
     """
     x = batch["state_vec"]
     a = batch["exec_chunk_flat"]
@@ -66,7 +139,17 @@ def critic_loss(
         target = r + bootstrap
 
     q1, q2 = critic(x, a)
-    return F.mse_loss(q1, target) + F.mse_loss(q2, target)
+    loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+
+    outcome = batch.get("outcome")
+    if outcome is not None and (rankq_alpha_success > 0 or rankq_alpha_failure > 0):
+        loss = loss + rankq_ranking_loss(
+            critic, x, a, outcome,
+            noise_scale=rankq_noise_scale,
+            alpha_success=rankq_alpha_success,
+            alpha_failure=rankq_alpha_failure,
+        )
+    return loss
 
 
 def actor_loss(
