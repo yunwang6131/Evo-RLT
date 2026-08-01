@@ -522,6 +522,24 @@ def test_official_so_leader_feedback_is_sent_through_bus():
     ]
 
 
+def test_official_so_leader_connection_error_is_compatible_with_lerobot_v051():
+    from evo_rlt.adapters.lerobot.record.hil import set_teleop_manual_control
+
+    leader = _FakeLeaderArm()
+    leader.diagnostic_label = "left leader"
+
+    def fail_enable_torque():
+        raise ConnectionError("Incorrect status packet")
+
+    leader.bus.enable_torque = fail_enable_torque
+
+    with pytest.raises(
+        ConnectionError,
+        match=r"left leader on /dev/fake failed while disabling leader manual control: Incorrect status packet",
+    ):
+        set_teleop_manual_control(leader, False)
+
+
 def test_official_bi_so_leader_feedback_splits_prefixed_actions():
     from evo_rlt.adapters.lerobot.record.hil import send_teleop_feedback
 

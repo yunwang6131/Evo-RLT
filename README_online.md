@@ -60,19 +60,31 @@ evo-rlt-online-train \
 
 # 恢复训练，从明确选择的历史训练状态继续：
 
+conda activate evo-rlt
+
 evo-rlt-online-train \
   --setup-json configs/my_so101_manifest.json \
   --vla-path /home/wangyun/Evo-RLT/pretrained/pretrained_model \
   --rl-token-path outputs/pin_insert_rl_token/checkpoints/010000/pretrained_model \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
-  --num-episodes 200 \
+  --num-episodes 400 \
   --actor-action-clip-delta 0.1 \
-  --resume-from outputs/pin_insert_online_rl/step_000100/online_state.pt \
-  --save-dir outputs/pin_insert_online_rl \
+  --beta 0.3 \
+  --gamma 0.9995 \
+  --utd-ratio 5 \
+  --max-updates-per-episode 1000 \
+  --warmup-episodes 5 \
+  --min-warmup-transitions 1000 \
+  --min-warmup-successes 3 \
+  --min-warmup-failures 3 \
+  --rl-action-arms left \
+  --resume-from outputs/online_rl/0731_online_rl/eval_online_rl_092314/step_000160/online_state.pt \
+  --save-dir outputs/online_rl/0731_online_rl/eval_online_rl_092314 \
   --wandb \
-  --wandb-project pin-insert-rl \
-  --wandb-run-id run1 \
+  --wandb-project rlt-left-only \
+  --wandb-run-name run1 \
+  --wandb-run-id 07nroabd \
   --wandb-resume must \
   --save-every-episodes 5
 

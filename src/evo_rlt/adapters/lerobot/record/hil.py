@@ -201,10 +201,16 @@ def _is_bi_so_leader(teleop: Teleoperator) -> bool:
 
 
 def _raise_so_leader_connection_error(teleop: Teleoperator, operation: str, error: ConnectionError) -> None:
-    from lerobot.utils.errors import DeviceDroppedConnectionError
-
     label = getattr(teleop, "diagnostic_label", "leader arm")
     port = getattr(getattr(teleop, "config", None), "port", "unknown")
+    try:
+        from lerobot.utils.errors import DeviceDroppedConnectionError
+    except ImportError:
+        # LeRobot 0.5.1 does not provide DeviceDroppedConnectionError. Keep
+        # the original connection failure actionable instead of masking it
+        # with an import error from the compatibility wrapper.
+        raise ConnectionError(f"{label} on {port} failed while {operation}: {error}") from error
+
     raise DeviceDroppedConnectionError(label, port, operation, error) from error
 
 
