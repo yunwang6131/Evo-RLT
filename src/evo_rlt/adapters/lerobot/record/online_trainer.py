@@ -268,7 +268,9 @@ class OnlineRLTrainer:
                 "chunk_length": policy_cfg.chunk_length,
                 "action_dim": policy_cfg.action_dim,
                 "actor_hidden_dim": policy_cfg.actor_hidden_dim,
+                "actor_layer_norm": policy_cfg.actor_layer_norm,
                 "critic_hidden_dim": policy_cfg.critic_hidden_dim,
+                "critic_layer_norm": policy_cfg.critic_layer_norm,
             },
             settings=wandb.Settings(save_code=False),
         )

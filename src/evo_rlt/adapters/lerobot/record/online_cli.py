@@ -84,10 +84,12 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--policy.actor_fixed_std={args.actor_fixed_std}",
         f"--policy.actor_activation={args.actor_activation}",
         f"--policy.actor_residual={'true' if args.actor_residual else 'false'}",
+        f"--policy.actor_layer_norm={'true' if args.actor_layer_norm else 'false'}",
         f"--policy.critic_hidden_dim={args.critic_hidden_dim}",
         f"--policy.critic_num_layers={args.critic_num_layers}",
         f"--policy.critic_activation={args.critic_activation}",
         f"--policy.critic_residual={'true' if args.critic_residual else 'false'}",
+        f"--policy.critic_layer_norm={'true' if args.critic_layer_norm else 'false'}",
         "--policy.device=cuda",
         *build_dataset_argv(
             dataset_name=paths.dataset_name,
@@ -193,8 +195,9 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
     )
     print(
         f"Actor: hidden_dim={args.actor_hidden_dim} num_layers={args.actor_num_layers} "
-        f"fixed_std={args.actor_fixed_std} | Critic: hidden_dim={args.critic_hidden_dim} "
-        f"num_layers={args.critic_num_layers}"
+        f"layer_norm={args.actor_layer_norm} fixed_std={args.actor_fixed_std} | "
+        f"Critic: hidden_dim={args.critic_hidden_dim} "
+        f"num_layers={args.critic_num_layers} layer_norm={args.critic_layer_norm}"
     )
     print(
         f"Safety: actor_action_clip_delta={args.actor_action_clip_delta}; "
@@ -360,6 +363,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--actor-activation", default="relu")
     parser.add_argument("--actor-residual", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--actor-layer-norm", action=argparse.BooleanOptionalAction, default=False,
+        help="LayerNorm in Actor hidden blocks. Disabled by default; RLPD's key "
+        "normalization recommendation applies to the Critic.",
+    )
+    parser.add_argument(
         "--rl-action-arms", choices=("left", "both"), default="left",
         help="Arm(s) whose action residual may be learned. 'left' keeps every "
         "right-arm action exactly equal to the frozen VLA reference.",
@@ -377,6 +385,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--critic-num-layers", type=int, default=3)
     parser.add_argument("--critic-activation", default="relu")
     parser.add_argument("--critic-residual", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--critic-layer-norm", action=argparse.BooleanOptionalAction, default=True,
+        help="LayerNorm in both online and target Critic hidden blocks. Enabled by "
+        "default for RLPD-style offline/online high-UTD stability.",
+    )
 
     # Safety.
     parser.add_argument(

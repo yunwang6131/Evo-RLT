@@ -69,6 +69,7 @@ evo-rlt-build-transition-cache-v2 \
 ```bash
   --offline-cache-path outputs/pin_insert_offline_cache \
   --offline-batch-fraction 0.5 \
+  --critic-layer-norm \
 ```
 
 每个 batch 默认一半来自固定离线示范，一半来自在线 replay。在线 warmup
@@ -222,6 +223,8 @@ warm_up结束之后会跑10个只更新crtic的不更新actor的
 --rl-action-arms（在线训练默认left）   left=仅左臂学习RL残差，右臂严格使用VLA动作；both=双臂都学习
 --actor-hidden-dim/--actor-num-layers/--critic-hidden-dim/--critic-num-layers（默认512/3层）
     对齐ac_paper_screw.yaml的复杂任务档位
+--critic-layer-norm（在线训练默认开）   RLPD风格的Critic LayerNorm，稳定offline/online混合与高UTD下的Q值
+--actor-layer-norm（默认关）   Actor暂不启用LayerNorm，避免不必要地改变残差策略动力学
 --actor-fixed-std（默认0）   目前不生效——rollout和训练loss都只用actor的确定性均值，从不调用
     actor.sample()，这个参数先留着占位，不代表有随机探索
 --stratified-sampling（默认开）   训练batch按成功/失败/人工干预/最近数据分层采样
