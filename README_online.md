@@ -1,12 +1,15 @@
+# 在线 RL：milestone reward + 双 Replay Buffer
+
+## 0. 安装与环境
+
+```bash
+cd Evo-RLT
+conda activate evo-rlt
 python -m pip install -e ".[lerobot]"
-# online RL 训练（真机，同步版）
-
-actor 用 zero-init 残差头（mu = ref + delta，delta 最后一层零初始化），没训练之前 actor 输出 == VLA 参考，第一轮就是安全的——不需要offline先训一版actor-critic再warm start，直接从零开始在线训也是安全的。
-
+export TORCHDYNAMO_DISABLE=1
 ```
-task = "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area."
-```
-### 1. 训练 RL Token（冻结VLA，只训一个encoder做特征压缩）
+
+## 1. 训练 RL Token
 
 ```bash
 python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerobot.scripts.lerobot_train import main; main()' \
@@ -30,14 +33,43 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
   --job_name=pin_insert_rl_token
 ```
 
-到这里为止，跟离线流程（README_dualarm_rlt.md）是共用的——**在线训练不需要再做`build-transition-cache`和`train-actor-critic`这两步**，`evo-rlt-online-train`会现场构造一个全新初始化的actor/critic。
+## 2. 标注离线 critical phase 与 milestone
 
-### 1.5 可选：把 VLA 示范作为固定 offline replay
+```bash
+conda activate evo-rlt
+python diagnostics/critical_segment_labeler_cv.py \
+  --dataset-root data/bimanual/merged_screw_v1
+```
 
-需要用当前版本重新构建 cache。旧版 v2 cache 令
-`exec_chunk == ref_chunk`，没有保留真实示范修正，不适合双 buffer 在线训练。
-左臂 RL 模式下，新 builder 使用“示范左臂动作 + 当前 VLA 右臂动作”，
-与在线部署的控制权限完全一致：
+### 标注按键
+
+```text
+r          第一次：critical phase 开始；第二次：结束并标为 success
+u          结束 critical phase 并标为 failure
+m          在 milestone 已完成的第一帧标注 milestone；再次按可移动
+Shift+m    清除 milestone
+z          清空当前 episode 的 critical phase 和 milestone
+x          标记当前 episode 没有 critical phase
+Space      播放 / 暂停
+a / d      前后移动 1 帧
+A / D      前后移动 10 帧
+1 / 2 / 3  0.25x / 0.5x / 1x
+Enter      保存并进入下一条
+b / n      不保存，切换上一条 / 下一条
+q / Esc    退出
+```
+
+标签写入：
+
+```text
+data/bimanual/merged_screw_v1/meta/critical_segments.json
+```
+
+`milestone_frame` 必须统一标在事件完成的第一帧，例如“销钉完全拔出”的第一帧。失败轨迹如果已经达到 milestone，也应标注；没有达到则保持 `null`。
+
+## 3. 构建固定 Offline Replay Buffer
+
+离线和在线必须使用完全相同的 `chunk-length`、`rl-action-arms`、`milestone-reward`、`terminal-reward` 和 `time-decay`。
 
 ```bash
 evo-rlt-build-transition-cache-v2 \
@@ -48,10 +80,12 @@ evo-rlt-build-transition-cache-v2 \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --output-dir outputs/pin_insert_offline_cache \
   --task-instruction "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
-  --default-episode-success success \
   --chunk-length 10 \
   --frame-stride 2 \
   --rl-action-arms left \
+  --milestone-reward 0.3 \
+  --terminal-reward 1.0 \
+  --time-decay 0.995 \
   --batch-size 32 \
   --num-workers 2 \
   --train-ratio 0.9 \
@@ -59,32 +93,7 @@ evo-rlt-build-transition-cache-v2 \
   --device cuda
 ```
 
-如果原始 VLA 数据包含整段长任务，最好先裁出与在线 `r` 键范围一致的
-插入 critical phase；否则大量抓取/搬运/放置状态会稀释离线 batch——现在
-`evo-rlt-build-transition-cache-v2` 会自动读取
-`<demo-dataset-root>/meta/critical_segments.json`（用
-`diagnostics/critical_segment_labeler_cv.py` 标注），存在的话默认就只用每条
-episode 里标出来的 critical-phase 片段（含该片段自己的 success/failure），
-跟在线 RL 的 critical phase 语义保持一致，不用再手动裁剪；没有该标签的
-episode 会被跳过，不会混进整集数据。传 `--no-critical-segments` 可以回退成
-下面这种整集 `episode_success` 的旧行为。没有 `episode_success` 元数据时，
-上面的命令把标准 VLA 示范视为成功；如果数据中混有失败，必须先补正确标签，
-不能统一标成成功。
-
-然后给在线训练增加：
-
-```bash
-  --offline-cache-path outputs/pin_insert_offline_cache \
-  --offline-batch-fraction 0.5 \
-  --critic-layer-norm \
-```
-
-每个 batch 默认一半来自固定离线示范，一半来自在线 replay。在线 warmup
-的 transition/success/failure 门槛以及 UTD 更新预算仍然只统计在线数据；
-离线成功示范不会让 actor 提前解冻。续训时必须传回同一个
-`--offline-cache-path`。
-
-### 2. 跑在线RL训练
+## 4. 在线训练：Offline + Online 双 Buffer
 
 ```bash
 evo-rlt-online-train \
@@ -94,44 +103,52 @@ evo-rlt-online-train \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 200 \
-  --actor-action-clip-delta 0.1 \
+  --chunk-length 10 \
   --rl-action-arms left \
+  --actor-action-clip-delta 0.1 \
   --offline-cache-path outputs/pin_insert_offline_cache \
   --offline-batch-fraction 0.5 \
+  --milestone-reward 0.3 \
+  --terminal-reward 1.0 \
+  --time-decay 0.995 \
   --beta 0.6 \
+  --gamma 0.9995 \
   --warmup-episodes 5 \
   --min-warmup-transitions 1000 \
   --min-warmup-successes 3 \
-  --min-warmup-failures 3  \
-  --rl-action-arms left \
-  --gamma 0.9995 \
+  --min-warmup-failures 3 \
+  --critic-layer-norm \
+  --utd-ratio 2 \
+  --save-every-episodes 5 \
   --wandb \
   --wandb-project rlt-left-only \
-  --wandb-run-name run1 \
-  --save-every-episodes 5 \
-  --utd-ratio 2
+  --wandb-run-name run1
 ```
 
-分段奖励（默认开启）：`--milestone-key`（默认 `m`）在 critical phase 进行中按
-一次，给一个一次性的中途 shaping 奖励（比如"销子已经拔出来了"，跟最终 r/u
-判定的插入结果分开算）；每次 critical phase 只生效一次，第二次按/critical
-phase 结束后按都是 no-op。`--milestone-reward`（默认 0.3）、`--terminal-reward`
-（默认 1.0，success 时给，failure 恒为 0）控制这两个奖励各自的（未打折）幅度。
-`--time-decay`（默认 **0.995**）让这两个奖励按"critical phase 开始到拿到奖励
-时**收尾了多少个 chunk**（不是帧数——按 chunk 计数是为了让衰减幅度跟真实耗时
-匹配：典型 critical phase 大概 50~300 个 chunk，0.995 在这个量级上给出
-~0.6~0.8 倍的实际差异，比如 0.995^50≈0.78、0.995^300≈0.22；如果按帧数算同样
-的指数，几百帧内就会衰减到 0 附近，反而把奖励signal打没了）打指数折扣，更快
-达成给分更高——故意不是靠调低 `--gamma` 实现：`--gamma` 是让稀疏 terminal
-reward 能在几百个 chunk 的 critical phase 里靠 bootstrap 传播回去的关键，调低
-它会削弱长距离 credit assignment，跟"给速度加分"应该是两件独立可调的事。传
-`--time-decay 1.0` 可以关掉这个效果，完全复现旧的"成功给 1.0、失败给 0、不受
-耗时影响"行为。
+### 在线操作按键
 
-`--save-dir` 现在可以不传——不传会自动生成 `outputs/online_rl/<MMDD>_<dataset-tag>/<HHMMSS>/`（跟数据集文件夹用同一个时间戳，方便对应），每次全新跑都不会互相覆盖。**续训(`--resume-from`)时必须显式传 `--save-dir`**，指向原来那次跑用的目录，不然会直接报错拦住——续训不该新开一个跟历史checkpoint不连续的目录。
+```text
+r          第一次：进入 critical phase；第二次：success 并立即写入在线 buffer
+u          failure 并立即写入在线 buffer
+m          milestone，只在当前 critical phase 第一次按下时生效
+i          左臂人工接管
+Space      双臂人工接管；再次按下解除接管
+s / f      整个记录 episode 成功 / 失败并结束
+```
 
-# 恢复训练，从明确选择的历史训练状态继续：
+critical phase 在 `r/u` 后立即结束并切回 VLA；后续 VLA 动作不进入在线 RL buffer。Offline buffer 固定不变，Online buffer 持续增长；每个训练 batch 由 `offline-batch-fraction` 控制混合比例。warmup、success/failure 门槛和 UTD 只统计 Online buffer。
 
+## 5. 自定义 Episode Reset 位置
+
+把下面参数追加到在线训练命令：
+
+```bash
+  --go-home-positions '{"left_shoulder_pan.pos": 2054, "left_shoulder_lift.pos": 2099, "left_elbow_flex.pos": 3041, "left_wrist_flex.pos": 1448, "left_gripper.pos": 1789, "right_shoulder_pan.pos": 2095, "right_shoulder_lift.pos": 2132, "right_elbow_flex.pos": 2984, "right_wrist_flex.pos": 1428, "right_gripper.pos": 1991}'
+```
+
+## 6. 恢复在线训练
+
+```bash
 evo-rlt-online-train \
   --setup-json configs/my_so101_manifest.json \
   --vla-path /home/wangyun/Evo-RLT/pretrained/pretrained_model \
@@ -139,25 +156,25 @@ evo-rlt-online-train \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 200 \
-  --actor-action-clip-delta 0.1 \
-  --resume-from outputs/pin_insert_online_rl/step_000100/online_state.pt \
+  --offline-cache-path outputs/pin_insert_offline_cache \
+  --offline-batch-fraction 0.5 \
+  --milestone-reward 0.3 \
+  --terminal-reward 1.0 \
+  --time-decay 0.995 \
+  --resume-from outputs/pin_insert_online_rl/latest_online_state.pt \
   --save-dir outputs/pin_insert_online_rl \
   --wandb \
   --wandb-project pin-insert-rl \
   --wandb-run-id run1 \
   --wandb-resume must \
   --save-every-episodes 5
+```
 
+`--num-episodes` 是恢复后的总 episode 目标。恢复时必须使用原来的 offline cache、reward 参数和 `--save-dir`。
 
-这个可以调reset之后的位置：
-  --go-home-positions '{"left_shoulder_pan.pos": 2054, "left_shoulder_lift.pos": 2099, "left_elbow_flex.pos": 3041, "left_wrist_flex.pos": 1448, "left_gripper.pos": 1789, "right_shoulder_pan.pos": 2095, "right_shoulder_lift.pos": 2132, "right_elbow_flex.pos": 2984, "right_wrist_flex.pos": 1428, "right_gripper.pos": 1991}' \
+## 7. 评测
 
-`--num-episodes` 是续训后的总 episode 目标。例如从
-`step_000100/online_state.pt` 恢复并传 `--num-episodes 200`，会从 100 继续到 200
---actor-action-clip-delta 用来限制 RLT Actor 输出相对于 VLA 参考动作的最大偏移
-
-# 评测
-
+```bash
 evo-rlt-record full \
   --initial-source vla \
   --setup-json configs/my_so101_manifest.json \
@@ -169,102 +186,128 @@ evo-rlt-record full \
   --no-rtc \
   --num-episodes 30 \
   --dataset-tag eval_pin_insert
+```
 
-phase mode可以选择：always_rl/always_vla/manual
+## 8. 收集 PI0.5 Baseline
 
-# 收集SFT之后的pi05_baseline
+```bash
+evo-rlt-record full \
+  --initial-source vla \
+  --setup-json configs/my_so101_manifest.json \
+  --policy-path /home/wangyun/Evo-RLT/pretrained/pretrained_model \
+  --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
+  --dataset-tag pi05_baseline_eval \
+  --num-episodes 30 \
+  --episode-time-s 600 \
+  --reset-time-s 6 \
+  --fps 30 \
+  --vcodec h264
+```
 
-evo-rlt-record full   --initial-source vla   --setup-json configs/my_so101_manifest.json   --policy-path /home/wangyun/Evo-RLT/pretrained/pretrained_model   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area."   --dataset-tag pi05_baseline_eval   --num-episodes 30   --episode-time-s 600   --reset-time-s 6   --fps 30   --vcodec h264
+## 9. 从 Online Buffer 删除错误 Episode
 
-# 删除bufferl里面的某个episode
-会先把原文件备份成 latest_online_state.pt.bak，再把episode 41的所有transition从buffer里删掉、覆写回 latest_online_state.pt。跑完会打印删了多少条、buffer从多少条变成多少条。
+### 预览
 
+```bash
+evo-rlt-prune-online-state \
+  --state-path outputs/pin_insert_online_rl/latest_online_state.pt \
+  --episode-id 41
+```
+
+### 覆盖原状态
+
+```bash
 evo-rlt-prune-online-state \
   --state-path outputs/pin_insert_online_rl/latest_online_state.pt \
   --episode-id 41 \
   --in-place
-
-如果不想直接覆写、想先看看结果对不对，去掉 --in-place 就行，会另外写一个 latest_online_state.pt.pruned.pt，原文件不动：
-evo-rlt-prune-online-state \
-  --state-path outputs/pin_insert_online_rl/latest_online_state.pt \
-  --episode-id 41
-
-# 人工标注VLA数据集中的critical phase
-conda activate evo-rlt
-python diagnostics/critical_segment_labeler_cv.py --dataset-root data/bimanual/merged_screw_v1
-
-r:不在critical里 → 标记当前帧为critical开始;已经在critical里 → 在当前帧收尾并存为成功
-u:在critical里的时候按 → 在当前帧收尾并存为失败(不在critical里按它没反应)
-z:重置——把这条episode当前标的段(不管是已经收尾的,还是刚按了r还没收尾的)清空,重新来
-x:标记"这条没有critical片段"
-播放到中间里程碑事件刚完成的那一帧，按 m。例如任务定义是“销钉已经完全拔出”，就标在确认完全拔出的第一帧。再按一次 m 可以移动 milestone。
-Shift+m 清除 milestone。
-
-space播放暂停、a/d单帧、A/D十帧、1/2/3慢放、enter保存下一条、b/n不保存切换、q退出
-
-## 按键 + episode之间的reset窗口
-
-r：第一次按进入critical phase，第二次按立即判定success
-u：立即把当前critical phase判定为failure
-   r的success和u的failure都只结束critical phase，不结束整个episode，
-   reward就在这一刻写进replay buffer，
-   之后自动切回VLA继续跑（比如把组装好的东西放到指定区域），这段VLA跑的不算训练数据
-s / f：整个episode真正结束（等VLA把后续动作做完、确认整体OK了再按）
-i：仅左臂 teleop 接管
-space：无干预时接管左右双臂；任意干预状态下解除干预
-  按r（第1次）→ 进入critical phase，actor开始控制
-    ↓（这期间可以按0次、1次或多次space）
-    按i → 仅左臂人工接管，右臂继续执行策略动作
-    或按space → 左右双臂人工接管
-    在任意干预状态再按space → intervention结束，actor自动恢复接管
-    ↓（可以反复intervene任意次）
-  按r（第2次）→ critical phase立即结束，判定success，
-    reward在这一刻写进replay buffer；期间任意时刻按u则立即判定failure
-    ↓
-  VLA自动接管，继续做后面的步骤
-    ↓
-  按s或f → 整个episode真正结束
-episode结束（按s/f）后依次发生两件事：
-
-## warmup 门槛
-# recorded_episodes >= 5 
-至少完成 5 个有效 episode，避免刚启动、数据量过少时立刻训练。
-# transitions >= 1000 
-Replay Buffer 中至少要有 1000 条状态转移。一条 transition 大致包括：
-当前状态 + 执行动作 + reward + 下一状态 + 是否结束
-它不是图像帧数，也不是 episode 数。一个 episode 可以产生几十或几百条 transition，具体数量取决于 critical phase 持续时间和 transition 构造方式。
-# successes >= 3 
-Replay Buffer 中至少包含 3 个成功的 critical-phase episode。成功数据让 critic 学会哪些状态和动作具有较高价值
-# failures >= 3 
-至少包含 3 个失败的 critical-phase episode。失败数据让 critic 能够区分“好动作”和“坏动作”。
-# critic only
-warm_up结束之后会跑10个只更新crtic的不更新actor的
-
-## 关键参数速查
-
---utd-ratio（默认1）/ --max-updates-per-episode（默认200）
-    更新次数 = min(本episode新增transition数 * utd_ratio, 上限)
---lr-actor(3e-5) / --lr-critic(1e-4)   actor学得慢，critic学得快
---actor-action-clip-delta   RL actor单步动作相对VLA参考的最大偏移
---rl-action-arms（在线训练默认left）   left=仅左臂学习RL残差，右臂严格使用VLA动作；both=双臂都学习
---actor-hidden-dim/--actor-num-layers/--critic-hidden-dim/--critic-num-layers（默认512/3层）
-    对齐ac_paper_screw.yaml的复杂任务档位
---critic-layer-norm（在线训练默认开）   RLPD风格的Critic LayerNorm，稳定offline/online混合与高UTD下的Q值
---actor-layer-norm（默认关）   Actor暂不启用LayerNorm，避免不必要地改变残差策略动力学
---actor-fixed-std（默认0）   目前不生效——rollout和训练loss都只用actor的确定性均值，从不调用
-    actor.sample()，这个参数先留着占位，不代表有随机探索
---stratified-sampling（默认开）   训练batch按成功/失败/人工干预/最近数据分层采样
---gamma/--beta/--tau/--actor-update-interval   TD3+BC超参，跟离线训练那套一样
 ```
-export TORCHDYNAMO_DISABLE=1
 
+`--in-place` 会先生成 `latest_online_state.pt.bak`。
 
-buffer包含：
-  当前状态 state
-  实际执行动作 exec_chunk
-  VLA参考动作 ref_chunk
-  奖励 reward
-  下一状态 next_state
-  是否结束 done
-  是否人工接管 intervention
-  episode编号
+## 10. W&B 指标速查
+### 训练状态
+
+| W&B 指标 | 含义 |
+|---|---|
+| `online_rl/warmup_satisfied` | `1` 表示 warmup 的 episode、transition、成功和失败门槛均已满足。 |
+| `online_rl/critic_only` | `1` 表示只更新 critic，actor 尚未解冻。 |
+| `online_rl/new_transitions` | 当前 episode 新增的 Online Buffer transition 数。 |
+| `online_rl/actual_updates` | 当前 episode 结束后实际执行的梯度更新次数。 |
+| `online_rl/effective_utd` | `actual_updates / new_transitions`。 |
+| `online_rl/training_time_s` | 当前 episode 结束后的训练耗时，单位为秒。 |
+
+### Replay Buffer 与 Batch
+
+| W&B 指标 | 含义 |
+|---|---|
+| `online_rl/buffer_transitions` | 当前 Online Replay Buffer 的 transition 数。 |
+| `online_rl/offline_buffer_transitions` | 固定 Offline Replay Buffer 的 transition 数。 |
+| `online_rl/offline_batch_size` | 每个训练 batch 实际抽取的 offline 样本数。 |
+| `online_rl/online_batch_size` | 每个训练 batch 实际抽取的 online 样本数。 |
+| `online_rl/buffer_successes` | Online Buffer 中已完成的成功 critical-phase episode 数。 |
+| `online_rl/buffer_failures` | Online Buffer 中已完成的失败 critical-phase episode 数。 |
+
+### Episode 与真机表现
+
+| W&B 指标 | 含义 |
+|---|---|
+| `online_rl/episode_reward` | 最新完成 episode 的 milestone reward 与 terminal reward 总和。 |
+| `online_rl/episode_intervened` | 最新 episode 是否发生人工干预：`1` 是，`0` 否。 |
+| `online_rl/episode_autonomous_success` | 最新 episode 是否在无人工干预下成功。 |
+| `online_rl/autonomous_episodes` | 累计无人工干预 episode 数。 |
+| `online_rl/autonomous_successes` | 累计无人工干预成功数。 |
+| `online_rl/autonomous_success_rate` | 累计自主成功率。 |
+| `online_rl/autonomous_success_rate_rolling_20` | 最近 20 个已标注 episode 中的自主成功率。 |
+| `online_rl/autonomous_episodes_rolling_20` | 最近 20 个已标注 episode 中无人工干预的数量。 |
+| `online_rl/intervention_rate` | 累计发生人工干预的 episode 比例。 |
+| `online_rl/intervention_rate_rolling_20` | 最近 20 个已标注 episode 的人工干预比例。 |
+
+### Loss 与 Q 诊断
+
+| W&B 指标 | 含义 |
+|---|---|
+| `online_rl/loss` | 最后一次 gradient update 的总 loss。 |
+| `online_rl/loss_critic` | Twin Critic 的 TD MSE，加上启用时的 RankQ loss。 |
+| `online_rl/loss_actor` | Actor 的 `-Q(s, actor(s)) + beta × BC`；只在发生 actor update 后记录。 |
+| `online_rl/q_action_sensitivity` | 同一 state 下，`exec/noisy/very_noisy/random/permuted` 五种 action 的 Q 标准差，再对 batch 取平均。 |
+
+`q_action_sensitivity` 的判断方式：
+
+| 现象 | 含义 |
+|---|---|
+| 长期接近 `0` | Critic 几乎忽略 action，可能从 `Q(s,a)` 塌陷成 `V(s)`。 |
+| 保持明显非零 | Critic 能区分 action，但不代表 Q 值没有高估。 |
+| 快速增大，同时自主成功率下降 | Critic 可能产生错误的 action 偏好，需要结合 Q 绝对值进一步诊断。 |
+
+当前日志不能直接判定 Q overestimation；`loss_critic` 很低或 `q_action_sensitivity` 非零都不能单独证明 Q 值准确。
+
+### W&B 启动参数
+
+| 参数 | 含义 |
+|---|---|
+| `--wandb` | 开启 W&B 日志。 |
+| `--wandb-project` | W&B project 名称。 |
+| `--wandb-run-name` | 当前 run 的显示名称。 |
+| `--wandb-entity` | W&B 用户或团队名称；默认使用当前登录账户。 |
+| `--wandb-run-id` | 固定 run ID，恢复同一个 W&B run 时使用。 |
+| `--wandb-resume` | W&B 恢复策略；严格恢复使用 `must`。 |
+
+## 11. Reward 与更新公式
+
+```text
+milestone = milestone_reward × time_decay ^ milestone前已关闭chunk数
+terminal  = success × terminal_reward × time_decay ^ 结束时已关闭chunk数
+episode_reward = milestone + terminal
+
+updates = min(本episode新增在线transition数 × utd_ratio,
+              max_updates_per_episode)
+```
+
+```text
+warmup 默认门槛：
+recorded_episodes >= 5
+online transitions >= 1000
+online success episodes >= 3
+online failure episodes >= 3
+```

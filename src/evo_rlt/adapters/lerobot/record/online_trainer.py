@@ -29,6 +29,7 @@ import torch
 
 from evo_rlt.adapters.lerobot.online_collector import RLTOnlineCollector
 from evo_rlt.core.interfaces import ChunkTransition
+from evo_rlt.core.losses import q_action_sensitivity
 from evo_rlt.core.replay_buffer import ReplayBuffer
 from evo_rlt.core.utils import soft_update, unflatten_chunk
 
@@ -255,6 +256,24 @@ class OnlineRLTrainer:
             raise ValueError("Offline and online replay batches have different fields")
         return {key: torch.cat([first[key], second[key]], dim=0) for key in first}
 
+    def _split_batch_sizes(self) -> tuple[int, int]:
+        """(online_n, offline_n): how a full training batch splits between
+        the online replay buffer and the fixed offline demo buffer (all
+        online, 0 offline, if no offline buffer is configured). Shared by
+        _sample_training_batch() and maybe_update()'s "is there enough data
+        yet" gate so the two can't drift apart -- that gate must check the
+        actual online_n needed, not the full batch_size, or it needlessly
+        delays the first update whenever an offline buffer is configured to
+        cover part of the batch (e.g. offline_batch_fraction=0.5 only ever
+        needs batch_size/2 online transitions, not a full batch_size worth).
+        """
+        batch_size = self.cfg.batch_size
+        if self.offline_buffer is None:
+            return batch_size, 0
+        offline_n = round(batch_size * self.cfg.offline_batch_fraction)
+        offline_n = min(max(offline_n, 0), batch_size - 1)
+        return batch_size - offline_n, offline_n
+
     def _sample_training_batch(self) -> tuple[dict[str, torch.Tensor], int, int]:
         """Sample a controlled offline/online mixture.
 
@@ -262,14 +281,7 @@ class OnlineRLTrainer:
         keeps its outcome/intervention/recent stratification. The warmup and
         UTD budget remain based solely on online experience.
         """
-        batch_size = self.cfg.batch_size
-        if self.offline_buffer is None:
-            online_n = batch_size
-            offline_n = 0
-        else:
-            offline_n = round(batch_size * self.cfg.offline_batch_fraction)
-            offline_n = min(max(offline_n, 0), batch_size - 1)
-            online_n = batch_size - offline_n
+        online_n, offline_n = self._split_batch_sizes()
 
         if self.cfg.use_stratified_sampling:
             online = self.replay_buffer.sample_stratified(online_n)
@@ -512,7 +524,8 @@ class OnlineRLTrainer:
                 step=recorded_episodes,
             )
             return None
-        if len(self.replay_buffer) < self.cfg.batch_size:
+        online_n, _offline_n = self._split_batch_sizes()
+        if len(self.replay_buffer) < online_n:
             self._log(self._autonomous_success_metrics(), step=recorded_episodes)
             return None
 
@@ -608,6 +621,18 @@ class OnlineRLTrainer:
         training_time_s = time.perf_counter() - start_t
 
         loss_dict = {k: (v.item() if torch.is_tensor(v) else v) for k, v in (info or {}).items()}
+        if num_updates > 0:
+            # Diagnostic (see losses.q_action_sensitivity): computed once per
+            # update cycle, not every gradient step, on the last sampled
+            # batch -- cheap enough for periodic logging, and catches the
+            # critic collapsing into an action-insensitive V(s)-like function
+            # (low TD loss but no useful signal for the actor) that plain
+            # loss_critic alone doesn't reveal.
+            loss_dict["q_action_sensitivity"] = q_action_sensitivity(
+                self.policy.critic,
+                raw["state_vec"].to(device),
+                raw["exec_chunk_flat"].to(device),
+            ).item()
         if last_actor_info is not None and "loss_actor" not in loss_dict:
             # The last iteration of this call didn't happen to be a do_actor
             # step, but an earlier one in the same call was -- surface that

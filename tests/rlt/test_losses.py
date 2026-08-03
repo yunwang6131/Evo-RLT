@@ -4,7 +4,13 @@ import torch
 import torch.nn.functional as F
 import pytest
 
-from evo_rlt.core.losses import discounted_chunk_return, critic_loss, actor_loss, rankq_ranking_loss
+from evo_rlt.core.losses import (
+    discounted_chunk_return,
+    critic_loss,
+    actor_loss,
+    rankq_ranking_loss,
+    q_action_sensitivity,
+)
 from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.critic import TwinCritic
 from evo_rlt.core.utils import soft_update
@@ -267,3 +273,34 @@ class TestRankQRankingLoss:
             rankq_alpha_success=1.0, rankq_alpha_failure=1.0,
         )
         assert still_base.item() == pytest.approx(base.item())
+
+
+class TestQActionSensitivity:
+    def test_nonzero_for_a_freshly_initialized_critic(self, critic):
+        """A random-init critic has not collapsed yet -- different actions at
+        the same state should already produce visibly different Q values."""
+        state = torch.randn(16, STATE_DIM)
+        action = torch.randn(16, CHUNK_DIM)
+        sensitivity = q_action_sensitivity(critic, state, action)
+        assert sensitivity.item() > 0.0
+
+    def test_near_zero_for_an_action_insensitive_critic(self):
+        """A critic that structurally ignores the action input (the failure
+        mode this diagnostic is meant to catch) must report ~0 sensitivity."""
+
+        class _StateOnlyCritic:
+            def min_q(self, state_vec, action_flat):
+                return state_vec.sum(dim=-1, keepdim=True)
+
+        state = torch.randn(16, STATE_DIM)
+        action = torch.randn(16, CHUNK_DIM)
+        sensitivity = q_action_sensitivity(_StateOnlyCritic(), state, action)
+        assert sensitivity.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_does_not_require_grad_tracking(self, critic):
+        """Must be safe to call mid-training without interfering with a live
+        autograd graph (it's a pure logging diagnostic, no gradients)."""
+        state = torch.randn(4, STATE_DIM, requires_grad=True)
+        action = torch.randn(4, CHUNK_DIM, requires_grad=True)
+        sensitivity = q_action_sensitivity(critic, state, action)
+        assert not sensitivity.requires_grad

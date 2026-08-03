@@ -380,6 +380,18 @@ def _encode_episode(
     # Matches RLTOnlineCollector._chunks_closed at flush_episode() time: every
     # C frames of the critical-phase attempt closes one chunk, and the final
     # (possibly partial) chunk still counts as closed when the attempt ends.
+    # ceil(), not floor()/(//): confirmed against a direct simulation of
+    # RLTOnlineCollector's actual increment logic (a real attempt with N real
+    # frames always ends at chunks_closed == ceil(N/C), because a leftover
+    # partial chunk at flush_episode() still increments the counter by 1).
+    # The offline anchor scheme can only ever *emit* floor(N/C) transitions
+    # for such an attempt (the dataset's true last frame can only ever serve
+    # as someone's bootstrap next_state, never start its own transition, so
+    # there's no transition to represent that trailing partial chunk) -- but
+    # that's a limitation of how many transitions get built, not of how much
+    # time actually elapsed, so the terminal transition's decay exponent
+    # still has to reflect the real ceil(N/C), not the smaller count of
+    # transitions the pipeline managed to physically produce.
     critical_length = episode_last_frame + 1 - critical_start_frame
     terminal_chunks_closed = math.ceil(critical_length / C) if critical_length > 0 else 0
     milestone_actual_start_frame, milestone_chunks_closed = _resolve_milestone_chunk(

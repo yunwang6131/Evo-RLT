@@ -171,3 +171,43 @@ def actor_loss(
     q = critic.min_q(x, mu)
     bc_reg = ((mu - ref) ** 2).sum(dim=-1).mean()
     return -q.mean() + beta * bc_reg
+
+
+def q_action_sensitivity(
+    critic: TwinCritic,
+    state_vec: torch.Tensor,
+    action_flat: torch.Tensor,
+    noise_scale: float = 0.15,
+) -> torch.Tensor:
+    """Diagnostic: how much does critic.min_q(s, ·) actually vary across
+    different actions at the same state?
+
+    A critic trained under sparse, long-horizon reward can trivially
+    minimize TD-MSE by learning a state-only baseline and ignoring the
+    action input almost entirely -- functionally collapsing into a value
+    function V(s) even though it's architecturally still Q(s,a) (see RankQ
+    paper Fig.1's ∂Q/∂a visualization for the same failure mode via a true
+    gradient; this is a cheaper no-autograd proxy for periodic logging).
+    Reuses the same candidate-action construction as rankq_ranking_loss so
+    the comparison is apples-to-apples.
+
+    Returns a scalar: mean over the batch of the per-sample std across 5
+    candidate actions' (exec/noisy/very_noisy/random/permuted) Q values.
+    Near 0 means Q is action-insensitive (collapsed toward V(s)); a healthy
+    value should track Q's own scale and stay well above 0.
+    """
+    with torch.no_grad():
+        bs = action_flat.shape[0]
+        eps = torch.randn_like(action_flat)
+        perm = torch.roll(torch.arange(bs, device=action_flat.device), shifts=-1)
+        candidates = [
+            action_flat,
+            action_flat + eps * noise_scale,
+            action_flat + eps * (2.0 * noise_scale),
+            torch.rand_like(action_flat) * 2.0 - 1.0,
+            action_flat[perm],
+        ]
+        q_values = torch.stack(
+            [critic.min_q(state_vec, a).squeeze(-1) for a in candidates], dim=0
+        )  # (5, B)
+        return q_values.std(dim=0).mean()

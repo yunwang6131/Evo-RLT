@@ -66,6 +66,31 @@ def test_mixed_batch_has_fixed_offline_online_split():
     assert batch["state_vec"].shape[0] == 10
 
 
+def test_split_batch_sizes_matches_sample_training_batch():
+    """maybe_update()'s 'enough data yet' gate and _sample_training_batch()
+    must use the identical split, or the gate can require far more online
+    data than a batch actually needs once an offline buffer covers part of
+    it (batch_size=10, offline_fraction=0.4 only ever needs 6 online
+    transitions, not a full 10)."""
+    trainer = object.__new__(OnlineRLTrainer)
+    trainer.cfg = SimpleNamespace(batch_size=10, offline_batch_fraction=0.4)
+    trainer.offline_buffer = _buffer(range(20))
+
+    online_n, offline_n = trainer._split_batch_sizes()
+
+    assert (online_n, offline_n) == (6, 4)
+
+
+def test_split_batch_sizes_no_offline_buffer_needs_full_batch():
+    trainer = object.__new__(OnlineRLTrainer)
+    trainer.cfg = SimpleNamespace(batch_size=10, offline_batch_fraction=0.4)
+    trainer.offline_buffer = None
+
+    online_n, offline_n = trainer._split_batch_sizes()
+
+    assert (online_n, offline_n) == (10, 0)
+
+
 def test_offline_cache_loader_accepts_v2_dict_cache(tmp_path):
     transition = _transition(1.0)
     cache_dict = {
