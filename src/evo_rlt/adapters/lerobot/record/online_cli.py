@@ -124,6 +124,7 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         # episode_failure_key, s/f by default) once that's done.
         "--rlt.enable=true",
         f"--rlt.rl_phase_key={args.rlt_toggle_key}",
+        f"--rlt.milestone_key={args.milestone_key}",
         f"--rlt.intervention_action_blend_time_s={args.intervention_blend_time_s}",
         "--rlt.skip_prefix_recording=true",
         "--rlt.rl_phase_key_toggles_critical_phase=true",
@@ -151,6 +152,9 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--online_rl.offline_batch_fraction={args.offline_batch_fraction}",
         f"--online_rl.lr_actor={args.lr_actor}",
         f"--online_rl.lr_critic={args.lr_critic}",
+        f"--online_rl.terminal_reward={args.terminal_reward}",
+        f"--online_rl.milestone_reward={args.milestone_reward}",
+        f"--online_rl.time_decay={args.time_decay}",
         f"--online_rl.save_dir={args.save_dir}",
         f"--online_rl.save_every_episodes={args.save_every_episodes}",
         f"--online_rl.go_home_time_s={args.go_home_time_s}",
@@ -335,6 +339,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vla-ref", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--play-sounds", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rlt-toggle-key", default="r")
+    parser.add_argument(
+        "--milestone-key", default="m",
+        help="Pressed once during an active critical-phase attempt to award the "
+        "one-time mid-phase shaping bonus (--milestone-reward), e.g. for a "
+        "sub-step like 'pin pulled out' ahead of the final r/u judgment. "
+        "No-op outside an active critical phase or after the first press.",
+    )
     parser.add_argument("--teleop-toggle-key", default="space")
     parser.add_argument("--left-intervention-key", default="i")
     parser.add_argument(
@@ -466,6 +477,31 @@ def build_parser() -> argparse.ArgumentParser:
     # actor -- which directly drives the robot -- should not.
     parser.add_argument("--lr-actor", type=float, default=3e-5)
     parser.add_argument("--lr-critic", type=float, default=1e-4)
+    parser.add_argument(
+        "--terminal-reward", type=float, default=1.0,
+        help="Reward on a successful critical-phase attempt (failure is always 0). "
+        "Scaled by --time-decay before being written -- see that flag.",
+    )
+    parser.add_argument(
+        "--milestone-reward", type=float, default=0.3,
+        help="One-time mid-phase shaping bonus awarded by --milestone-key "
+        "(0.0 disables it). Scaled by --time-decay before being written.",
+    )
+    parser.add_argument(
+        "--time-decay", type=float, default=0.995,
+        help="Both --milestone-reward and --terminal-reward are multiplied by "
+        "time_decay ** (chunks CLOSED in the attempt so far, not raw frames) when "
+        "awarded, so a faster attempt scores higher than a slower one reaching the "
+        "same milestone/outcome. On by default: a typical critical-phase attempt "
+        "is ~50-300 closed chunks, and 0.995 gives a real ~0.6-0.8x range there "
+        "(0.995**50=0.78, 0.995**300=0.22). Pass 1.0 to disable this and reproduce "
+        "the exact old fixed-magnitude-on-success behavior. Deliberately separate "
+        "from --gamma: gamma is what lets the sparse terminal reward bootstrap "
+        "back across a whole multi-hundred-chunk critical-phase attempt, so "
+        "lowering it to add time pressure would undermine that long-horizon "
+        "credit assignment instead of adding an independently-tunable speed "
+        "incentive.",
+    )
     parser.add_argument(
         "--save-dir", default=None,
         help="Where to write step_NNNNNN checkpoints, selectable "

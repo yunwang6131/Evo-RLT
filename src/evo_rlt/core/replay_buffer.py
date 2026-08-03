@@ -80,12 +80,22 @@ class ReplayBuffer:
 
     def episode_outcomes(self) -> dict[int, str]:
         """Map episode_id -> "success"/"failure" for every episode that has a
-        terminal (done=1) transition currently in the buffer."""
+        terminal (done=1) transition currently in the buffer.
+
+        New transitions carry an explicit outcome so positive milestone
+        shaping cannot turn a failed episode into a success.  The reward
+        fallback keeps old checkpoints/caches readable.
+        """
         outcomes: dict[int, str] = {}
         for t in self.buffer:
             if t.done.item() == 1.0:
                 eid = int(t.episode_id.item())
-                outcomes[eid] = "success" if t.reward_seq.sum().item() > 0 else "failure"
+                explicit = getattr(t, "outcome", None)
+                explicit_value = float(explicit.item()) if explicit is not None else -1.0
+                if explicit_value >= 0.0:
+                    outcomes[eid] = "success" if explicit_value >= 0.5 else "failure"
+                else:
+                    outcomes[eid] = "success" if t.reward_seq.sum().item() > 0 else "failure"
         return outcomes
 
     def outcome_labels(self, episode_id: torch.Tensor) -> torch.Tensor:

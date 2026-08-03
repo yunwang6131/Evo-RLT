@@ -610,6 +610,17 @@ def record_loop(
             return
         _mark_rl_phase_failure(toggles_episode, toggles_cp)
 
+    def _handle_rl_milestone_event() -> None:
+        if not events.get("mark_rl_milestone", False):
+            return
+        events["mark_rl_milestone"] = False
+        if not rl_phase_started or rlt_online_collector is None:
+            return
+        bonus = rlt_online_collector.mark_milestone()
+        if bonus > 0:
+            log_say("milestone", play_sounds=True)
+            logging.info("RL milestone reached (bonus=%.4f)", bonus)
+
     def _release_active_intervention_after_phase_end() -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
         if not (intervention_enabled and _intervention_is_active()):
@@ -764,6 +775,7 @@ def record_loop(
         _handle_critical_phase_events()
         _handle_rl_phase_start_event()
         _handle_rl_phase_failure_event()
+        _handle_rl_milestone_event()
         _handle_end_phase_event("end_phase_success", EPISODE_SUCCESS)
         _handle_end_phase_event("end_phase_failure", EPISODE_FAILURE)
 

@@ -227,6 +227,13 @@ class RLTRecordConfig:
     rl_phase_failure_key: str = "u"
     end_success_key: str = "s"
     end_failure_key: str = "f"
+    # Awards the one-time mid-phase shaping bonus (OnlineRLConfig.
+    # milestone_reward/time_decay) for reaching an intermediate milestone
+    # inside the current critical-phase attempt (e.g. "pin pulled out" ahead
+    # of a separate final "inserted" judgment on rl_phase_key/
+    # rl_phase_failure_key). No-op if not in an active critical phase, or if
+    # already pressed once this attempt -- see RLTOnlineCollector.mark_milestone().
+    milestone_key: str = "m"
     # wo_prefix mode: drop frames captured during PHASE_PREFIX (before RL phase
     # starts). Used when the dataset should only contain the RL-driven segment.
     skip_prefix_recording: bool = False
@@ -291,6 +298,34 @@ class OnlineRLConfig:
     critic_only_episodes: int = 10
     replay_capacity: int = 20_000
     batch_size: int = 256
+    # Terminal reward on a successful critical-phase attempt (failure is
+    # always 0 regardless of this value). Kept separate from time_decay so a
+    # run that doesn't care about speed shaping can leave time_decay=1.0 and
+    # get the exact old fixed-1.0-on-success behavior.
+    terminal_reward: float = 1.0
+    # One-time mid-phase shaping bonus, fired by pressing rlt.milestone_key
+    # once during a critical-phase attempt (e.g. "pin pulled out" ahead of a
+    # separate final "inserted" judgment) -- see RLTOnlineCollector.
+    # mark_milestone(). 0.0 disables it outright (the key becomes a no-op).
+    milestone_reward: float = 0.3
+    # Both milestone_reward and terminal_reward are multiplied by
+    # time_decay ** (chunks CLOSED in this attempt so far, not raw frames --
+    # see RLTOnlineCollector._chunks_closed) when awarded, so a faster
+    # attempt scores higher than a slower one that reaches the same
+    # milestone/outcome. On by default: a typical critical-phase attempt is
+    # ~50-300 closed chunks, and 0.995 gives a real ~0.6-0.8x range over that
+    # span (0.995**50=0.78, 0.995**300=0.22) instead of vanishing to ~0 (which
+    # a per-FRAME exponent over the same wall-clock span would do -- do not
+    # "fix" this by lowering time_decay further without checking the actual
+    # chunk-count scale of your attempts). Pass time_decay=1.0 to disable and
+    # get the exact old fixed-1.0-on-success behavior.
+    # Deliberately NOT implemented by lowering policy.gamma: gamma is what
+    # lets the sparse terminal reward bootstrap back across a whole
+    # multi-hundred-chunk critical-phase attempt (see OnlineRLConfig's other
+    # comments on warmup/critic-only); lowering it to add time pressure would
+    # undermine that long-horizon credit assignment instead of adding a
+    # separate, independently-tunable speed incentive.
+    time_decay: float = 0.995
     # Optional fixed demonstration cache. It is sampled separately from the
     # online replay so a large offline dataset cannot drown out recent robot
     # experience (and online eviction cannot erase the demonstrations).
@@ -949,6 +984,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             rl_phase_failure_key=rl_phase_failure_key_binding,
             end_success_key=cfg.rlt.end_success_key if rlt_active else None,
             end_failure_key=cfg.rlt.end_failure_key if rlt_active else None,
+            milestone_key=cfg.rlt.milestone_key if rlt_active else None,
         )
 
         def _warmup_rlt_path() -> None:

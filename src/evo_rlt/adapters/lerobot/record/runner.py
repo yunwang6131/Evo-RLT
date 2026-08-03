@@ -227,6 +227,7 @@ def _ensure_record_events(events: dict[str, Any]) -> None:
         "mark_rl_phase_failure",
         "end_phase_success",
         "end_phase_failure",
+        "mark_rl_milestone",
     ]:
         events.setdefault(event_name, False)
 
@@ -253,6 +254,7 @@ def _patch_record_keyboard_listener() -> None:
             kwargs.pop("rl_phase_failure_key", None): "mark_rl_phase_failure",
             kwargs.pop("end_success_key", None): "end_phase_success",
             kwargs.pop("end_failure_key", None): "end_phase_failure",
+            kwargs.pop("milestone_key", None): "mark_rl_milestone",
         }
         keyboard_listener, events = original_init_keyboard_listener(*args, **kwargs)
         _ensure_record_events(events)
@@ -320,6 +322,7 @@ def _patch_episode_outcome_listener(
         rl_phase_failure_key = kwargs.pop("rl_phase_failure_key", None)
         end_success_key = kwargs.pop("end_success_key", None)
         end_failure_key = kwargs.pop("end_failure_key", None)
+        milestone_key = kwargs.pop("milestone_key", None)
         keyboard_listener, events = original_init_keyboard_listener()
         _ensure_record_events(events)
         router = _EpisodeOutcomeRouter(events, outcome_key, failure_key=failure_key)
@@ -333,6 +336,7 @@ def _patch_episode_outcome_listener(
             rl_phase_failure_key: "mark_rl_phase_failure",
             end_success_key: "end_phase_success",
             end_failure_key: "end_phase_failure",
+            milestone_key: "mark_rl_milestone",
         }
         pedal_listener = _start_record_event_pedal_listener(events, record_key_bindings, router)
         extra_keyboard_listener = _start_episode_outcome_key_listener(outcome_key, router, failure_key=failure_key)

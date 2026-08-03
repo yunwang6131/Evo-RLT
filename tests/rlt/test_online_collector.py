@@ -14,7 +14,12 @@ STATE_DIM = 10
 
 def _make_collector() -> tuple[RLTOnlineCollector, ReplayBuffer]:
     buffer = ReplayBuffer(capacity=100)
-    collector = RLTOnlineCollector(replay_buffer=buffer, chunk_length=CHUNK_LENGTH, action_dim=ACTION_DIM)
+    # time_decay=1.0: these tests are about staging/flush mechanics, not
+    # decay -- see TestMilestoneReward for decay-specific behavior, which
+    # uses its own helper with an explicit time_decay per test.
+    collector = RLTOnlineCollector(
+        replay_buffer=buffer, chunk_length=CHUNK_LENGTH, action_dim=ACTION_DIM, time_decay=1.0
+    )
     collector.start_episode(episode_id=0)
     return collector, buffer
 
@@ -169,3 +174,150 @@ class TestFlushedGuard:
             _feed_frame(collector, i)
         collector.flush_episode(episode_success=False)
         assert len(buffer) == 2
+
+
+class TestMilestoneReward:
+    def _make_collector_with_shaping(self, **kwargs) -> tuple[RLTOnlineCollector, ReplayBuffer]:
+        buffer = ReplayBuffer(capacity=100)
+        collector = RLTOnlineCollector(
+            replay_buffer=buffer, chunk_length=CHUNK_LENGTH, action_dim=ACTION_DIM, **kwargs
+        )
+        collector.start_episode(episode_id=0)
+        return collector, buffer
+
+    def test_time_decay_of_one_reproduces_old_fixed_reward(self):
+        """time_decay=1.0 must reproduce the pre-shaping behavior exactly:
+        terminal reward is always exactly 1.0/0.0 no matter how many chunks
+        closed. (The class default below is < 1.0 -- see its own test.)"""
+        collector, buffer = self._make_collector_with_shaping(time_decay=1.0)
+        for i in range(CHUNK_LENGTH - 1):
+            _feed_frame(collector, i)
+        collector.flush_episode(episode_success=True)
+        transition = buffer.buffer[0]
+        assert transition.reward_seq.sum().item() == pytest.approx(1.0)
+
+    def test_default_time_decay_is_enabled_not_a_no_op(self):
+        """The class default (0.995, decaying per closed chunk) must actually
+        shrink the terminal reward once at least one chunk has closed -- this
+        flag is on by default, not an inert opt-in."""
+        collector, buffer = self._make_collector_with_shaping()  # default time_decay
+        for i in range(CHUNK_LENGTH):  # one full chunk closes
+            _feed_frame(collector, i)
+        for i in range(CHUNK_LENGTH - 1):  # partial terminal chunk
+            _feed_frame(collector, i)
+        collector.flush_episode(episode_success=True)
+        terminal = buffer.buffer[-1]
+        actual = int(terminal.actual_steps.item())
+        # 2 chunks closed by the time the terminal reward is computed (the
+        # first full chunk, then this terminal chunk itself).
+        assert terminal.reward_seq[actual - 1].item() == pytest.approx(1.0 * 0.995 ** 2)
+        assert terminal.reward_seq[actual - 1].item() < 1.0
+
+    def test_milestone_fires_once_and_lands_on_next_chunk_close(self):
+        collector, buffer = self._make_collector_with_shaping(milestone_reward=0.5, time_decay=1.0)
+        _feed_frame(collector, 0)
+        bonus = collector.mark_milestone()
+        assert bonus == pytest.approx(0.5)
+        # Second press this attempt must be a no-op.
+        assert collector.mark_milestone() == 0.0
+
+        for i in range(1, CHUNK_LENGTH):  # close out the chunk the milestone landed in
+            _feed_frame(collector, i)
+        assert len(buffer) == 0  # first chunk auto-emitted but only staged, not committed yet
+        first_staged = collector._episode_staging[0]
+        assert first_staged.done.item() == 0.0
+        assert first_staged.reward_seq.sum().item() == pytest.approx(0.5)
+
+        for i in range(CHUNK_LENGTH - 1):  # second, partial, terminal chunk
+            _feed_frame(collector, i)
+        collector.flush_episode(episode_success=True)
+
+        assert len(buffer) == 2
+        assert buffer.buffer[0].reward_seq.sum().item() == pytest.approx(0.5)  # milestone chunk unaffected
+        assert buffer.buffer[1].reward_seq.sum().item() == pytest.approx(1.0)  # terminal chunk, no bonus left
+        assert collector.last_episode_reward == pytest.approx(1.5)
+
+    def test_milestone_and_terminal_additive_on_same_chunk(self):
+        """Milestone pressed in the same chunk that immediately closes the
+        episode: both rewards must land on that one chunk, summed."""
+        collector, buffer = self._make_collector_with_shaping(milestone_reward=0.5, time_decay=1.0)
+        for i in range(CHUNK_LENGTH - 1):
+            _feed_frame(collector, i)
+        collector.mark_milestone()
+        collector.flush_episode(episode_success=True)
+
+        assert len(buffer) == 1
+        transition = buffer.buffer[0]
+        assert transition.reward_seq.sum().item() == pytest.approx(1.5)
+        assert collector.last_episode_reward == pytest.approx(1.5)
+
+    def test_milestone_does_not_turn_terminal_failure_into_success(self):
+        collector, buffer = self._make_collector_with_shaping(
+            milestone_reward=0.5, time_decay=1.0
+        )
+        for i in range(CHUNK_LENGTH - 1):
+            _feed_frame(collector, i)
+        collector.mark_milestone()
+        collector.flush_episode(episode_success=False)
+
+        transition = buffer.buffer[0]
+        assert transition.reward_seq.sum().item() == pytest.approx(0.5)
+        assert transition.outcome.item() == 0.0
+        assert buffer.episode_outcomes() == {0: "failure"}
+
+    def test_flush_episode_is_idempotent(self):
+        collector, buffer = self._make_collector_with_shaping(time_decay=1.0)
+        for i in range(CHUNK_LENGTH - 1):
+            _feed_frame(collector, i)
+        collector.flush_episode(episode_success=False)
+        assert collector.flush_episode(episode_success=True) is None
+        assert len(buffer) == 1
+        assert buffer.buffer[0].outcome.item() == 0.0
+        assert collector.last_episode_reward == 0.0
+
+    def test_milestone_ignored_after_flush(self):
+        collector, buffer = self._make_collector_with_shaping(milestone_reward=0.5, time_decay=1.0)
+        for i in range(CHUNK_LENGTH - 1):
+            _feed_frame(collector, i)
+        collector.flush_episode(episode_success=True)
+        assert collector.mark_milestone() == 0.0
+        assert collector.last_episode_reward == pytest.approx(1.0)
+
+    def test_time_decay_shrinks_reward_by_chunks_closed_not_frames(self):
+        """The decay exponent must be chunks closed, not raw frame count --
+        a milestone pressed mid-chunk (no chunk closed yet) gets exponent 0
+        (undiscounted); one pressed after N chunks have already closed gets
+        exponent N regardless of how many frames those N chunks contained."""
+        collector, buffer = self._make_collector_with_shaping(
+            milestone_reward=1.0, terminal_reward=1.0, time_decay=0.9
+        )
+        for i in range(CHUNK_LENGTH - 1):  # partial chunk, nothing closed yet
+            _feed_frame(collector, i)
+        bonus_step0 = collector.mark_milestone()
+        assert bonus_step0 == pytest.approx(1.0)  # 0.9 ** 0 == 1.0, no discount yet
+
+        collector.flush_episode(episode_success=True)  # closes 1 chunk -> _chunks_closed=1
+        expected_terminal = 1.0 * 0.9 ** 1
+        assert collector.last_episode_reward == pytest.approx(bonus_step0 + expected_terminal)
+        assert expected_terminal < 1.0
+
+    def test_default_time_decay_shrinks_a_milestone_pressed_after_chunks_close(self):
+        collector, buffer = self._make_collector_with_shaping(milestone_reward=1.0)  # default time_decay
+        for i in range(CHUNK_LENGTH):  # 2 full chunks close before the milestone press
+            _feed_frame(collector, i)
+        for i in range(CHUNK_LENGTH):
+            _feed_frame(collector, i)
+        bonus = collector.mark_milestone()
+        assert bonus == pytest.approx(1.0 * 0.995 ** 2)
+        assert bonus < 1.0
+
+    def test_milestone_bonus_dropped_by_next_start_episode_if_never_flushed(self):
+        """A rerecorded attempt's milestone bonus must not leak into the retry."""
+        collector, buffer = self._make_collector_with_shaping(milestone_reward=0.5, time_decay=1.0)
+        _feed_frame(collector, 0)
+        collector.mark_milestone()
+        collector.start_episode(episode_id=1)  # rerecord, no flush_episode() call
+        for i in range(CHUNK_LENGTH - 1):
+            _feed_frame(collector, i)
+        collector.flush_episode(episode_success=True)
+        assert buffer.buffer[0].reward_seq.sum().item() == pytest.approx(1.0)  # no stray 0.5

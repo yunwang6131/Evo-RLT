@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pathlib
 import random
 import sys
@@ -30,7 +31,6 @@ from evo_rlt.adapters.lerobot.policies.configuration_rlt_token import RLTokenPol
 from evo_rlt.adapters.lerobot.policies.modeling_rlt_token import RLTokenPolicy
 from evo_rlt.adapters.lerobot.policies.processor_rlt_token import make_rlt_token_pre_post_processors
 from evo_rlt.adapters.lerobot.offline_dataset import build_overlap_frame_indices
-from evo_rlt.core.rewards import build_reward_seq
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +49,47 @@ def parse_args() -> argparse.Namespace:
         choices=("success", "failure", "error"),
         default="success",
         help="Outcome used when the VLA demonstration dataset has no "
-        "episode_success metadata. VLA SFT demonstrations are normally successful.",
+        "episode_success metadata. VLA SFT demonstrations are normally successful. "
+        "Only consulted for episodes not covered by --critical-segments-path.",
+    )
+    p.add_argument(
+        "--critical-segments-path", default=None,
+        help="Path to a critical_segments.json produced by "
+        "diagnostics/critical_segment_labeler_cv.py (see that file's docstring for "
+        "the schema). Defaults to <demo-dataset-root>/meta/critical_segments.json "
+        "if that file exists. When present, every episode is built from ONLY its "
+        "labeled [start, end] critical-phase span (with that span's own "
+        "success/failure as episode_success) instead of the whole recorded "
+        "episode -- matching what the online RL critical-phase reward actually "
+        "sees (RLTOnlineCollector.flush_episode() rewards only the critical-phase "
+        "attempt, not full-episode footage). Episodes with no entry, "
+        "no_critical=true, or a null segment are skipped entirely, same as an "
+        "unlabeled/discarded online attempt. Pass --no-critical-segments to opt "
+        "out and fall back to whole-episode --default-episode-success semantics "
+        "even if the file exists.",
+    )
+    p.add_argument(
+        "--no-critical-segments", action="store_true",
+        help="Ignore meta/critical_segments.json even if present; use whole-episode "
+        "episode_success semantics (pre-critical-segment-crop behavior).",
+    )
+    p.add_argument(
+        "--milestone-reward", type=float, default=0.3,
+        help="One-time mid-phase shaping bonus applied to episodes whose critical-segment "
+        "label has a milestone_frame, matching RLTOnlineCollector.mark_milestone(). Must "
+        "equal the online run's --online_rl.milestone_reward, or offline and online "
+        "transitions end up on different reward scales in the same replay buffer.",
+    )
+    p.add_argument(
+        "--terminal-reward", type=float, default=1.0,
+        help="Reward on a successful critical-phase segment's terminal chunk (failure is "
+        "always 0). Must equal --online_rl.terminal_reward.",
+    )
+    p.add_argument(
+        "--time-decay", type=float, default=0.995,
+        help="Both rewards above are multiplied by time_decay ** (chunks closed so far in "
+        "the segment), matching RLTOnlineCollector's chunk-resolution decay. Must equal "
+        "--online_rl.time_decay. 1.0 reproduces the old fixed-reward-on-success behavior.",
     )
     p.add_argument("--chunk-length", type=int, default=10)
     p.add_argument(
@@ -111,6 +151,125 @@ def _get_episode_success(
     raise ValueError(f"Unrecognized episode_success value for episode {episode_idx}: {raw!r}")
 
 
+def _load_critical_segments(path: pathlib.Path | None) -> dict:
+    """Load a critical_segments.json (schema: see
+    diagnostics/critical_segment_labeler_cv.py's module docstring), keyed by
+    str(episode_index) -> {"segment": [start, end, "success"|"failure"] | None,
+    "no_critical": bool, "milestone_frame": int | None, ...}. Returns {} if
+    `path` is None or doesn't exist, which callers treat as "no episode is
+    critical-phase-labeled"."""
+    if path is None or not path.is_file():
+        return {}
+    return json.loads(path.read_text())
+
+
+def _episode_critical_bounds(
+    labels: dict,
+    ep_id: int,
+    ep_from: int,
+) -> tuple[int, int, bool, int | None] | None:
+    """Resolve one episode's critical-phase span from `labels` (as loaded by
+    `_load_critical_segments`) into absolute dataset-row bounds, matching the
+    online path's semantics: RLTOnlineCollector rewards only the critical-phase
+    attempt (see RLTOnlineCollector.flush_episode()), never full-episode
+    footage. Returns None if this episode has no usable label (missing entry,
+    no_critical=true, or a null segment) -- callers must skip such episodes
+    entirely, same as an unlabeled/discarded online attempt is never flushed
+    into the replay buffer.
+
+    `segment`'s [start, end] are LOCAL frame indices relative to the episode
+    start (per the labeler's docstring) with `end` being the last critical
+    frame (inclusive) -- converted here to the [ep_from+start, ep_from+end+1)
+    absolute half-open range build_overlap_frame_indices()/episode_last_frame
+    expect, matching dataset_from_index/dataset_to_index's own convention.
+
+    The optional `milestone_frame` (same LOCAL-frame convention as `segment`)
+    is resolved to an absolute frame index too, mirroring
+    RLTOnlineCollector.mark_milestone(): a one-time mid-phase shaping bonus
+    that can fire regardless of the segment's final success/failure outcome.
+    Returns None in the 4th slot when the label has no milestone_frame (the
+    demonstration never reached it, or the label predates milestone support).
+    """
+    entry = labels.get(str(ep_id))
+    if entry is None or entry.get("no_critical") or not entry.get("segment"):
+        return None
+    local_start, local_end, outcome = entry["segment"]
+    if outcome not in ("success", "failure"):
+        raise ValueError(f"Episode {ep_id}: unrecognized segment outcome {outcome!r}")
+    local_milestone = entry.get("milestone_frame")
+    milestone_frame = ep_from + int(local_milestone) if local_milestone is not None else None
+    return ep_from + int(local_start), ep_from + int(local_end) + 1, outcome == "success", milestone_frame
+
+
+def _resolve_milestone_chunk(
+    milestone_frame: int | None,
+    critical_start_frame: int,
+    episode_last_frame: int,
+    chunk_length: int,
+    frame_indices: list[int],
+    ep_id: int,
+) -> tuple[int | None, int | None]:
+    """Map an absolute milestone_frame onto (milestone_actual_start_frame,
+    milestone_chunks_closed): which encoded transition's reward_seq the
+    one-time shaping bonus lands on, and the chunks-closed exponent to decay
+    it by. Mirrors RLTOnlineCollector.mark_milestone()/_chunks_closed: the
+    bonus decays as if the milestone landed at its chunk's start (chunks
+    closed strictly BEFORE it), but is deposited at that chunk's own closing
+    transition -- "applied by whichever _emit_transition() closes next".
+
+    Returns (None, None) if there's no milestone, or no usable anchor exists
+    to hang the bonus on (segment too short to produce any transition).
+    """
+    if milestone_frame is None:
+        return None, None
+    if not (critical_start_frame <= milestone_frame <= episode_last_frame):
+        raise ValueError(
+            f"Episode {ep_id}: milestone_frame {milestone_frame} outside its own "
+            f"critical segment [{critical_start_frame}, {episode_last_frame}]"
+        )
+    C = chunk_length
+    milestone_chunks_closed = (milestone_frame - critical_start_frame) // C
+    milestone_target_start_frame = critical_start_frame + milestone_chunks_closed * C
+    usable_starts = [f for f in frame_indices if f + C <= episode_last_frame]
+    if not usable_starts:
+        _log(f"  ep{ep_id}: no usable anchor to place the milestone bonus on -- skipping it")
+        return None, None
+    if milestone_target_start_frame in usable_starts:
+        return milestone_target_start_frame, milestone_chunks_closed
+    nearest = min(usable_starts, key=lambda f: abs(f - milestone_target_start_frame))
+    _log(
+        f"  ep{ep_id}: milestone target start_frame {milestone_target_start_frame} has no "
+        "exact anchor (chunk_length not a multiple of frame_stride?) -- using nearest "
+        f"anchor {nearest} instead"
+    )
+    return nearest, milestone_chunks_closed
+
+
+def _compute_chunk_reward(
+    start_frame: int,
+    is_last: bool,
+    episode_success: bool,
+    terminal_chunks_closed: int,
+    milestone_actual_start_frame: int | None,
+    milestone_chunks_closed: int | None,
+    chunk_length: int,
+    milestone_reward: float,
+    terminal_reward: float,
+    time_decay: float,
+) -> torch.Tensor:
+    """Build one chunk's (C,) reward_seq, matching RLTOnlineCollector's
+    combined milestone + terminal reward: both are undiscounted magnitudes
+    scaled by time_decay ** (chunks closed), and both are added onto the same
+    last-timestep slot when they land on the same chunk (e.g. the milestone
+    is reached in the segment's final chunk)."""
+    reward_seq = torch.zeros(chunk_length)
+    if is_last and episode_success:
+        reward_seq[chunk_length - 1] += terminal_reward * (time_decay ** terminal_chunks_closed)
+    if milestone_actual_start_frame is not None and start_frame == milestone_actual_start_frame:
+        reward_seq[chunk_length - 1] += milestone_reward * (time_decay ** milestone_chunks_closed)
+    return reward_seq
+
+
 def _compose_exec_chunk(
     demonstrated_chunk: Tensor,
     ref_chunk: Tensor,
@@ -152,6 +311,11 @@ def _encode_episode(
     episode_last_frame: int,
     episode_success: bool,
     rl_action_arms: str,
+    critical_start_frame: int,
+    milestone_frame: int | None,
+    milestone_reward: float,
+    terminal_reward: float,
+    time_decay: float,
 ) -> list[dict[str, Tensor]]:
     """Encode anchors and build x_t -> x_{t+C} chunk transitions."""
     out: list[dict[str, Tensor]] = []
@@ -213,6 +377,14 @@ def _encode_episode(
     frame_to_encoded_idx = {
         frame_idx: encoded_idx for encoded_idx, frame_idx in enumerate(frame_indices)
     }
+    # Matches RLTOnlineCollector._chunks_closed at flush_episode() time: every
+    # C frames of the critical-phase attempt closes one chunk, and the final
+    # (possibly partial) chunk still counts as closed when the attempt ends.
+    critical_length = episode_last_frame + 1 - critical_start_frame
+    terminal_chunks_closed = math.ceil(critical_length / C) if critical_length > 0 else 0
+    milestone_actual_start_frame, milestone_chunks_closed = _resolve_milestone_chunk(
+        milestone_frame, critical_start_frame, episode_last_frame, C, frame_indices, ep_id,
+    )
     for i, start_frame in enumerate(frame_indices):
         next_frame = start_frame + C
         if next_frame > episode_last_frame:
@@ -224,10 +396,17 @@ def _encode_episode(
                 f"{start_frame} -> {next_frame}"
             )
         is_last = next_frame == episode_last_frame
-        reward_seq = build_reward_seq(
-            chunk_length=C,
-            is_terminal_chunk=is_last,
+        reward_seq = _compute_chunk_reward(
+            start_frame=start_frame,
+            is_last=is_last,
             episode_success=episode_success,
+            terminal_chunks_closed=terminal_chunks_closed,
+            milestone_actual_start_frame=milestone_actual_start_frame,
+            milestone_chunks_closed=milestone_chunks_closed,
+            chunk_length=C,
+            milestone_reward=milestone_reward,
+            terminal_reward=terminal_reward,
+            time_decay=time_decay,
         )
         out.append(
             {
@@ -243,6 +422,7 @@ def _encode_episode(
                 "source": torch.tensor(0, dtype=torch.int64),
                 "episode_id": torch.tensor(ep_id, dtype=torch.int64),
                 "is_critical": torch.tensor(1.0),
+                "outcome": torch.tensor(float(episode_success)),
             }
         )
     return out
@@ -265,6 +445,30 @@ def main() -> None:
 
     out_dir = pathlib.Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    critical_segments_path = None
+    if not args.no_critical_segments:
+        critical_segments_path = (
+            pathlib.Path(args.critical_segments_path) if args.critical_segments_path
+            else pathlib.Path(args.demo_dataset_root) / "meta" / "critical_segments.json"
+        )
+    critical_segments = _load_critical_segments(critical_segments_path)
+    if critical_segments:
+        _log(
+            f"using critical-phase labels from {critical_segments_path} "
+            f"({len(critical_segments)} labeled episodes) -- each episode is cropped to "
+            "ONLY its labeled critical span, matching the online RL reward's critical-phase "
+            "scope. Episodes with no label / no_critical=true / null segment are skipped."
+        )
+    else:
+        _log(
+            f"no critical-phase labels found at {critical_segments_path} "
+            "(or --no-critical-segments was passed) -- falling back to whole-episode "
+            "episode_success semantics. This does NOT match what the online RL critical "
+            "phase actually rewards; only use this for datasets that were never split into "
+            "prefix/critical-phase segments."
+        )
+
     (out_dir / "cache_metadata.json").write_text(
         json.dumps(
             {
@@ -275,6 +479,19 @@ def main() -> None:
                 "task_instruction": args.task_instruction,
                 "vla_pretrained_path": args.vla_pretrained_path,
                 "rl_token_policy_path": args.rl_token_policy_path,
+                "critical_segments_path": (
+                    str(critical_segments_path) if critical_segments else None
+                ),
+                "cropped_to_critical_segment": bool(critical_segments),
+                "milestone_reward": args.milestone_reward,
+                "terminal_reward": args.terminal_reward,
+                "time_decay": args.time_decay,
+                # Bump if the reward formula/placement semantics ever change
+                # again -- online_trainer.py's _load_offline_buffer() uses
+                # this to refuse loading a cache whose reward scale can't be
+                # verified against the current online_rl milestone/decay
+                # config (see its reward_schema_version check).
+                "reward_schema_version": 2,
             },
             indent=2,
         )
@@ -329,22 +546,37 @@ def main() -> None:
         t_start = time.time()
         for split_name, eps in (("train", train_eps), ("val", val_eps)):
             all_tx: list[dict[str, Tensor]] = []
+            n_skipped = 0
             for k, ep_id in enumerate(eps):
                 ep_meta = dataset.meta.episodes
                 ep_from = int(ep_meta["dataset_from_index"][ep_id])
                 ep_to = int(ep_meta["dataset_to_index"][ep_id])
+
+                if critical_segments:
+                    bounds = _episode_critical_bounds(critical_segments, ep_id, ep_from)
+                    if bounds is None:
+                        n_skipped += 1
+                        _log(f"  [{split_name}] ep {k+1}/{len(eps)} id={ep_id} skipped (no critical-phase label)")
+                        continue
+                    crit_from, crit_to, episode_success, milestone_frame = bounds
+                else:
+                    crit_from, crit_to = ep_from, ep_to
+                    episode_success = _get_episode_success(
+                        dataset,
+                        ep_id,
+                        default_outcome=args.default_episode_success,
+                    )
+                    # No critical-segment label in this fallback mode, so
+                    # there's no milestone_frame to resolve either.
+                    milestone_frame = None
+
                 frame_indices = build_overlap_frame_indices(
-                    episode_start=ep_from,
-                    episode_stop=ep_to,
+                    episode_start=crit_from,
+                    episode_stop=crit_to,
                     chunk_length=args.chunk_length,
                     stride=args.frame_stride,
                 )
-                episode_success = _get_episode_success(
-                    dataset,
-                    ep_id,
-                    default_outcome=args.default_episode_success,
-                )
-                _log(f"  [{split_name}] ep {k+1}/{len(eps)} id={ep_id} frames={ep_to-ep_from} chunks={len(frame_indices)} success={episode_success} (total transitions={len(all_tx)}, wall={time.time()-t_start:.0f}s)")
+                _log(f"  [{split_name}] ep {k+1}/{len(eps)} id={ep_id} frames={crit_to-crit_from} chunks={len(frame_indices)} success={episode_success} (total transitions={len(all_tx)}, wall={time.time()-t_start:.0f}s)")
                 ep_tx = _encode_episode(
                     pi05=pi05,
                     rl_token=rl_token,
@@ -361,13 +593,20 @@ def main() -> None:
                     empty_cache_every=args.empty_cache_every,
                     task_str=args.task_instruction,
                     ep_id=ep_id,
-                    episode_last_frame=ep_to - 1,
+                    episode_last_frame=crit_to - 1,
                     episode_success=episode_success,
                     rl_action_arms=args.rl_action_arms,
+                    critical_start_frame=crit_from,
+                    milestone_frame=milestone_frame,
+                    milestone_reward=args.milestone_reward,
+                    terminal_reward=args.terminal_reward,
+                    time_decay=args.time_decay,
                 )
                 all_tx.extend(ep_tx)
                 if (k + 1) % 5 == 0 or (k + 1) == len(eps):
                     _save_partial(out_dir, split_name, all_tx, f"{split_name} ep {k+1}/{len(eps)}")
+            if critical_segments:
+                _log(f"  [{split_name}] done: {len(eps) - n_skipped} episodes used, {n_skipped} skipped (unlabeled/no_critical), {len(all_tx)} transitions")
     finally:
         capture.detach()
 

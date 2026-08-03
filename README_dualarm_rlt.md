@@ -149,6 +149,11 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
   --job_name=bimanual_rl_token
 
 # 构建 transition cache
+# 如果 <demo-dataset-root>/meta/critical_segments.json 存在（用
+# diagnostics/critical_segment_labeler_cv.py 标过），默认会自动读取并只用每条
+# episode 里标出来的 critical-phase 片段（含该片段自己的 success/failure），跟在线
+# RL 的 critical phase 语义保持一致；没有该 label 的 episode 会被跳过。不想用的话传
+# --no-critical-segments 回退成整集 episode_success 的老行为。
 evo-rlt-build-transition-cache-v2 \
   --demo-dataset-repo-id local/merged_screw_v1 \
   --demo-dataset-root data/bimanual/merged_screw_v1 \

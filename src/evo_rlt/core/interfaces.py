@@ -60,3 +60,7 @@ class ChunkTransition:
     source: torch.Tensor = field(default_factory=lambda: torch.tensor(0))
     episode_id: torch.Tensor = field(default_factory=lambda: torch.tensor(-1))
     is_critical: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))
+    # Resolved whole-episode label: 1=success, 0=failure, -1=unknown.
+    # Keep this separate from reward_seq: shaping rewards (e.g. milestones)
+    # may be positive even when the episode ultimately fails.
+    outcome: torch.Tensor = field(default_factory=lambda: torch.tensor(-1.0))

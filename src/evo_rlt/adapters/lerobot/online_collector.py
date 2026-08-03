@@ -19,10 +19,27 @@ class RLTOnlineCollector:
         replay_buffer: ReplayBuffer,
         chunk_length: int,
         action_dim: int,
+        milestone_reward: float = 0.3,
+        terminal_reward: float = 1.0,
+        time_decay: float = 0.995,
     ):
         self._buffer = replay_buffer
         self._C = chunk_length
         self._action_dim = action_dim
+        # milestone_reward/terminal_reward are the *undiscounted* magnitudes;
+        # time_decay=1.0 would reproduce the old fixed-1.0-at-the-end behavior
+        # exactly, but the default here is < 1.0 (0.995 per CLOSED CHUNK, not
+        # per frame -- a typical critical-phase attempt is ~50-300 chunks, so
+        # 0.995 gives a real 0.6-0.8x range there instead of vanishing to ~0
+        # the way a per-frame exponent over the same wall-clock span would).
+        # See mark_milestone()/flush_episode() for how time_decay **
+        # _chunks_closed scales the two rewards down the longer the attempt
+        # takes, so faster attempts score higher without touching gamma
+        # (gamma stays tuned for long-horizon TD bootstrap, not for
+        # incentivizing speed -- see OnlineRLConfig.time_decay).
+        self._milestone_reward = milestone_reward
+        self._terminal_reward = terminal_reward
+        self._time_decay = time_decay
         self._frame_actions: list[torch.Tensor] = []
         self._frame_sources: list[float] = []
         self._chunk_state: torch.Tensor | None = None
@@ -44,6 +61,25 @@ class RLTOnlineCollector:
         # so the RL reward reflects only what the actor actually controlled,
         # not whatever happens afterward. Reset by the next start_episode().
         self._flushed: bool = False
+        # Chunks fully closed so far in this critical-phase attempt (does NOT
+        # count the chunk currently accumulating in _frame_actions) -- the
+        # clock mark_milestone()/flush_episode() decay against. Chunk
+        # resolution (not per-frame): a milestone landing mid-chunk decays as
+        # if it landed at that chunk's start, same ~0.33s@30fps/C=10
+        # resolution mark_milestone()'s docstring already accepts for which
+        # chunk the bonus lands on.
+        self._chunks_closed: int = 0
+        # A milestone fires at most once per attempt (see mark_milestone()).
+        self._milestone_given: bool = False
+        # Reward earned but not yet written into a chunk's reward_seq --
+        # applied by the next _emit_transition() (routine or terminal),
+        # whichever closes first. Lets mark_milestone() fire between chunk
+        # boundaries without forcing an early, short chunk.
+        self._pending_bonus: float = 0.0
+        # Total reward (milestone + terminal) actually awarded this attempt,
+        # for callers that want to log/inspect it (e.g. wandb) without
+        # re-deriving it from the replay buffer.
+        self.last_episode_reward: float = 0.0
 
     def start_episode(self, episode_id: int) -> None:
         self._episode_id = episode_id
@@ -55,6 +91,10 @@ class RLTOnlineCollector:
         self._prev_transition = None
         self._episode_staging = []
         self._flushed = False
+        self._chunks_closed = 0
+        self._milestone_given = False
+        self._pending_bonus = 0.0
+        self.last_episode_reward = 0.0
 
     def on_frame(
         self,
@@ -93,36 +133,81 @@ class RLTOnlineCollector:
             return self._emit_transition(done=False)
         return None
 
+    def mark_milestone(self) -> float:
+        """Award the one-time mid-phase shaping bonus (OnlineRLConfig.milestone_reward,
+        time-decayed by chunks closed since start_episode() -- see class
+        docstring). Fires at most once per critical-phase attempt: a second
+        call this attempt, or any call after flush_episode(), is a no-op
+        (returns 0.0). The bonus isn't written into reward_seq immediately --
+        it's held in _pending_bonus and applied by whichever _emit_transition()
+        closes next (a routine mid-phase chunk or the terminal one from
+        flush_episode()), so pressing the milestone key mid-chunk doesn't
+        force an early, short chunk boundary. Returns the (possibly
+        time-decayed) bonus actually awarded, for the caller to log.
+        """
+        if self._flushed or self._milestone_given:
+            return 0.0
+        self._milestone_given = True
+        bonus = self._milestone_reward * (self._time_decay ** self._chunks_closed)
+        self._pending_bonus += bonus
+        self.last_episode_reward += bonus
+        return bonus
+
     def flush_episode(self, episode_success: bool) -> ChunkTransition | None:
         """Finalize the critical-phase attempt, marking the terminal
-        transition done=1 and writing the sparse binary reward (r=1 iff
-        success, else 0) onto its last valid timestep, matching the paper's
-        terminal-reward-only setup. Commits every transition staged so far to
-        the global replay buffer, then ignores any further on_frame() calls
-        until the next start_episode() -- call this at the moment the
-        critical phase itself resolves (success/failure), not necessarily at
-        whole-episode end: the recorded episode may continue afterward (e.g.
-        VLA autonomously finishing a subsequent step), but that tail is
-        dataset-only and must not leak into the RL reward. For a
+        transition done=1 and writing the sparse binary reward (terminal_reward
+        iff success, else 0, both time-decayed by chunks closed by the time
+        the attempt ends -- see class docstring) onto its last valid
+        timestep, matching the paper's terminal-reward-only setup
+        (time_decay=1.0 reproduces that exactly). Commits every transition
+        staged so far to the global replay buffer, then ignores any further
+        on_frame() calls until the next start_episode() -- call this at the
+        moment the critical phase itself resolves (success/failure), not
+        necessarily at whole-episode end: the recorded episode may continue
+        afterward (e.g. VLA autonomously finishing a subsequent step), but
+        that tail is dataset-only and must not leak into the RL reward. For a
         rerecorded/discarded/never-labeled attempt, just don't call this and
         let the next start_episode() drop the staged data instead.
         """
-        terminal_reward = 1.0 if episode_success else 0.0
-        result: ChunkTransition | None = None
+        # A duplicate UI/event callback must not relabel or reward an episode
+        # that has already been committed.
+        if self._flushed:
+            return None
+
+        target: ChunkTransition | None = None
         if self._frame_actions:
-            result = self._emit_transition(done=True, terminal_reward=terminal_reward)
+            # Closes the final (possibly partial) chunk -- _emit_transition()
+            # increments _chunks_closed for it before we compute the decay
+            # exponent below, so the terminal reward decays against a chunk
+            # count that includes this very last chunk.
+            target = self._emit_transition(done=True)
         elif self._prev_transition is not None:
-            # Episode length was exact multiple of C — mark last staged chunk as terminal.
+            # Episode length was exact multiple of C — the last chunk already
+            # closed (and already incremented _chunks_closed) during on_frame();
+            # just mark it terminal instead of emitting a new one.
             self._prev_transition.done = torch.tensor(1.0)
-            actual = int(self._prev_transition.actual_steps.item())
-            self._prev_transition.reward_seq[actual - 1] = terminal_reward
+            target = self._prev_transition
+
+        terminal_reward = (
+            self._terminal_reward * (self._time_decay ** self._chunks_closed) if episode_success else 0.0
+        )
+        self.last_episode_reward += terminal_reward
+        if target is not None:
+            actual = int(target.actual_steps.item())
+            if self._pending_bonus != 0.0:
+                target.reward_seq[actual - 1] += self._pending_bonus
+                self._pending_bonus = 0.0
+            target.reward_seq[actual - 1] += terminal_reward
+
+        explicit_outcome = torch.tensor(float(episode_success))
         for transition in self._episode_staging:
+            transition.outcome = explicit_outcome.clone()
             self._buffer.add(transition)
         self._episode_staging = []
         self._flushed = True
-        return result
+        return target
 
-    def _emit_transition(self, done: bool, terminal_reward: float = 0.0) -> ChunkTransition | None:
+    def _emit_transition(self, done: bool) -> ChunkTransition | None:
         if self._chunk_state is None or self._chunk_ref is None:
             self._frame_actions.clear()
             self._frame_sources.clear()
@@ -144,8 +229,13 @@ class RLTOnlineCollector:
 
         state = self._chunk_state.cpu()
         reward_seq = torch.zeros(self._C)
-        if done and actual > 0:
-            reward_seq[actual - 1] = terminal_reward
+        if actual > 0 and self._pending_bonus != 0.0:
+            # flush_episode() applies the terminal reward itself, after this
+            # call returns (see its _chunks_closed-based decay exponent
+            # computation) -- this only needs to flush any milestone bonus
+            # earned since the last chunk closed.
+            reward_seq[actual - 1] += self._pending_bonus
+            self._pending_bonus = 0.0
         transition = ChunkTransition(
             state_vec=state,
             exec_chunk=exec_chunk,
@@ -167,6 +257,7 @@ class RLTOnlineCollector:
 
         self._episode_staging.append(transition)
         self._prev_transition = transition
+        self._chunks_closed += 1
 
         self._frame_actions.clear()
         self._frame_sources.clear()

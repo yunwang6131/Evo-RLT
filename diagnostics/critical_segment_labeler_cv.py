@@ -18,19 +18,29 @@ Usage:
 
 Output: <dataset-root>/meta/critical_segments.json
     {"<episode_index>": {"segment": [start_frame, end_frame, "success"|"failure"] | null,
-                          "no_critical": bool, "note": str, "updated_at": str}, ...}
+                          "no_critical": bool, "milestone_frame": int | null,
+                          "note": str, "updated_at": str}, ...}
 (frame indices are relative to the start of the episode; one critical segment
 per episode, same convention as the live `--only-critical` recorder: `r`
-toggles entering/exiting critical phase, `u` exits as a failure instead)
+toggles entering/exiting critical phase, `u` exits as a failure instead.
+`milestone_frame` is optional, mirroring the live recorder's separate
+milestone_key: a single frame marking a one-time mid-phase shaping bonus
+-- e.g. "pin pulled out" ahead of a separate final "inserted" judgment --
+that build_transition_cache_v2 rewards regardless of whether the segment
+itself ends success or failure. null means the demonstration never reached
+it, same as never pressing the milestone key live.)
 
 Keys:
     r               not in critical: mark critical-phase start at current frame
                     in critical: close it here and save as SUCCESS
     u               in critical: close it here and save as FAILURE (no-op otherwise)
+    m               mark the milestone at the current frame (requires a
+                    segment already started or closed this episode; press
+                    again to move it). M (shift+m) clears it.
     space           play / pause
     a / d           step 1 frame back / forward
     A / D           step 10 frames back / forward (shift+a, shift+d)
-    z               reset (clear the marked/in-progress segment for this episode)
+    z               reset (clear the marked/in-progress segment and milestone for this episode)
     x               toggle "no critical segment in this episode"
     1 / 2 / 3       playback speed 0.25x / 0.5x / 1x
     enter           save this episode's label and go to the next episode
@@ -167,11 +177,14 @@ def compose_video_row(frames: dict, camera_keys: list[str], cam_w: int = 480) ->
     return np.hstack(imgs)
 
 
-LEGEND_1 = "r: enter critical / exit=OK    u: exit=FAIL    space play/pause"
+LEGEND_1 = "r: enter critical / exit=OK    u: exit=FAIL    m: mark milestone (M: clear)    space play/pause"
 LEGEND_2 = "a/d -1/+1f  A/D -10/+10f  z reset  x no-critical  1/2/3 speed  ENTER save+next  b prev-ep  n next-ep  q quit"
 
 
-def render(episodes, idx, player, frames, segment, no_critical, crit_start, playing, rate, labeled) -> np.ndarray:
+def render(
+    episodes, idx, player, frames, segment, no_critical, crit_start, milestone_frame,
+    playing, rate, labeled,
+) -> np.ndarray:
     ep = episodes[idx]
     video_row = compose_video_row(frames, player.camera_keys)
     W = video_row.shape[1]
@@ -207,6 +220,9 @@ def render(episodes, idx, player, frames, segment, no_critical, crit_start, play
     if crit_start is not None:
         s, e = sorted((crit_start, player.local_frame))
         cv2.rectangle(canvas, (xf(s), tl_y0), (xf(e), tl_y1), (255, 180, 60), 2)
+    if milestone_frame is not None:
+        mx = xf(milestone_frame)
+        cv2.line(canvas, (mx, tl_y0), (mx, tl_y1), (60, 210, 230), 2)
     ph_x = xf(player.local_frame)
     cv2.line(canvas, (ph_x, tl_y0), (ph_x, tl_y1), (60, 60, 255), 2)
 
@@ -220,7 +236,8 @@ def render(episodes, idx, player, frames, segment, no_critical, crit_start, play
         seg_text = f"critical start marked at frame {crit_start}, press r (=OK) or u (=FAIL) to close"
     else:
         seg_text = "not marked yet -- press r at the critical-phase start frame"
-    cv2.putText(canvas, ("segment: " + seg_text)[:170], (8, fy), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 210, 220), 1, cv2.LINE_AA)
+    milestone_text = f"  |  milestone: {milestone_frame}" if milestone_frame is not None else "  |  milestone: (none, press m)"
+    cv2.putText(canvas, ("segment: " + seg_text + milestone_text)[:200], (8, fy), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 210, 220), 1, cv2.LINE_AA)
     cv2.putText(canvas, LEGEND_1, (8, fy + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 160, 170), 1, cv2.LINE_AA)
     cv2.putText(canvas, LEGEND_2, (8, fy + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (150, 160, 170), 1, cv2.LINE_AA)
     return canvas
@@ -259,7 +276,10 @@ def main() -> None:
                 idx = i
                 break
 
-    state = {"segment": None, "no_critical": False, "crit_start": None, "playing": False, "rate": 1.0}
+    state = {
+        "segment": None, "no_critical": False, "crit_start": None,
+        "milestone_frame": None, "playing": False, "rate": 1.0,
+    }
     player = None
 
     def load_episode(new_idx: int) -> None:
@@ -272,6 +292,9 @@ def main() -> None:
         state["segment"] = list(existing["segment"]) if existing and existing.get("segment") else None
         state["no_critical"] = bool(existing["no_critical"]) if existing else False
         state["crit_start"] = None
+        state["milestone_frame"] = (
+            existing.get("milestone_frame") if existing and existing.get("milestone_frame") is not None else None
+        )
         state["playing"] = False
 
     load_episode(idx)
@@ -282,11 +305,15 @@ def main() -> None:
         labels[str(ep["episode_index"])] = {
             "segment": state["segment"],
             "no_critical": state["no_critical"],
+            "milestone_frame": state["milestone_frame"],
             "note": "",
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         save_labels(labels_path, labels)
-        print(f"saved episode {ep['episode_index']}: segment={state['segment']} no_critical={state['no_critical']}")
+        print(
+            f"saved episode {ep['episode_index']}: segment={state['segment']} "
+            f"no_critical={state['no_critical']} milestone_frame={state['milestone_frame']}"
+        )
 
     # The evo-rlt env's opencv build is headless (no highgui window backend:
     # `cv2.getBuildInformation()` reports "GUI: NONE"), so cv2.imshow/waitKey
@@ -305,7 +332,7 @@ def main() -> None:
         labeled = str(episodes[idx]["episode_index"]) in labels
         canvas = render(
             episodes, idx, player, frames, state["segment"], state["no_critical"],
-            state["crit_start"], state["playing"], state["rate"], labeled,
+            state["crit_start"], state["milestone_frame"], state["playing"], state["rate"], labeled,
         )
         rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
         photo_holder["img"] = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -335,10 +362,12 @@ def main() -> None:
             if state["crit_start"] is None:
                 # (re)start: any previously finalized segment is discarded,
                 # matching the live recorder where re-entering critical
-                # phase means you're redoing it.
+                # phase means you're redoing it. Its milestone (if any)
+                # belonged to that discarded segment, so it goes too.
                 state["segment"] = None
                 state["crit_start"] = player.local_frame
                 state["no_critical"] = False
+                state["milestone_frame"] = None
             else:
                 s, e = sorted((state["crit_start"], player.local_frame))
                 state["segment"] = [s, e, "success"]
@@ -348,14 +377,25 @@ def main() -> None:
                 s, e = sorted((state["crit_start"], player.local_frame))
                 state["segment"] = [s, e, "failure"]
                 state["crit_start"] = None
+        elif key == "m":
+            # Mark/move the milestone to the current frame -- meaningful once
+            # a segment has been started (in progress) or closed this
+            # episode, mirroring the live recorder where milestone_key only
+            # does anything mid-critical-phase attempt.
+            if state["crit_start"] is not None or state["segment"] is not None:
+                state["milestone_frame"] = player.local_frame
+        elif key == "M":
+            state["milestone_frame"] = None
         elif key == "z":
             state["segment"] = None
             state["crit_start"] = None
+            state["milestone_frame"] = None
         elif key == "x":
             state["no_critical"] = not state["no_critical"]
             if state["no_critical"]:
                 state["segment"] = None
                 state["crit_start"] = None
+                state["milestone_frame"] = None
         elif key in ("1", "2", "3"):
             state["rate"] = {"1": 0.25, "2": 0.5, "3": 1.0}[key]
         elif keysym in ("Return", "KP_Enter"):

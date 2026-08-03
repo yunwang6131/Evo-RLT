@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import time
@@ -47,11 +48,15 @@ class OnlineRLTrainer:
         self.offline_buffer = self._load_offline_buffer(
             online_rl_cfg.offline_cache_path,
             policy_cfg=policy_cfg,
+            online_rl_cfg=online_rl_cfg,
         )
         self.collector = RLTOnlineCollector(
             replay_buffer=self.replay_buffer,
             chunk_length=policy_cfg.chunk_length,
             action_dim=policy_cfg.action_dim,
+            milestone_reward=online_rl_cfg.milestone_reward,
+            terminal_reward=online_rl_cfg.terminal_reward,
+            time_decay=online_rl_cfg.time_decay,
         )
         # Separate optimizers (not just param groups on one Adam): actor lr
         # << critic lr since the critic should adapt quickly while the actor
@@ -91,12 +96,64 @@ class OnlineRLTrainer:
         candidate = Path(path).expanduser()
         return str(candidate.resolve()) if candidate.exists() else path
 
+    @staticmethod
+    def _check_reward_schema(metadata: dict, cache_path: Path, online_rl_cfg: Any) -> None:
+        """Refuse to silently mix offline and online transitions that were
+        built under different reward scales.
+
+        RLTOnlineCollector rewards a critical-phase attempt with
+        milestone_reward/terminal_reward * time_decay ** (chunks closed) --
+        see OnlineRLConfig in backend.py. build_transition_cache_v2 mirrors
+        that formula (reward_schema_version>=2 caches), so the two only
+        agree if built/run with matching milestone_reward/terminal_reward/
+        time_decay values. Skipped entirely if `online_rl_cfg` is None (no
+        online-side config to compare against, e.g. a bare cache-inspection
+        call) or if online_rl_cfg has no milestone/decay attributes.
+        """
+        if online_rl_cfg is None:
+            return
+        milestone_reward = getattr(online_rl_cfg, "milestone_reward", None)
+        time_decay = getattr(online_rl_cfg, "time_decay", None)
+        if milestone_reward is None and time_decay is None:
+            return
+        online_uses_shaping = (milestone_reward or 0.0) != 0.0 or (time_decay or 1.0) != 1.0
+        if metadata.get("reward_schema_version") is None:
+            if online_uses_shaping:
+                raise ValueError(
+                    f"Offline cache {cache_path} predates milestone/time-decay reward "
+                    "support (no reward_schema_version in cache_metadata.json), but this "
+                    f"online run uses milestone_reward={milestone_reward} "
+                    f"time_decay={time_decay} -- rebuild the cache with the current "
+                    "evo-rlt-build-transition-cache-v2 (--milestone-reward/--terminal-reward/"
+                    "--time-decay matching these online_rl flags), or set "
+                    "online_rl.milestone_reward=0 and online_rl.time_decay=1.0 to match "
+                    "the cache's old fixed-reward-on-success behavior."
+                )
+            return
+        for metadata_key, cfg_attr in (
+            ("milestone_reward", "milestone_reward"),
+            ("terminal_reward", "terminal_reward"),
+            ("time_decay", "time_decay"),
+        ):
+            cached_value = metadata.get(metadata_key)
+            current_value = getattr(online_rl_cfg, cfg_attr, None)
+            if cached_value is None or current_value is None:
+                continue
+            if not math.isclose(cached_value, current_value, rel_tol=1e-6, abs_tol=1e-9):
+                raise ValueError(
+                    f"Offline cache {cache_path} {metadata_key}={cached_value!r} != "
+                    f"online_rl.{cfg_attr}={current_value!r} -- offline and online reward "
+                    f"scales must match. Rebuild the cache with --{metadata_key.replace('_', '-')}"
+                    f"={current_value}, or change online_rl.{cfg_attr} to {cached_value}."
+                )
+
     @classmethod
     def _load_offline_buffer(
         cls,
         path: str | None,
         *,
         policy_cfg: Any,
+        online_rl_cfg: Any = None,
     ) -> ReplayBuffer | None:
         if path is None:
             return None
@@ -134,6 +191,7 @@ class OnlineRLTrainer:
                         f"match policy {policy_key}={current_checkpoint!r}; state_vec and "
                         "VLA references must be encoded by the deployed checkpoints"
                     )
+            cls._check_reward_schema(metadata, cache_path, online_rl_cfg)
         else:
             raise ValueError(
                 f"Offline cache {cache_path} has no cache_metadata.json. It may be an "
@@ -225,12 +283,15 @@ class OnlineRLTrainer:
             return online, 0, actual_online_n
         assert self.offline_buffer is not None
         offline = self.offline_buffer.sample(offline_n)
-        # The offline cache is contractually "demonstrated_action" only (see
-        # _load_offline_buffer's exec_chunk_source check), so every demo
-        # transition counts as a resolved success -- its episode_id is not
-        # reliable for episode_outcomes() lookup (often left at the default
-        # -1 sentinel by the cache builder).
-        offline["outcome"] = torch.ones(offline["state_vec"].shape[0])
+        # New caches preserve their explicit episode success/failure labels.
+        # Old demo caches have no label, so retain the historical assumption
+        # that demonstrated trajectories are successes.
+        offline_outcome = self.offline_buffer.outcome_labels(offline["episode_id"])
+        offline["outcome"] = torch.where(
+            offline_outcome >= 0.0,
+            offline_outcome,
+            torch.ones_like(offline_outcome),
+        )
         actual_offline_n = next(iter(offline.values())).shape[0]
         actual_online_n = next(iter(online.values())).shape[0]
         return (
@@ -262,6 +323,9 @@ class OnlineRLTrainer:
                 "min_warmup_transitions": online_rl_cfg.min_warmup_transitions,
                 "min_warmup_successes": online_rl_cfg.min_warmup_successes,
                 "min_warmup_failures": online_rl_cfg.min_warmup_failures,
+                "terminal_reward": online_rl_cfg.terminal_reward,
+                "milestone_reward": online_rl_cfg.milestone_reward,
+                "time_decay": online_rl_cfg.time_decay,
                 "replay_capacity": online_rl_cfg.replay_capacity,
                 "batch_size": online_rl_cfg.batch_size,
                 "offline_cache_path": online_rl_cfg.offline_cache_path,
@@ -291,6 +355,83 @@ class OnlineRLTrainer:
         if self.wandb_run is None:
             return
         self.wandb_run.log(data, step=step)
+
+    def _autonomous_success_metrics(self, rolling_window: int = 20) -> dict[str, float | int]:
+        """Summarize success without counting human-rescued episodes as autonomous.
+
+        An episode is considered intervened when any of its replay chunks has
+        ``intervention=1``. This follows the collector's existing chunk-level
+        dominant-source annotation. ``autonomous_success_rate`` uses only
+        autonomous episodes as its denominator.
+        """
+        episodes: dict[int, dict[str, bool | float]] = {}
+        for transition in self.replay_buffer.buffer:
+            episode_id = int(transition.episode_id.item())
+            episode = episodes.setdefault(
+                episode_id,
+                {
+                    "done": False,
+                    "success": False,
+                    "intervention": False,
+                    "reward": 0.0,
+                },
+            )
+            episode["intervention"] |= bool(transition.intervention.item())
+            episode["reward"] += float(transition.reward_seq.sum().item())
+            if float(transition.done.item()) == 1.0:
+                episode["done"] = True
+                explicit = getattr(transition, "outcome", None)
+                explicit_value = float(explicit.item()) if explicit is not None else -1.0
+                episode["success"] = (
+                    explicit_value >= 0.5
+                    if explicit_value >= 0.0
+                    else float(transition.reward_seq.sum().item()) > 0.0
+                )
+
+        labeled = [episodes[eid] for eid in sorted(episodes) if episodes[eid]["done"]]
+        autonomous = [episode for episode in labeled if not episode["intervention"]]
+        autonomous_successes = sum(episode["success"] for episode in autonomous)
+        intervened = sum(episode["intervention"] for episode in labeled)
+
+        recent_labeled = labeled[-rolling_window:]
+        recent_autonomous = [
+            episode for episode in recent_labeled if not episode["intervention"]
+        ]
+        recent_autonomous_successes = sum(
+            episode["success"] for episode in recent_autonomous
+        )
+
+        labeled_count = len(labeled)
+        autonomous_count = len(autonomous)
+        recent_count = len(recent_labeled)
+        recent_autonomous_count = len(recent_autonomous)
+        latest = labeled[-1] if labeled else None
+        return {
+            "online_rl/episode_reward": float(latest["reward"]) if latest else 0.0,
+            "online_rl/episode_intervened": float(latest["intervention"]) if latest else 0.0,
+            "online_rl/episode_autonomous_success": (
+                float(bool(latest["success"]) and not bool(latest["intervention"]))
+                if latest
+                else 0.0
+            ),
+            "online_rl/autonomous_episodes": autonomous_count,
+            "online_rl/autonomous_successes": autonomous_successes,
+            "online_rl/autonomous_success_rate": (
+                autonomous_successes / autonomous_count if autonomous_count else 0.0
+            ),
+            f"online_rl/autonomous_success_rate_rolling_{rolling_window}": (
+                recent_autonomous_successes / recent_autonomous_count
+                if recent_autonomous_count
+                else 0.0
+            ),
+            f"online_rl/autonomous_episodes_rolling_{rolling_window}": recent_autonomous_count,
+            "online_rl/intervention_rate": intervened / labeled_count if labeled_count else 0.0,
+            f"online_rl/intervention_rate_rolling_{rolling_window}": (
+                sum(episode["intervention"] for episode in recent_labeled) / recent_count
+                if recent_count
+                else 0.0
+            ),
+        }
 
     def close(self) -> None:
         if self.wandb_run is not None:
@@ -366,11 +507,13 @@ class OnlineRLTrainer:
                     "online_rl/buffer_transitions": len(self.replay_buffer),
                     "online_rl/buffer_successes": successes,
                     "online_rl/buffer_failures": failures,
+                    **self._autonomous_success_metrics(),
                 },
                 step=recorded_episodes,
             )
             return None
         if len(self.replay_buffer) < self.cfg.batch_size:
+            self._log(self._autonomous_success_metrics(), step=recorded_episodes)
             return None
 
         # Critic-only window: freeze actor updates so the critic gets a
@@ -513,6 +656,7 @@ class OnlineRLTrainer:
                 "online_rl/online_batch_size": online_batch_size,
                 "online_rl/buffer_successes": successes,
                 "online_rl/buffer_failures": failures,
+                **self._autonomous_success_metrics(),
                 **{f"online_rl/{k}": v for k, v in loss_dict.items() if k != "critic_step"},
             },
             step=recorded_episodes,

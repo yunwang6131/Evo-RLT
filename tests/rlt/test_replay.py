@@ -129,6 +129,13 @@ class TestEpisodeOutcomes:
         outcomes = buf.episode_outcomes()
         assert outcomes == {5: "success"}
 
+    def test_explicit_failure_overrides_positive_shaping_reward(self):
+        buf = ReplayBuffer(capacity=100)
+        transition = _make_episode_transition(8, done=True, success=True)
+        transition.outcome = torch.tensor(0.0)
+        buf.add(transition)
+        assert buf.episode_outcomes() == {8: "failure"}
+
 
 class TestOutcomeLabels:
     def test_maps_success_failure_and_unresolved(self):

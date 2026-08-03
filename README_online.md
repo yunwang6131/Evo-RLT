@@ -60,9 +60,16 @@ evo-rlt-build-transition-cache-v2 \
 ```
 
 如果原始 VLA 数据包含整段长任务，最好先裁出与在线 `r` 键范围一致的
-插入 critical phase；否则大量抓取/搬运/放置状态会稀释离线 batch。没有
-`episode_success` 元数据时，上面的命令把标准 VLA 示范视为成功；如果数据中
-混有失败，必须先补正确标签，不能统一标成成功。
+插入 critical phase；否则大量抓取/搬运/放置状态会稀释离线 batch——现在
+`evo-rlt-build-transition-cache-v2` 会自动读取
+`<demo-dataset-root>/meta/critical_segments.json`（用
+`diagnostics/critical_segment_labeler_cv.py` 标注），存在的话默认就只用每条
+episode 里标出来的 critical-phase 片段（含该片段自己的 success/failure），
+跟在线 RL 的 critical phase 语义保持一致，不用再手动裁剪；没有该标签的
+episode 会被跳过，不会混进整集数据。传 `--no-critical-segments` 可以回退成
+下面这种整集 `episode_success` 的旧行为。没有 `episode_success` 元数据时，
+上面的命令把标准 VLA 示范视为成功；如果数据中混有失败，必须先补正确标签，
+不能统一标成成功。
 
 然后给在线训练增加：
 
@@ -91,7 +98,7 @@ evo-rlt-online-train \
   --rl-action-arms left \
   --offline-cache-path outputs/pin_insert_offline_cache \
   --offline-batch-fraction 0.5 \
-  --beta 0.3 \
+  --beta 0.6 \
   --warmup-episodes 5 \
   --min-warmup-transitions 1000 \
   --min-warmup-successes 3 \
@@ -101,8 +108,25 @@ evo-rlt-online-train \
   --wandb \
   --wandb-project rlt-left-only \
   --wandb-run-name run1 \
-  --save-every-episodes 5
+  --save-every-episodes 5 \
+  --utd-ratio 2
 ```
+
+分段奖励（默认开启）：`--milestone-key`（默认 `m`）在 critical phase 进行中按
+一次，给一个一次性的中途 shaping 奖励（比如"销子已经拔出来了"，跟最终 r/u
+判定的插入结果分开算）；每次 critical phase 只生效一次，第二次按/critical
+phase 结束后按都是 no-op。`--milestone-reward`（默认 0.3）、`--terminal-reward`
+（默认 1.0，success 时给，failure 恒为 0）控制这两个奖励各自的（未打折）幅度。
+`--time-decay`（默认 **0.995**）让这两个奖励按"critical phase 开始到拿到奖励
+时**收尾了多少个 chunk**（不是帧数——按 chunk 计数是为了让衰减幅度跟真实耗时
+匹配：典型 critical phase 大概 50~300 个 chunk，0.995 在这个量级上给出
+~0.6~0.8 倍的实际差异，比如 0.995^50≈0.78、0.995^300≈0.22；如果按帧数算同样
+的指数，几百帧内就会衰减到 0 附近，反而把奖励signal打没了）打指数折扣，更快
+达成给分更高——故意不是靠调低 `--gamma` 实现：`--gamma` 是让稀疏 terminal
+reward 能在几百个 chunk 的 critical phase 里靠 bootstrap 传播回去的关键，调低
+它会削弱长距离 credit assignment，跟"给速度加分"应该是两件独立可调的事。传
+`--time-decay 1.0` 可以关掉这个效果，完全复现旧的"成功给 1.0、失败给 0、不受
+耗时影响"行为。
 
 `--save-dir` 现在可以不传——不传会自动生成 `outputs/online_rl/<MMDD>_<dataset-tag>/<HHMMSS>/`（跟数据集文件夹用同一个时间戳，方便对应），每次全新跑都不会互相覆盖。**续训(`--resume-from`)时必须显式传 `--save-dir`**，指向原来那次跑用的目录，不然会直接报错拦住——续训不该新开一个跟历史checkpoint不连续的目录。
 
@@ -172,9 +196,11 @@ python diagnostics/critical_segment_labeler_cv.py --dataset-root data/bimanual/m
 r:不在critical里 → 标记当前帧为critical开始;已经在critical里 → 在当前帧收尾并存为成功
 u:在critical里的时候按 → 在当前帧收尾并存为失败(不在critical里按它没反应)
 z:重置——把这条episode当前标的段(不管是已经收尾的,还是刚按了r还没收尾的)清空,重新来
-x:标记"这条没有critical片段"(原来的x,没变)
+x:标记"这条没有critical片段"
+播放到中间里程碑事件刚完成的那一帧，按 m。例如任务定义是“销钉已经完全拔出”，就标在确认完全拔出的第一帧。再按一次 m 可以移动 milestone。
+Shift+m 清除 milestone。
 
-(space播放暂停、a/d单帧、A/D十帧、1/2/3慢放、enter保存下一条、b/n不保存切换、q退出)都没变。存的格式也从"多段列表"改成单个 segment: [start, end, "success"|"failure"] | null。
+space播放暂停、a/d单帧、A/D十帧、1/2/3慢放、enter保存下一条、b/n不保存切换、q退出
 
 ## 按键 + episode之间的reset窗口
 
