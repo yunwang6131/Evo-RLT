@@ -777,6 +777,49 @@ def _configure_rlt_record_policy(policy, cfg: RecordConfig) -> None:
     )
 
 
+def _validate_actor_rl_arm_action_order(robot, policy_cfg) -> None:
+    """`actor_rl_arm="left"` masks the actor's flattened action vector in
+    half by raw index -- dims [0, action_dim//2) are treated as the left
+    arm, [action_dim//2, action_dim) as the right arm (see ChunkActor's
+    action_mask construction in modeling_rlt_ac.py). That's a hardcoded
+    assumption about the connected robot's action_features order, with
+    nothing elsewhere tying it to the actual hardware: if it's ever wrong
+    (different robot type, reordered joints, a robot whose action space
+    isn't a clean left/right block), the RL actor silently trains/controls
+    the wrong arm with no error and no other symptom. Verify it against the
+    live robot instead of trusting it.
+    """
+    actor_rl_arm = getattr(policy_cfg, "actor_rl_arm", None)
+    if actor_rl_arm != "left":
+        return
+    action_names = list(robot.action_features)
+    n = len(action_names)
+    action_dim = getattr(policy_cfg, "action_dim", None)
+    if action_dim is not None and n != action_dim:
+        raise ValueError(
+            f"actor_rl_arm='left' expects the robot's action_features ({n}: {action_names}) "
+            f"to match policy.action_dim ({action_dim}), but they differ -- the left/right "
+            "action mask would be built for the wrong dimensionality."
+        )
+    if n % 2 != 0:
+        raise ValueError(
+            "actor_rl_arm='left' requires an even number of action features to split into "
+            f"left/right halves, got {n}: {action_names}"
+        )
+    half = n // 2
+    left_names, right_names = action_names[:half], action_names[half:]
+    bad_left = [name for name in left_names if not name.startswith("left_")]
+    bad_right = [name for name in right_names if not name.startswith("right_")]
+    if bad_left or bad_right:
+        raise ValueError(
+            "actor_rl_arm='left' assumes the robot's action_features are ordered as "
+            "[all left_* dims, all right_* dims] (see ChunkActor's action_mask), but got "
+            f"{action_names}. Unexpected in first half: {bad_left or 'none'}; unexpected in "
+            f"second half: {bad_right or 'none'}. Refusing to start rather than silently "
+            "training/controlling the wrong arm."
+        )
+
+
 def _raw_ticks_to_normalized(robot, action_name: str, raw_value: float) -> float:
     """Convert a raw motor tick (the POS column from lerobot-calibrate) to
     the normalized [-100, 100] value robot.send_action() expects, using that
@@ -812,6 +855,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     )
 
     robot = make_robot_from_config(cfg.robot)
+    if cfg.policy is not None:
+        _validate_actor_rl_arm_action_order(robot, cfg.policy)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()

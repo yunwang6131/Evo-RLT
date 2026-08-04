@@ -104,6 +104,7 @@ evo-rlt-online-train \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 300 \
   --chunk-length 10 \
+  --chunk-exec-steps 10 \
   --rl-action-arms left \
   --actor-action-clip-delta 0.1 \
   --offline-cache-path outputs/pin_insert_offline_cache \

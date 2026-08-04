@@ -10,6 +10,7 @@ from evo_rlt.core.losses import (
     actor_loss,
     rankq_ranking_loss,
     q_action_sensitivity,
+    _masked_candidate,
 )
 from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.critic import TwinCritic
@@ -274,6 +275,74 @@ class TestRankQRankingLoss:
         )
         assert still_base.item() == pytest.approx(base.item())
 
+    def test_critic_loss_forwards_action_mask_to_ranking_term(
+        self, actor, critic, target_critic, batch
+    ):
+        """Sanity check the plumbing: critic_loss must accept action_mask and
+        thread it through without erroring, same call shape as before."""
+        batch = dict(batch, outcome=torch.tensor([1.0, 0.0] * 8))
+        mask = torch.ones(CHUNK_DIM)
+        loss = critic_loss(
+            critic, target_critic, actor, batch, gamma=0.99, C=C,
+            rankq_alpha_success=1.0, rankq_alpha_failure=1.0,
+            action_mask=mask,
+        )
+        assert torch.isfinite(loss)
+
+
+class TestMaskedCandidate:
+    def test_pins_masked_out_dims_to_base_value(self):
+        base = torch.zeros(2, 4)
+        alt = torch.ones(2, 4)
+        mask = torch.tensor([1.0, 1.0, 0.0, 0.0])
+        out = _masked_candidate(base, alt, mask)
+        assert torch.equal(out[:, :2], torch.ones(2, 2))
+        assert torch.equal(out[:, 2:], torch.zeros(2, 2))
+
+    def test_none_mask_returns_alt_unchanged(self):
+        base = torch.zeros(2, 4)
+        alt = torch.ones(2, 4)
+        assert torch.equal(_masked_candidate(base, alt, None), alt)
+
+
+class TestRankQActionMask:
+    """actor_rl_arm="left"-style masking: candidates must never differ from
+    the executed action on a frozen (masked-out) dim, since the actor could
+    never have produced such an action."""
+
+    def test_all_zero_mask_makes_ranking_loss_seed_invariant(self, critic):
+        """With every dim masked out, every candidate collapses to the exact
+        executed action -- so the loss must not depend at all on the
+        noisy/random/permuted draws, unlike the unmasked case."""
+        B = 8
+        state = torch.randn(B, STATE_DIM)
+        action = torch.randn(B, CHUNK_DIM)
+        outcome = torch.tensor([1.0, 0.0] * (B // 2))
+        zero_mask = torch.zeros(CHUNK_DIM)
+
+        torch.manual_seed(1)
+        loss_a = rankq_ranking_loss(critic, state, action, outcome, action_mask=zero_mask)
+        torch.manual_seed(2)
+        loss_b = rankq_ranking_loss(critic, state, action, outcome, action_mask=zero_mask)
+
+        assert loss_a.item() == pytest.approx(loss_b.item())
+
+    def test_partial_mask_leaves_masked_out_half_never_perturbed(self, critic):
+        """Right half masked out (actor_rl_arm='left'-style split): rerunning
+        with different seeds must still change the loss (left half is being
+        randomized), but must match a version where we manually zero out
+        the right-half randomness by construction -- verified indirectly via
+        _masked_candidate's own unit tests plus this end-to-end smoke check
+        that mixed masks don't crash and stay finite."""
+        B = 8
+        state = torch.randn(B, STATE_DIM)
+        action = torch.randn(B, CHUNK_DIM)
+        outcome = torch.tensor([1.0, 0.0] * (B // 2))
+        half_mask = torch.cat([torch.ones(CHUNK_DIM // 2), torch.zeros(CHUNK_DIM // 2)])
+
+        loss = rankq_ranking_loss(critic, state, action, outcome, action_mask=half_mask)
+        assert torch.isfinite(loss)
+
 
 class TestQActionSensitivity:
     def test_nonzero_for_a_freshly_initialized_critic(self, critic):
@@ -304,3 +373,14 @@ class TestQActionSensitivity:
         action = torch.randn(4, CHUNK_DIM, requires_grad=True)
         sensitivity = q_action_sensitivity(critic, state, action)
         assert not sensitivity.requires_grad
+
+    def test_all_zero_mask_reports_zero_sensitivity_even_for_a_healthy_critic(self, critic):
+        """With every dim masked out, all 5 candidates collapse to the exact
+        same executed action -- so a critic that's perfectly action-sensitive
+        elsewhere must still report ~0 here, since the actor (under this
+        mask) genuinely cannot move any of these dims."""
+        state = torch.randn(16, STATE_DIM)
+        action = torch.randn(16, CHUNK_DIM)
+        zero_mask = torch.zeros(CHUNK_DIM)
+        sensitivity = q_action_sensitivity(critic, state, action, action_mask=zero_mask)
+        assert sensitivity.item() == pytest.approx(0.0, abs=1e-6)

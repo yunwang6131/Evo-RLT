@@ -632,6 +632,7 @@ class OnlineRLTrainer:
                 self.policy.critic,
                 raw["state_vec"].to(device),
                 raw["exec_chunk_flat"].to(device),
+                action_mask=self.policy.actor.action_mask,
             ).item()
         if last_actor_info is not None and "loss_actor" not in loss_dict:
             # The last iteration of this call didn't happen to be a do_actor

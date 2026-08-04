@@ -26,6 +26,25 @@ def discounted_chunk_return(
     return (reward_seq * discounts.unsqueeze(0)).sum(dim=1, keepdim=True)
 
 
+def _masked_candidate(
+    base: torch.Tensor, alt: torch.Tensor, action_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Blend `alt` into `base`, restricted to the actor-controllable dims.
+
+    `action_mask` mirrors ChunkActor.action_mask: 1 on dims the actor may
+    move, 0 on dims pinned to the VLA reference (e.g. the frozen arm under
+    actor_rl_arm="left"). Perturbing/randomizing/permuting a masked-out dim
+    would build a candidate action the actor could never actually produce
+    (its output on that dim is always exactly `base`), which only adds
+    noise to the ranking signal below without changing what the actor can
+    do about it. None means no masking (e.g. actor_rl_arm="both") -- `alt`
+    is used as-is.
+    """
+    if action_mask is None:
+        return alt
+    return base + action_mask * (alt - base)
+
+
 def rankq_ranking_loss(
     critic: TwinCritic,
     state_vec: torch.Tensor,
@@ -34,6 +53,7 @@ def rankq_ranking_loss(
     noise_scale: float = 0.15,
     alpha_success: float = 1.0,
     alpha_failure: float = 1.0,
+    action_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """RankQ (Choi & Xu, 2026) self-supervised action-ranking loss.
 
@@ -51,6 +71,11 @@ def rankq_ranking_loss(
 
     `outcome`: (B,) with 1.0 = success, 0.0 = failure, anything else =
     unresolved/unknown (excluded).
+
+    `action_mask`: see _masked_candidate -- restricts every perturbed
+    candidate to the actor's controllable dims (e.g. left arm only under
+    actor_rl_arm="left") so the ranking is over actions the actor could
+    actually choose between, not actions differing only on a frozen arm.
     """
     success_mask = outcome == 1
     failure_mask = outcome == 0
@@ -62,10 +87,14 @@ def rankq_ranking_loss(
     perm = torch.roll(torch.arange(bs, device=action_flat.device), shifts=-1)
     candidates = {
         "exec": action_flat,
-        "noisy": action_flat + eps * noise_scale,
-        "very_noisy": action_flat + eps * (2.0 * noise_scale),
-        "random": torch.rand_like(action_flat) * 2.0 - 1.0,
-        "permuted": action_flat[perm],
+        "noisy": _masked_candidate(action_flat, action_flat + eps * noise_scale, action_mask),
+        "very_noisy": _masked_candidate(
+            action_flat, action_flat + eps * (2.0 * noise_scale), action_mask
+        ),
+        "random": _masked_candidate(
+            action_flat, torch.rand_like(action_flat) * 2.0 - 1.0, action_mask
+        ),
+        "permuted": _masked_candidate(action_flat, action_flat[perm], action_mask),
     }
     q1, q2 = {}, {}
     for name, action in candidates.items():
@@ -102,6 +131,7 @@ def critic_loss(
     rankq_noise_scale: float = 0.15,
     rankq_alpha_success: float = 0.0,
     rankq_alpha_failure: float = 0.0,
+    action_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """TD3-style chunk-level TD loss with correct truncated-chunk handling.
 
@@ -111,7 +141,8 @@ def critic_loss(
     If `batch["outcome"]` is present and either rankq_alpha_* is > 0, adds
     RankQ's self-supervised ranking loss (see rankq_ranking_loss above) as
     an additional term. Fully backward compatible: with the default alphas
-    (or no "outcome" key in batch) this is a no-op.
+    (or no "outcome" key in batch) this is a no-op. `action_mask` (see
+    _masked_candidate) is forwarded to it unchanged.
     """
     x = batch["state_vec"]
     a = batch["exec_chunk_flat"]
@@ -148,6 +179,7 @@ def critic_loss(
             noise_scale=rankq_noise_scale,
             alpha_success=rankq_alpha_success,
             alpha_failure=rankq_alpha_failure,
+            action_mask=action_mask,
         )
     return loss
 
@@ -178,6 +210,7 @@ def q_action_sensitivity(
     state_vec: torch.Tensor,
     action_flat: torch.Tensor,
     noise_scale: float = 0.15,
+    action_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Diagnostic: how much does critic.min_q(s, ·) actually vary across
     different actions at the same state?
@@ -188,8 +221,10 @@ def q_action_sensitivity(
     function V(s) even though it's architecturally still Q(s,a) (see RankQ
     paper Fig.1's ∂Q/∂a visualization for the same failure mode via a true
     gradient; this is a cheaper no-autograd proxy for periodic logging).
-    Reuses the same candidate-action construction as rankq_ranking_loss so
-    the comparison is apples-to-apples.
+    Reuses the same masked candidate-action construction as
+    rankq_ranking_loss (see _masked_candidate) so the comparison stays
+    apples-to-apples -- and so a frozen arm under actor_rl_arm="left"
+    doesn't get credited as "action sensitivity" it doesn't actually have.
 
     Returns a scalar: mean over the batch of the per-sample std across 5
     candidate actions' (exec/noisy/very_noisy/random/permuted) Q values.
@@ -202,10 +237,14 @@ def q_action_sensitivity(
         perm = torch.roll(torch.arange(bs, device=action_flat.device), shifts=-1)
         candidates = [
             action_flat,
-            action_flat + eps * noise_scale,
-            action_flat + eps * (2.0 * noise_scale),
-            torch.rand_like(action_flat) * 2.0 - 1.0,
-            action_flat[perm],
+            _masked_candidate(action_flat, action_flat + eps * noise_scale, action_mask),
+            _masked_candidate(
+                action_flat, action_flat + eps * (2.0 * noise_scale), action_mask
+            ),
+            _masked_candidate(
+                action_flat, torch.rand_like(action_flat) * 2.0 - 1.0, action_mask
+            ),
+            _masked_candidate(action_flat, action_flat[perm], action_mask),
         ]
         q_values = torch.stack(
             [critic.min_q(state_vec, a).squeeze(-1) for a in candidates], dim=0

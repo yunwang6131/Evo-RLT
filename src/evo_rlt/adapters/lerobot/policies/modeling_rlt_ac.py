@@ -241,6 +241,7 @@ class ChunkACPolicy(PreTrainedPolicy):
             rankq_noise_scale=getattr(self.config, "rankq_noise_scale", 0.15),
             rankq_alpha_success=getattr(self.config, "rankq_alpha_success", 0.0),
             rankq_alpha_failure=getattr(self.config, "rankq_alpha_failure", 0.0),
+            action_mask=self.actor.action_mask,
         )
         soft_update(self.target_critic, self.critic, self.config.tau)
         self._critic_step += 1
