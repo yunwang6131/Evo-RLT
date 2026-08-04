@@ -135,6 +135,7 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         "--require_episode_success_label=true",
         "--intervention_state_machine_enabled=true",
         f"--left_intervention_key={args.left_intervention_key}",
+        f"--right_intervention_key={args.right_intervention_key}",
         f"--policy_sync_to_teleop={'true' if teleop_argv else 'false'}",
         f"--vla_ref={'true' if args.vla_ref else 'false'}",
         f"--play_sounds={'true' if args.play_sounds else 'false'}",
@@ -220,6 +221,9 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
         "recording continues under VLA afterward), s/f=end the whole recorded episode "
         "once VLA finishes, "
         f"{args.left_intervention_key}=left-arm intervention, "
+        f"{args.right_intervention_key}=right-arm intervention (puppeteer the right arm out of the "
+        "way; it is never RL-controlled under --rl-action-arms left, so this does not affect what's "
+        "being learned -- but the frame is still tagged as an intervention, same as left), "
         f"{args.teleop_toggle_key}=both-arm intervention/release"
     )
     print(
@@ -246,10 +250,14 @@ def run_online_train(args: argparse.Namespace) -> None:
     set_offline_env()
     if args.wandb_resume is not None and args.wandb_run_id is None:
         raise ValueError("--wandb-resume requires --wandb-run-id (the original W&B run ID).")
-    keys = {args.teleop_toggle_key, args.left_intervention_key, args.rlt_toggle_key, "u"}
-    if len(keys) != 4:
+    keys = {
+        args.teleop_toggle_key, args.left_intervention_key, args.right_intervention_key,
+        args.rlt_toggle_key, "u",
+    }
+    if len(keys) != 5:
         raise ValueError(
-            "--teleop-toggle-key, --left-intervention-key, --rlt-toggle-key, and the fixed 'u' failure key must be distinct."
+            "--teleop-toggle-key, --left-intervention-key, --right-intervention-key, --rlt-toggle-key, "
+            "and the fixed 'u' failure key must be distinct."
         )
 
     setup = load_robot_setup(args.setup_json)
@@ -348,6 +356,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--teleop-toggle-key", default="space")
     parser.add_argument("--left-intervention-key", default="i")
+    parser.add_argument(
+        "--right-intervention-key", default="o",
+        help="Puppeteer only the right arm (Space releases it, same as left). The right arm is "
+        "never RL-controlled under --rl-action-arms left, so this has no effect on what's being "
+        "learned -- it just keeps a misbehaving right arm from ruining an otherwise-good "
+        "left-arm attempt. Note: the frame is still tagged as an intervention while active (source "
+        "is per-frame, not per-arm), same limitation as --left-intervention-key.",
+    )
     parser.add_argument(
         "--preflight", action=argparse.BooleanOptionalAction, default=True,
         help="Connect/torque-check follower+leader arms before loading the policy.",

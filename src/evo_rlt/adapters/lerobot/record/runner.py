@@ -141,7 +141,9 @@ def _start_record_event_pedal_listener(
         logging.info("No pedal key bindings configured; pedal listener skipped")
         return None
 
-    cooldown_events = {"toggle_intervention", "toggle_left_intervention", "toggle_critical_phase"}
+    cooldown_events = {
+        "toggle_intervention", "toggle_left_intervention", "toggle_right_intervention", "toggle_critical_phase",
+    }
     last_event_times: dict[str, float] = {}
 
     def on_press(key_name: str) -> None:
@@ -220,6 +222,7 @@ def _ensure_record_events(events: dict[str, Any]) -> None:
     for event_name in [
         "toggle_intervention",
         "toggle_left_intervention",
+        "toggle_right_intervention",
         "toggle_critical_phase",
         "cp_mark_success",
         "cp_mark_failure",
@@ -245,6 +248,7 @@ def _patch_record_keyboard_listener() -> None:
         key_bindings = {
             kwargs.pop("intervention_toggle_key", None): "toggle_intervention",
             kwargs.pop("left_intervention_key", None): "toggle_left_intervention",
+            kwargs.pop("right_intervention_key", None): "toggle_right_intervention",
             kwargs.pop("critical_phase_toggle_key", None): "toggle_critical_phase",
             kwargs.pop("episode_success_key", None): "episode_success",
             kwargs.pop("episode_failure_key", None): "episode_failure",
@@ -313,6 +317,7 @@ def _patch_episode_outcome_listener(
     def init_keyboard_listener(*args, **kwargs):
         intervention_toggle_key = kwargs.pop("intervention_toggle_key", None)
         left_intervention_key = kwargs.pop("left_intervention_key", None)
+        right_intervention_key = kwargs.pop("right_intervention_key", None)
         critical_phase_toggle_key = kwargs.pop("critical_phase_toggle_key", None)
         kwargs.pop("episode_success_key", None)
         kwargs.pop("episode_failure_key", None)
@@ -329,6 +334,7 @@ def _patch_episode_outcome_listener(
         record_key_bindings = {
             intervention_toggle_key: "toggle_intervention",
             left_intervention_key: "toggle_left_intervention",
+            right_intervention_key: "toggle_right_intervention",
             critical_phase_toggle_key: "toggle_critical_phase",
             cp_success_key: "cp_mark_success",
             cp_failure_key: "cp_mark_failure",

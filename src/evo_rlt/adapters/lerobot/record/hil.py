@@ -45,6 +45,7 @@ INTERVENTION_STATE_POLICY = 0.0
 INTERVENTION_STATE_ACTIVE = 1.0
 INTERVENTION_STATE_RELEASE = 2.0
 INTERVENTION_STATE_LEFT_ACTIVE = 3.0
+INTERVENTION_STATE_RIGHT_ACTIVE = 4.0
 
 
 def _get_torch_rng_state(device: torch.device) -> tuple[torch.Tensor, torch.Tensor | None]:

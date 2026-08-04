@@ -430,6 +430,14 @@ class RecordConfig:
     intervention_toggle_key: str = " "
     # i enters left-arm-only intervention; Space releases it.
     left_intervention_key: str = "i"
+    # o enters right-arm-only intervention; Space releases it. The right arm
+    # is never RL-controlled (rl_action_arms=left masks it to the frozen VLA
+    # reference), so puppeteering it out of the way here does not touch RL
+    # training -- but the frame is still tagged is_intervention/SOURCE_HUMAN
+    # while active, same limitation as left_intervention_key (source is
+    # per-frame, not per-arm), so it still lands in the replay buffer's
+    # "intervention" bucket rather than "autonomous success/failure".
+    right_intervention_key: str = "o"
     # Pure-teleop mode: r key starts an episode (entering critical phase),
     # second r press ends the episode and marks it success; u marks it as
     # failure. No VLA,
@@ -524,6 +532,12 @@ class RecordConfig:
             raise ValueError("`left_intervention_key` must be a single character.")
         if self.left_intervention_key.lower() == self.intervention_toggle_key.lower():
             raise ValueError("`left_intervention_key` must differ from `intervention_toggle_key`.")
+        if not self.right_intervention_key or len(self.right_intervention_key) != 1:
+            raise ValueError("`right_intervention_key` must be a single character.")
+        if self.right_intervention_key.lower() == self.intervention_toggle_key.lower():
+            raise ValueError("`right_intervention_key` must differ from `intervention_toggle_key`.")
+        if self.right_intervention_key.lower() == self.left_intervention_key.lower():
+            raise ValueError("`right_intervention_key` must differ from `left_intervention_key`.")
 
         if self.enable_episode_outcome_labeling:
             label_key_bindings = {
@@ -537,13 +551,14 @@ class RecordConfig:
             normalized_keys = [
                 self.intervention_toggle_key.lower(),
                 self.left_intervention_key.lower(),
+                self.right_intervention_key.lower(),
                 self.episode_success_key.lower(),
                 self.episode_failure_key.lower(),
             ]
             if len(set(normalized_keys)) != len(normalized_keys):
                 raise ValueError(
-                    "`intervention_toggle_key`, `left_intervention_key`, `episode_success_key`, and "
-                    "`episode_failure_key` must be distinct."
+                    "`intervention_toggle_key`, `left_intervention_key`, `right_intervention_key`, "
+                    "`episode_success_key`, and `episode_failure_key` must be distinct."
                 )
 
         if self.rlt.enable:
@@ -560,6 +575,7 @@ class RecordConfig:
                 self.rlt.rl_phase_failure_key.lower(),
                 self.intervention_toggle_key.lower(),
                 self.left_intervention_key.lower(),
+                self.right_intervention_key.lower(),
             ]
             if self.enable_episode_outcome_labeling:
                 reserved_keys.append(self.episode_success_key.lower())
@@ -975,6 +991,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         listener, events = init_keyboard_listener(
             intervention_toggle_key=cfg.intervention_toggle_key if policy is not None else None,
             left_intervention_key=cfg.left_intervention_key if rlt_hil_mode else None,
+            right_intervention_key=cfg.right_intervention_key if rlt_hil_mode else None,
             critical_phase_toggle_key=cp_key if not rlt_active else None,
             episode_success_key=cfg.episode_success_key if bind_ep_outcome_keys else None,
             episode_failure_key=cfg.episode_failure_key if bind_ep_outcome_keys else None,

@@ -41,6 +41,7 @@ from evo_rlt.adapters.lerobot.record.hil import (
     INTERVENTION_STATE_LEFT_ACTIVE,
     INTERVENTION_STATE_POLICY,
     INTERVENTION_STATE_RELEASE,
+    INTERVENTION_STATE_RIGHT_ACTIVE,
     ACPInferenceConfig,
     PolicySyncDualArmExecutor,
     _capture_policy_runtime_state,
@@ -87,6 +88,16 @@ def _merge_left_teleop_action(
     """Use human commands for left-arm joints and policy commands elsewhere."""
     mixed_action = dict(policy_action)
     mixed_action.update({key: value for key, value in teleop_action.items() if key.startswith("left_")})
+    return mixed_action
+
+
+def _merge_right_teleop_action(
+    policy_action: RobotAction,
+    teleop_action: RobotAction,
+) -> RobotAction:
+    """Use human commands for right-arm joints and policy commands elsewhere."""
+    mixed_action = dict(policy_action)
+    mixed_action.update({key: value for key, value in teleop_action.items() if key.startswith("right_")})
     return mixed_action
 
 
@@ -418,9 +429,10 @@ def record_loop(
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
         nonlocal last_intervention_action
         last_intervention_action = None
-        intervention_state = (
-            INTERVENTION_STATE_LEFT_ACTIVE if arm_scope == "left" else INTERVENTION_STATE_ACTIVE
-        )
+        intervention_state = {
+            "left": INTERVENTION_STATE_LEFT_ACTIVE,
+            "right": INTERVENTION_STATE_RIGHT_ACTIVE,
+        }.get(arm_scope, INTERVENTION_STATE_ACTIVE)
         set_teleop_manual_control(True, arm_scope=arm_scope)
         if rlt_intervention_tracker is not None:
             rlt_intervention_tracker.start(get_episode_frame_index())
@@ -484,7 +496,11 @@ def record_loop(
         logging.info("Intervention release requested (S2): returning control to policy.")
 
     def _intervention_is_active() -> bool:
-        return intervention_state in {INTERVENTION_STATE_ACTIVE, INTERVENTION_STATE_LEFT_ACTIVE}
+        return intervention_state in {
+            INTERVENTION_STATE_ACTIVE,
+            INTERVENTION_STATE_LEFT_ACTIVE,
+            INTERVENTION_STATE_RIGHT_ACTIVE,
+        }
 
     def _handle_intervention_toggle() -> None:
         if not events.get("toggle_intervention", False):
@@ -498,15 +514,24 @@ def record_loop(
             else:
                 _release_intervention()
 
-        if not events.get("toggle_left_intervention", False):
+        if events.get("toggle_left_intervention", False):
+            events["toggle_left_intervention"] = False
+            if not intervention_enabled:
+                logging.info("Left intervention ignored because policy+teleop are not both active.")
+            elif intervention_state == INTERVENTION_STATE_POLICY:
+                _start_intervention("left")
+            else:
+                logging.info("Left intervention key ignored while an intervention is already active; use Space to release.")
+
+        if not events.get("toggle_right_intervention", False):
             return
-        events["toggle_left_intervention"] = False
+        events["toggle_right_intervention"] = False
         if not intervention_enabled:
-            logging.info("Left intervention ignored because policy+teleop are not both active.")
+            logging.info("Right intervention ignored because policy+teleop are not both active.")
         elif intervention_state == INTERVENTION_STATE_POLICY:
-            _start_intervention("left")
+            _start_intervention("right")
         else:
-            logging.info("Left intervention key ignored while an intervention is already active; use Space to release.")
+            logging.info("Right intervention key ignored while an intervention is already active; use Space to release.")
 
     def _handle_critical_phase_events() -> None:
         if events.get("toggle_critical_phase", False):
@@ -670,6 +695,11 @@ def record_loop(
             teleop_action = act_processed_teleop or last_teleop_action
             if policy_action is not None and teleop_action is not None:
                 return 1.0, _merge_left_teleop_action(policy_action, teleop_action)
+        if intervention_state == INTERVENTION_STATE_RIGHT_ACTIVE:
+            policy_action = act_processed_policy or last_policy_action_for_blend
+            teleop_action = act_processed_teleop or last_teleop_action
+            if policy_action is not None and teleop_action is not None:
+                return 1.0, _merge_right_teleop_action(policy_action, teleop_action)
         if act_processed_teleop is not None:
             return 1.0, act_processed_teleop
         if last_teleop_action is not None:
@@ -863,13 +893,19 @@ def record_loop(
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         selected_from_policy = act_processed_policy is not None and action_values is act_processed_policy
         _t0 = time.perf_counter()
+        # Whichever arm is NOT being manually driven is still policy-controlled
+        # and needs its leader kept in sync with what's actually being sent,
+        # so the leader doesn't drift from the follower while the human is
+        # only holding the other arm.
         sync_right_only = intervention_state == INTERVENTION_STATE_LEFT_ACTIVE
-        if policy_sync_executor is not None and (selected_from_policy or sync_right_only):
+        sync_left_only = intervention_state == INTERVENTION_STATE_RIGHT_ACTIVE
+        if policy_sync_executor is not None and (selected_from_policy or sync_right_only or sync_left_only):
+            _feedback_arm_scope = "right" if sync_right_only else ("left" if sync_left_only else "both")
             _sent_action = run_with_connection_retry(
                 "policy_sync_executor.send_action",
-                lambda robot_action_to_send=robot_action_to_send, sync_right_only=sync_right_only: policy_sync_executor.send_action(
+                lambda robot_action_to_send=robot_action_to_send, _feedback_arm_scope=_feedback_arm_scope: policy_sync_executor.send_action(
                     robot_action_to_send,
-                    feedback_arm_scope="right" if sync_right_only else "both",
+                    feedback_arm_scope=_feedback_arm_scope,
                 ),
             )
         else:
@@ -883,7 +919,10 @@ def record_loop(
         # Only pop metadata when policy action was actually executed (not during intervention)
         # to keep _meta_queue in sync with _action_queue.
         rlt_meta = None
-        if rlt is not None and (not is_intervention or intervention_state == INTERVENTION_STATE_LEFT_ACTIVE):
+        if rlt is not None and (
+            not is_intervention
+            or intervention_state in {INTERVENTION_STATE_LEFT_ACTIVE, INTERVENTION_STATE_RIGHT_ACTIVE}
+        ):
             rlt_meta = rlt.pop_step_metadata()
 
         if rlt is None and skip_prefix_recording:
@@ -894,7 +933,27 @@ def record_loop(
             rlt_phase = PHASE_CRITICAL if rl_phase_started else PHASE_PREFIX
         else:
             rlt_phase = rlt_meta.phase if rlt_meta is not None else prev_phase
-        rlt_source = SOURCE_HUMAN if is_intervention else (rlt_meta.source_type if rlt_meta else SOURCE_VLA)
+        # Right-arm-only intervention is never RL-controlled (rl_action_arms=
+        # left masks it to the frozen VLA reference regardless), so it must
+        # NOT be recorded as SOURCE_HUMAN here -- that flows straight into
+        # RLTOnlineCollector's dominant_source/ChunkTransition.intervention
+        # tagging, and marking it human would (a) wrongly exclude the whole
+        # episode from _autonomous_success_metrics()'s autonomous_* stats
+        # even though the left arm was fully autonomous, and (b) overwrite
+        # ref_chunk with the human-puppeteered right-arm position for no
+        # benefit, since the mask forces mu=ref on those dims either way.
+        # is_intervention itself stays True for this state (still needed for
+        # the takeover/release blend, which is a physical smoothness concern,
+        # not an RL-bookkeeping one) -- only the *source* recorded here is
+        # scoped down. complementary_info.is_intervention/.state (written a
+        # few lines below from is_intervention/intervention_state directly)
+        # are intentionally left untouched, so the raw dataset still shows
+        # the true right-arm-active state for anyone reviewing footage.
+        rlt_source = (
+            SOURCE_HUMAN
+            if is_intervention and intervention_state != INTERVENTION_STATE_RIGHT_ACTIVE
+            else (rlt_meta.source_type if rlt_meta else SOURCE_VLA)
+        )
         rlt_is_critical = float(rlt_phase == PHASE_CRITICAL)
 
         # Write to dataset
