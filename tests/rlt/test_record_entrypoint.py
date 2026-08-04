@@ -505,6 +505,27 @@ class _FakeLeaderArm:
         self.config = SimpleNamespace(port="/dev/fake")
 
 
+def test_so_leader_connection_error_is_not_masked_by_lerobot_version():
+    from evo_rlt.adapters.lerobot.record.hil import set_teleop_manual_control
+
+    leader = _FakeLeaderArm()
+    leader.diagnostic_label = "right leader arm"
+
+    def fail_to_enable_torque():
+        raise ConnectionError("serial read failed")
+
+    leader.bus.enable_torque = fail_to_enable_torque
+
+    with pytest.raises(ConnectionError) as exc_info:
+        set_teleop_manual_control(leader, False)
+
+    assert str(exc_info.value) == (
+        "right leader arm on /dev/fake lost its connection while "
+        "disabling leader manual control: serial read failed"
+    )
+    assert isinstance(exc_info.value.__cause__, ConnectionError)
+
+
 def test_official_so_leader_feedback_is_sent_through_bus():
     from evo_rlt.adapters.lerobot.record.hil import send_teleop_feedback, set_teleop_manual_control
 

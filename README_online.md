@@ -83,11 +83,11 @@ evo-rlt-build-transition-cache-v2 \
   --chunk-length 10 \
   --frame-stride 2 \
   --rl-action-arms left \
-  --milestone-reward 0.3 \
+  --milestone-reward 0.5 \
   --terminal-reward 1.0 \
   --time-decay 0.995 \
   --batch-size 32 \
-  --num-workers 2 \
+  --num-workers 8 \
   --train-ratio 0.9 \
   --tolerance-s 0.04 \
   --device cuda
@@ -102,13 +102,13 @@ evo-rlt-online-train \
   --rl-token-path outputs/pin_insert_rl_token/checkpoints/010000/pretrained_model \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
-  --num-episodes 200 \
+  --num-episodes 300 \
   --chunk-length 10 \
   --rl-action-arms left \
   --actor-action-clip-delta 0.1 \
   --offline-cache-path outputs/pin_insert_offline_cache \
   --offline-batch-fraction 0.5 \
-  --milestone-reward 0.3 \
+  --milestone-reward 0.5 \
   --terminal-reward 1.0 \
   --time-decay 0.995 \
   --beta 0.6 \
@@ -122,7 +122,7 @@ evo-rlt-online-train \
   --save-every-episodes 5 \
   --wandb \
   --wandb-project rlt-left-only \
-  --wandb-run-name run1
+  --wandb-run-name run2
 ```
 
 ### 在线操作按键
