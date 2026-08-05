@@ -55,10 +55,33 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     # half of each bimanual action vector, so those commands remain exactly the
     # frozen VLA reference during training, target computation, and rollout.
     actor_rl_arm: str = "both"
-    # Optional safety clamp on the RL actor's per-step deviation from the VLA
-    # reference chunk while in the critical/RL phase. None disables clamping
-    # (existing deploy behavior). Only affects RLTActionModifier's RL branch.
+    # Optional safety bound on the RL actor's per-step deviation from the VLA
+    # reference chunk while in the critical/RL phase: |action - ref| stays
+    # under this value via project_action_delta's smooth ref+limit*tanh(...)
+    # projection (see core/utils.py), applied identically in
+    # RLTActionModifier.compute_chunk (deploy), actor_loss, and critic_loss's
+    # target computation (training) -- NOT a plain clamp(mu-ref, -d, d),
+    # which breaks the |action-ref|<=d bound whenever ref itself lies outside
+    # [-1,1] (a real, common QUANTILES-normalization occurrence). None
+    # disables the bound everywhere (existing pre-fix behavior: mu only ever
+    # clamped to [-1,1], independent of ref).
     actor_action_clip_delta: float | None = None
+    # Optional runtime slew-rate limit: caps how much the actor's *executed*
+    # action may change from one physical timestep to the next (see
+    # RLTActionModifier._apply_slew_rate_limit), independent of and in
+    # addition to actor_action_clip_delta above -- the delta bound only
+    # limits how far an action sits from its own reference, not how much it
+    # can change from the immediately preceding frame, so adjacent frames
+    # could otherwise swing from -actor_action_clip_delta to
+    # +actor_action_clip_delta with nothing to stop them. None disables it
+    # (existing behavior).
+    actor_slew_rate_limit: float | None = None
+    # Optional training-time complement to actor_slew_rate_limit: penalizes
+    # squared differences between adjacent-timestep raw mu within a chunk
+    # (see losses.actor_loss), discouraging the actor's own residual from
+    # oscillating step-to-step in the first place rather than only clipping
+    # the symptom at deploy time. 0.0 (default) is a no-op.
+    actor_smoothness_weight: float = 0.0
 
     # --- Critic + target ---
     critic_hidden_dim: int = 256
@@ -87,9 +110,23 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     # resolved "outcome" label (see losses.rankq_ranking_loss); batches
     # without one (e.g. offline lerobot-train pretraining) are unaffected.
     # alpha0/alpha1 = 1.0, noise_scale = 0.15 match the paper's defaults.
+    # rankq_ranking_loss averages each branch over its own pair count before
+    # applying alpha (see that function's docstring), so alpha=1.0 here is
+    # already calibrated to a TD-loss-comparable scale -- it is NOT the raw,
+    # un-normalized paper formula.
     rankq_alpha_success: float = 1.0
     rankq_alpha_failure: float = 1.0
     rankq_noise_scale: float = 0.15
+
+    # TD3-style target policy smoothing: clipped noise added to the target
+    # actor's action before evaluating target_critic on it, so the critic
+    # can't fit an arbitrarily sharp function right at one exact action --
+    # see losses.critic_loss's target_noise_std docstring for why this
+    # matters specifically for real-robot jitter. On by default; pass
+    # target_noise_std=0.0 to disable and get the exact pre-smoothing
+    # behavior.
+    target_noise_std: float = 0.1
+    target_noise_clip: float = 0.3
 
     # --- Shapes ---
     chunk_length: int = 10
@@ -139,6 +176,10 @@ class ChunkACPolicyConfig(PreTrainedConfig):
             )
         if self.actor_rl_arm == "left" and self.action_dim % 2 != 0:
             raise ValueError("actor_rl_arm='left' requires an even action_dim")
+        if self.actor_slew_rate_limit is not None and self.actor_slew_rate_limit < 0:
+            raise ValueError("actor_slew_rate_limit must be >= 0 when set")
+        if self.actor_smoothness_weight < 0:
+            raise ValueError("actor_smoothness_weight must be >= 0")
 
     @property
     def type(self) -> str:

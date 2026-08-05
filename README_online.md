@@ -80,9 +80,9 @@ evo-rlt-build-transition-cache-v2 \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --output-dir outputs/pin_insert_offline_cache \
   --task-instruction "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
-  --chunk-length 10 \
+  --chunk-length 25 \
   --frame-stride 2 \
-  --rl-action-arms left \
+  --rl-action-arms both \
   --milestone-reward 0.5 \
   --terminal-reward 1.0 \
   --time-decay 0.995 \
@@ -103,16 +103,17 @@ evo-rlt-online-train \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
   --num-episodes 300 \
-  --chunk-length 10 \
-  --chunk-exec-steps 10 \
-  --rl-action-arms left \
+  --chunk-length 25 \
+  --chunk-exec-steps 25 \
+  --rl-action-arms both \
   --actor-action-clip-delta 0.1 \
+  --actor-slew-rate-limit 0.03 \
   --offline-cache-path outputs/pin_insert_offline_cache \
   --offline-batch-fraction 0.5 \
   --milestone-reward 0.5 \
   --terminal-reward 1.0 \
   --time-decay 0.995 \
-  --beta 0.6 \
+  --beta 50 \
   --gamma 0.9995 \
   --warmup-episodes 5 \
   --min-warmup-transitions 1000 \
@@ -120,10 +121,10 @@ evo-rlt-online-train \
   --min-warmup-failures 3 \
   --critic-layer-norm \
   --utd-ratio 2 \
-  --save-every-episodes 5 \
+  --save-every-episodes 10 \
   --wandb \
-  --wandb-project rlt-left-only \
-  --wandb-run-name run2
+  --wandb-project rlt-both \
+  --wandb-run-name run1
 ```
 
 ### 在线操作按键
@@ -144,7 +145,7 @@ critical phase 在 `r/u` 后立即结束并切回 VLA；后续 VLA 动作不进�
 把下面参数追加到在线训练命令：
 
 ```bash
-  --go-home-positions '{"left_shoulder_pan.pos": 2054, "left_shoulder_lift.pos": 2099, "left_elbow_flex.pos": 3041, "left_wrist_flex.pos": 1448, "left_gripper.pos": 1789, "right_shoulder_pan.pos": 2095, "right_shoulder_lift.pos": 2132, "right_elbow_flex.pos": 2984, "right_wrist_flex.pos": 1428, "right_gripper.pos": 1991}'
+  --go-home-positions '{"left_shoulder_pan.pos": 2038, "left_shoulder_lift.pos": 2081, "left_elbow_flex.pos": 3034, "left_wrist_flex.pos": 1142, "left_gripper.pos": 2164, "right_shoulder_pan.pos": 2066, "right_shoulder_lift.pos": 2160, "right_elbow_flex.pos": 2880, "right_wrist_flex.pos": 1066, "right_gripper.pos": 2209}'
 ```
 
 ## 6. 恢复在线训练
@@ -156,22 +157,79 @@ evo-rlt-online-train \
   --rl-token-path outputs/pin_insert_rl_token/checkpoints/010000/pretrained_model \
   --tokenizer-path /home/wangyun/.cache/huggingface/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c \
   --task "Pick up the black hexagonal part with the right arm, pull the gray pin out of the white platform with the left arm, align the gray pin with the hole in the side of the black hexagonal part, insert the gray pin into the hole, and place the assembled object in the red square area." \
-  --num-episodes 200 \
+  --num-episodes 300 \
+  --episode-time-s 3000 \
+  --reset-time-s 15 \
+  --fps 30 \
+  --chunk-length 25 \
+  --chunk-exec-steps 25 \
+  --action-dim 12 \
+  --proprio-dim 12 \
+  --rl-action-arms both \
+  --actor-action-clip-delta 0.1 \
+  --actor-slew-rate-limit 0.03 \
+  --actor-smoothness-weight 0.0 \
+  --actor-hidden-dim 512 \
+  --actor-num-layers 3 \
+  --actor-activation relu \
+  --actor-residual \
+  --no-actor-layer-norm \
+  --actor-fixed-std 0.0 \
+  --critic-hidden-dim 512 \
+  --critic-num-layers 3 \
+  --critic-activation relu \
+  --critic-residual \
+  --critic-layer-norm \
+  --rankq-alpha-success 1.0 \
+  --rankq-alpha-failure 1.0 \
+  --rankq-noise-scale 0.15 \
+  --target-noise-std 0.1 \
+  --target-noise-clip 0.3 \
   --offline-cache-path outputs/pin_insert_offline_cache \
   --offline-batch-fraction 0.5 \
-  --milestone-reward 0.3 \
+  --milestone-reward 0.5 \
   --terminal-reward 1.0 \
   --time-decay 0.995 \
-  --resume-from outputs/pin_insert_online_rl/latest_online_state.pt \
-  --save-dir outputs/pin_insert_online_rl \
+  --beta 50 \
+  --gamma 0.9995 \
+  --tau 0.005 \
+  --actor-update-interval 2 \
+  --warmup-episodes 5 \
+  --critic-only-episodes 10 \
+  --actor-unfreeze-ramp-episodes 10 \
+  --min-warmup-transitions 1000 \
+  --min-warmup-successes 3 \
+  --min-warmup-failures 3 \
+  --stratified-sampling \
+  --replay-capacity 20000 \
+  --batch-size 256 \
+  --lr-actor 3e-5 \
+  --lr-critic 1e-4 \
+  --utd-ratio 2 \
+  --max-updates-per-episode 1000 \
+  --intervention-blend-time-s 0.3 \
+  --vla-ref \
+  --play-sounds \
+  --go-home-time-s 3.0 \
+  --go-home-gripper-value 100.0 \
+  --save-every-episodes 10 \
+  --resume-from outputs/online_rl/0805_online_rl/eval_online_rl_110435/latest_online_state.pt \
+  --save-dir outputs/online_rl/0805_online_rl/eval_online_rl_110435 \
   --wandb \
-  --wandb-project pin-insert-rl \
-  --wandb-run-id run1 \
-  --wandb-resume must \
-  --save-every-episodes 5
+  --wandb-project rlt-both \
+  --wandb-run-name run1 \
+  --wandb-run-id yiycy1r4 \
+  --wandb-resume must
 ```
 
-`--num-episodes` 是恢复后的总 episode 目标。恢复时必须使用原来的 offline cache、reward 参数和 `--save-dir`。
+当前 `latest_online_state.pt` 已完整保存到 episode 51（W&B 最后一条为 `_step=50`，
+两者采用 1-based/0-based 计数，状态一致）。`--num-episodes 300` 是恢复后的总目标，
+因此会从 episode 52 继续，而不是再训练 300 个 episode。
+
+上面的参数来自本次 run `yiycy1r4` 的实际 W&B metadata；原命令中依赖默认值的网络、
+优化器、RankQ、target smoothing、warmup、采样和 reset 参数也已显式冻结。恢复时只新增
+`--resume-from`、显式指定原 `--save-dir`，并用 `--wandb-run-id`/`--wandb-resume` 接回
+原 W&B run；不要修改其余参数。
 
 ## 7. 评测
 

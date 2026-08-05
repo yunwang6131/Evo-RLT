@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.critic import TwinCritic
-from evo_rlt.core.utils import compute_discount_vector
+from evo_rlt.core.utils import compute_discount_vector, project_action_delta, unflatten_chunk
 
 
 def discounted_chunk_return(
@@ -76,6 +76,20 @@ def rankq_ranking_loss(
     candidate to the actor's controllable dims (e.g. left arm only under
     actor_rl_arm="left") so the ranking is over actions the actor could
     actually choose between, not actions differing only on a frozen arm.
+
+    Deviation from the paper's raw Eq. A.5 (documented, not accidental):
+    Eq. A.5 sums all pairwise softplus terms unweighted by count. At
+    alpha=1.0 that gives ~6 success pairs + 1 failure pair, times 2 critic
+    heads = up to 14 terms, each up to softplus(0)=ln(2)~=0.69 before the
+    critic has learned to separate anything -- i.e. up to ~9.7 total,
+    several times the plain 2-term TD MSE loss's typical scale (measured
+    empirically on this codebase's chunk-flattened action space). Left as
+    Eq. A.5 verbatim, this term can dominate critic training over accurately
+    fitting returns, especially early on. Averaging each branch (success,
+    failure) over its own pair count keeps `alpha_success`/`alpha_failure`
+    meaningful as "how much to weight ranking vs. TD" regardless of how many
+    pairs the two branches happen to define, instead of that weight
+    silently scaling with an implementation detail.
     """
     success_mask = outcome == 1
     failure_mask = outcome == 0
@@ -113,9 +127,10 @@ def rankq_ranking_loss(
     ]
     loss = action_flat.new_zeros(())
     for q in (q1, q2):
-        for pos, neg in success_pairs:
-            loss = loss + alpha_success * _rank(q, pos, neg, success_mask)
-        # L^fail (Eq. 6): only the weak "beats random" constraint.
+        success_terms = torch.stack([_rank(q, pos, neg, success_mask) for pos, neg in success_pairs])
+        loss = loss + alpha_success * success_terms.mean()
+        # L^fail (Eq. 6): only the weak "beats random" constraint -- already
+        # a single term, nothing to average over.
         loss = loss + alpha_failure * _rank(q, "exec", "random", failure_mask)
     return loss
 
@@ -132,6 +147,10 @@ def critic_loss(
     rankq_alpha_success: float = 0.0,
     rankq_alpha_failure: float = 0.0,
     action_mask: torch.Tensor | None = None,
+    target_noise_std: float = 0.0,
+    target_noise_clip: float = 0.3,
+    action_clip_delta: float | None = None,
+    info: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """TD3-style chunk-level TD loss with correct truncated-chunk handling.
 
@@ -143,6 +162,40 @@ def critic_loss(
     an additional term. Fully backward compatible: with the default alphas
     (or no "outcome" key in batch) this is a no-op. `action_mask` (see
     _masked_candidate) is forwarded to it unchanged.
+
+    `target_noise_std` > 0 enables TD3-style target policy smoothing:
+    clipped Gaussian noise (std=target_noise_std, clipped to
+    +/-target_noise_clip) is added to the target actor's action before
+    evaluating target_critic on it. Without this, the critic is free to fit
+    an arbitrarily sharp/discontinuous function of action right at whatever
+    single point mu_next happens to be -- the actor's own subsequent
+    gradient-ascent update then follows that same local sharpness, which
+    reads as jittery real-robot output even though nothing about the
+    physical actuators changed. Averaging the bootstrap target over a small
+    neighborhood of actions (this is what the added+clipped noise
+    approximates) forces the critic toward a locally smooth fit instead.
+    Masked the same way as rankq_ranking_loss's candidates, since a frozen
+    arm under actor_rl_arm="left" can't actually receive this noise either
+    (mu_next is already pinned to ref there). Default 0.0 preserves the
+    exact prior behavior (no smoothing) for existing callers.
+
+    `action_clip_delta` (see project_action_delta) is applied to mu_next
+    both before AND after the smoothing noise above, so target_noise_clip
+    can never push the bootstrap action outside action_clip_delta of
+    ref_next regardless of how the two are configured relative to each
+    other -- the noised action is re-projected back into the same
+    ref+/-action_clip_delta neighborhood the deployed actor can actually
+    reach, instead of exploring a physically-unreachable region. None
+    (default) preserves the exact prior behavior (mu_next only ever
+    clamped to [-1,1], independent of any deployment delta bound).
+
+    If `info` is passed, it is populated in place with the TD-only and
+    RankQ-only components (`"loss_critic_td"`, `"loss_critic_rankq"`,
+    both detached) so callers can log them separately -- the two terms can
+    differ by several times in magnitude (RankQ's softplus floor is ~ln(2)
+    per unsatisfied ranking pair regardless of how well the TD fit has
+    converged), and the returned scalar alone can't be un-summed after the
+    fact. Purely additive/optional: the returned loss is unchanged either way.
     """
     x = batch["state_vec"]
     a = batch["exec_chunk_flat"]
@@ -153,9 +206,45 @@ def critic_loss(
     actual_steps = batch.get("actual_steps")
 
     with torch.no_grad():
-        # Use deterministic mean for target action (TD3-style), clamped to [-1,1]
+        # Use deterministic mean for target action (TD3-style). Project onto
+        # the same ref+/-action_clip_delta neighborhood the deployed actor is
+        # bound to (see project_action_delta) -- matches what actor_loss does
+        # to mu below, so the critic's TD target reflects the policy that
+        # actually runs on hardware, not an unconstrained hypothetical one.
         mu_next, _ = actor.forward(x_next, ref_next)
-        mu_next = mu_next.clamp(-1.0, 1.0)
+        mu_next = project_action_delta(mu_next, ref_next, action_clip_delta)
+        if target_noise_std > 0:
+            smoothing_noise = torch.randn_like(mu_next) * target_noise_std
+            smoothing_noise = smoothing_noise.clamp(-target_noise_clip, target_noise_clip)
+            mu_next = _masked_candidate(mu_next, mu_next + smoothing_noise, action_mask)
+            # Re-bound after adding noise: target_noise_clip is tuned for
+            # smoothing the Q-landscape and may be larger than
+            # action_clip_delta (e.g. TD3's usual convention scales it to
+            # the full action range) -- without this, the noised sample
+            # could land outside the deployable neighborhood regardless of
+            # how the two are configured relative to each other. A second
+            # project_action_delta() call here (as before) is wrong:
+            # that projection is a smooth *contraction* toward ref (tanh),
+            # not a boundary-only clip, so applying it twice compounds
+            # shrinkage instead of leaving already-in-bound points alone --
+            # e.g. a raw delta of exactly action_clip_delta lands at ~0.76x
+            # after one call and ~0.64x after two, systematically pulling
+            # this *target* action closer to ref than the action
+            # project_action_delta's own docstring promises actor_loss/
+            # deployment ever produce for the same state. A hard clamp is
+            # the right tool for this second step instead: identity for
+            # anything already in bound (only reshapes genuine excursions
+            # from the noise), and project_action_delta's smooth-gradient
+            # property isn't needed here -- this whole function runs under
+            # the enclosing no_grad(), so no gradient flows through this
+            # re-bound either way.
+            if action_clip_delta is not None:
+                mu_next = (
+                    ref_next if action_clip_delta <= 0
+                    else ref_next + (mu_next - ref_next).clamp(-action_clip_delta, action_clip_delta)
+                )
+        if action_clip_delta is None:
+            mu_next = mu_next.clamp(-1.0, 1.0)
         q_next = target_critic.min_q(x_next, mu_next)
         if target_q_clip is not None and target_q_clip > 0:
             q_next = q_next.clamp(-target_q_clip, target_q_clip)
@@ -170,16 +259,25 @@ def critic_loss(
         target = r + bootstrap
 
     q1, q2 = critic(x, a)
-    loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+    td_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+    loss = td_loss
 
+    rankq_loss: torch.Tensor | None = None
     outcome = batch.get("outcome")
     if outcome is not None and (rankq_alpha_success > 0 or rankq_alpha_failure > 0):
-        loss = loss + rankq_ranking_loss(
+        rankq_loss = rankq_ranking_loss(
             critic, x, a, outcome,
             noise_scale=rankq_noise_scale,
             alpha_success=rankq_alpha_success,
             alpha_failure=rankq_alpha_failure,
             action_mask=action_mask,
+        )
+        loss = loss + rankq_loss
+
+    if info is not None:
+        info["loss_critic_td"] = td_loss.detach()
+        info["loss_critic_rankq"] = (
+            rankq_loss.detach() if rankq_loss is not None else td_loss.new_zeros(())
         )
     return loss
 
@@ -189,6 +287,9 @@ def actor_loss(
     critic: TwinCritic,
     batch: dict[str, torch.Tensor],
     beta: float,
+    action_clip_delta: float | None = None,
+    smoothness_weight: float = 0.0,
+    chunk_length: int | None = None,
 ) -> torch.Tensor:
     """Q-maximization + BC regularization toward VLA reference.
 
@@ -196,13 +297,40 @@ def actor_loss(
     BC term is the per-sample squared distance summed across action dims, then
     averaged over the batch — matching the paper's β-scaling convention. This
     differs from mean-MSE by a factor of C*D_flat.
+
+    `action_clip_delta` (see project_action_delta) projects `mu` into
+    ref+/-action_clip_delta before querying the critic, so -q.mean()'s
+    gradient reflects the action that actually gets deployed (see
+    RLTActionModifier.compute_chunk, which uses the same projection), not an
+    unconstrained hypothetical one the robot would never execute. BC
+    regularization still regresses the *raw*, pre-projection mu -- it needs
+    an unsaturating gradient to keep pulling a runaway residual back toward
+    ref; regressing the already-bounded projected action would saturate
+    near +/-action_clip_delta and lose that pull-back signal right where
+    it's needed most. None (default) leaves mu unconstrained here, matching
+    prior behavior.
+
+    `smoothness_weight` > 0 adds a penalty on adjacent-timestep differences
+    in the *raw* mu within each chunk (requires `chunk_length` to unflatten
+    it) -- a soft, training-time complement to the runtime slew-rate limiter
+    in RLTActionModifier: discourages the actor's own residual from
+    oscillating step-to-step in the first place, rather than only clipping
+    the symptom after the fact. 0.0 (default) is a no-op.
     """
     x = batch["state_vec"]
     ref = batch["ref_chunk_flat"]
     mu, _ = actor.forward(x, ref, training=True)
-    q = critic.min_q(x, mu)
+    mu_safe = project_action_delta(mu, ref, action_clip_delta)
+    q = critic.min_q(x, mu_safe)
     bc_reg = ((mu - ref) ** 2).sum(dim=-1).mean()
-    return -q.mean() + beta * bc_reg
+    loss = -q.mean() + beta * bc_reg
+    if smoothness_weight > 0:
+        if chunk_length is None:
+            raise ValueError("smoothness_weight > 0 requires chunk_length to unflatten mu")
+        mu_chunk = unflatten_chunk(mu, chunk_length)
+        smoothness = ((mu_chunk[:, 1:, :] - mu_chunk[:, :-1, :]) ** 2).sum(dim=(-1, -2)).mean()
+        loss = loss + smoothness_weight * smoothness
+    return loss
 
 
 def q_action_sensitivity(

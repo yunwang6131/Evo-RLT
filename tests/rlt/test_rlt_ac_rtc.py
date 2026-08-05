@@ -89,6 +89,18 @@ def test_configure_rtc_accepts_vla_rtc_config_and_switches_by_phase() -> None:
     assert policy.vla_seen_configs == [vla_rtc_config, rlt_rtc_config]
 
 
+def test_record_executed_action_delegates_to_modifier() -> None:
+    policy = object.__new__(ChunkACPolicy)
+    recorded: list[torch.Tensor] = []
+    modifier = SimpleNamespace(record_executed_action=lambda action: recorded.append(action))
+    object.__setattr__(policy, "_ensure_modifier", lambda: modifier)
+    action = torch.arange(12, dtype=torch.float32).reshape(1, 12)
+
+    policy.record_executed_action(action)
+
+    assert recorded == [action]
+
+
 def test_prepare_rtc_request_uses_leftover_and_latency() -> None:
     policy = _make_policy()
     old_actions = torch.arange(12, dtype=torch.float32).reshape(4, 3)

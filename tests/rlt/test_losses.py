@@ -14,7 +14,7 @@ from evo_rlt.core.losses import (
 )
 from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.critic import TwinCritic
-from evo_rlt.core.utils import soft_update
+from evo_rlt.core.utils import project_action_delta, soft_update, unflatten_chunk
 
 STATE_DIM = 78
 CHUNK_DIM = 140
@@ -196,6 +196,97 @@ def test_critic_loss_respects_target_q_clip():
     assert unclipped.item() == pytest.approx(2_000_000.0)
 
 
+class TestTargetPolicySmoothing:
+    def test_default_disabled_matches_no_smoothing_exactly(self, actor, critic, target_critic, batch):
+        """target_noise_std defaults to 0.0 -- existing callers that don't
+        pass it must see byte-identical behavior to before this feature."""
+        torch.manual_seed(1)
+        base = critic_loss(critic, target_critic, actor, batch, gamma=0.99, C=C)
+        torch.manual_seed(1)
+        explicit_off = critic_loss(
+            critic, target_critic, actor, batch, gamma=0.99, C=C, target_noise_std=0.0,
+        )
+        assert explicit_off.item() == pytest.approx(base.item())
+
+    def test_nonzero_noise_std_changes_the_target_action(self, actor, critic):
+        """With smoothing enabled, target_critic must be queried at an action
+        that differs from the actor's raw (unperturbed) target action."""
+
+        class _RecordingTargetCritic:
+            def __init__(self):
+                self.seen_actions: list[torch.Tensor] = []
+
+            def min_q(self, state_vec, action_flat):
+                self.seen_actions.append(action_flat.clone())
+                return torch.zeros(state_vec.shape[0], 1)
+
+        batch = {
+            "state_vec": torch.zeros(4, STATE_DIM),
+            "exec_chunk_flat": torch.zeros(4, CHUNK_DIM),
+            "ref_chunk_flat": torch.zeros(4, CHUNK_DIM),
+            "reward_seq": torch.zeros(4, C),
+            "next_state_vec": torch.zeros(4, STATE_DIM),
+            "next_ref_flat": torch.zeros(4, CHUNK_DIM),
+            "done": torch.zeros(4),
+            "actual_steps": torch.full((4,), C),
+        }
+        target_critic = _RecordingTargetCritic()
+        torch.manual_seed(0)
+        with torch.no_grad():
+            raw_mu_next, _ = actor.forward(batch["next_state_vec"], batch["next_ref_flat"])
+            raw_mu_next = raw_mu_next.clamp(-1.0, 1.0)
+
+        torch.manual_seed(0)
+        critic_loss(
+            critic, target_critic, actor, batch, gamma=0.99, C=C,
+            target_noise_std=0.2, target_noise_clip=0.5,
+        )
+        smoothed_action = target_critic.seen_actions[0]
+        assert not torch.allclose(smoothed_action, raw_mu_next)
+        # Still clamped to the valid action range despite the added noise.
+        assert smoothed_action.abs().max().item() <= 1.0 + 1e-5
+
+    def test_noise_respects_action_mask(self, actor, critic):
+        """Masked-out dims (e.g. the frozen arm under actor_rl_arm='left')
+        must not receive smoothing noise -- the actor could never actually
+        produce a perturbed action there (mu is pinned to ref on those dims
+        regardless), so smoothing them would just be pointless extra noise
+        in the TD target."""
+
+        class _RecordingTargetCritic:
+            def __init__(self):
+                self.seen_actions: list[torch.Tensor] = []
+
+            def min_q(self, state_vec, action_flat):
+                self.seen_actions.append(action_flat.clone())
+                return torch.zeros(state_vec.shape[0], 1)
+
+        batch = {
+            "state_vec": torch.zeros(4, STATE_DIM),
+            "exec_chunk_flat": torch.zeros(4, CHUNK_DIM),
+            "ref_chunk_flat": torch.zeros(4, CHUNK_DIM),
+            "reward_seq": torch.zeros(4, C),
+            "next_state_vec": torch.zeros(4, STATE_DIM),
+            "next_ref_flat": torch.zeros(4, CHUNK_DIM),
+            "done": torch.zeros(4),
+            "actual_steps": torch.full((4,), C),
+        }
+        target_critic = _RecordingTargetCritic()
+        mask = torch.cat([torch.ones(CHUNK_DIM // 2), torch.zeros(CHUNK_DIM // 2)])
+
+        with torch.no_grad():
+            raw_mu_next, _ = actor.forward(batch["next_state_vec"], batch["next_ref_flat"])
+            raw_mu_next = raw_mu_next.clamp(-1.0, 1.0)
+
+        critic_loss(
+            critic, target_critic, actor, batch, gamma=0.99, C=C,
+            target_noise_std=0.2, target_noise_clip=0.5, action_mask=mask,
+        )
+        smoothed_action = target_critic.seen_actions[0]
+        second_half = slice(CHUNK_DIM // 2, CHUNK_DIM)
+        assert torch.allclose(smoothed_action[:, second_half], raw_mu_next[:, second_half])
+
+
 class TestRankQRankingLoss:
     def test_zero_when_no_resolved_outcome(self, critic):
         B = 8
@@ -287,6 +378,40 @@ class TestRankQRankingLoss:
             rankq_alpha_success=1.0, rankq_alpha_failure=1.0,
             action_mask=mask,
         )
+        assert torch.isfinite(loss)
+
+    def test_critic_loss_info_breakdown_sums_to_returned_loss(
+        self, actor, critic, target_critic, batch
+    ):
+        """The two components logged via `info` must actually add up to the
+        scalar critic_loss() returns -- otherwise the wandb breakdown would
+        be lying about what's actually being optimized."""
+        batch_with_outcome = dict(batch, outcome=torch.tensor([1.0, 0.0] * 8))
+        info: dict = {}
+        loss = critic_loss(
+            critic, target_critic, actor, batch_with_outcome, gamma=0.99, C=C,
+            rankq_alpha_success=1.0, rankq_alpha_failure=1.0,
+            info=info,
+        )
+        assert set(info.keys()) == {"loss_critic_td", "loss_critic_rankq"}
+        assert (info["loss_critic_td"] + info["loss_critic_rankq"]).item() == pytest.approx(
+            loss.item()
+        )
+
+    def test_critic_loss_info_rankq_is_zero_when_disabled(
+        self, actor, critic, target_critic, batch
+    ):
+        """No outcome / alphas=0 -> loss_critic_rankq must report exactly 0,
+        not just be absent, so the wandb panel reads correctly either way."""
+        info: dict = {}
+        loss = critic_loss(critic, target_critic, actor, batch, gamma=0.99, C=C, info=info)
+        assert info["loss_critic_rankq"].item() == pytest.approx(0.0)
+        assert info["loss_critic_td"].item() == pytest.approx(loss.item())
+
+    def test_critic_loss_info_is_optional(self, actor, critic, target_critic, batch):
+        """Existing callers that don't pass info= must keep working exactly
+        as before (no crash, same returned loss)."""
+        loss = critic_loss(critic, target_critic, actor, batch, gamma=0.99, C=C)
         assert torch.isfinite(loss)
 
 
@@ -384,3 +509,293 @@ class TestQActionSensitivity:
         zero_mask = torch.zeros(CHUNK_DIM)
         sensitivity = q_action_sensitivity(critic, state, action, action_mask=zero_mask)
         assert sensitivity.item() == pytest.approx(0.0, abs=1e-6)
+
+
+class TestProjectActionDelta:
+    def test_none_limit_returns_mu_unchanged(self):
+        mu = torch.tensor([5.0, -3.0, 0.2])
+        ref = torch.tensor([0.1, 0.1, 0.1])
+        assert torch.equal(project_action_delta(mu, ref, None), mu)
+
+    def test_zero_limit_returns_ref_unchanged(self):
+        """limit=0 means zero authority (must equal ref exactly); must not
+        divide by zero."""
+        mu = torch.tensor([5.0, -3.0, 0.2])
+        ref = torch.tensor([0.1, 0.1, 0.1])
+        result = project_action_delta(mu, ref, 0.0)
+        assert torch.equal(result, ref)
+        assert torch.isfinite(result).all()
+
+    def test_small_delta_is_almost_unchanged(self):
+        """Near mu==ref, tanh is ~linear -- a small in-range delta should
+        survive the projection almost exactly, not get squashed."""
+        ref = torch.zeros(5)
+        mu = ref + 0.01
+        result = project_action_delta(mu, ref, limit=0.1)
+        assert torch.allclose(result, mu, atol=1e-3)
+
+    def test_invariant_holds_for_a_huge_raw_delta(self):
+        """However far mu strays from ref, the projected action must stay
+        within `limit` of ref (tanh saturates, never overshoots) -- allowing
+        a hair of float32 rounding at the boundary itself, since tanh of an
+        extreme ratio rounds to exactly 1.0 in float32."""
+        ref = torch.tensor([0.2])
+        mu = torch.tensor([1e6])
+        result = project_action_delta(mu, ref, limit=0.1)
+        assert (result - ref).abs().item() <= 0.1 + 1e-4
+
+    def test_invariant_holds_even_when_ref_itself_exceeds_unit_range(self):
+        """The actual bug this exists to fix: ref regularly exceeds [-1,1]
+        under QUANTILES normalization (confirmed empirically on real
+        recorded data, not a hypothetical). With mu == ref (a perfectly
+        zero-residual actor), the projected action must still land within
+        `limit` of ref -- unlike clamp(mu,-1,1) -> clamp(delta,-l,l) ->
+        clamp(-1,1), which silently blows the bound open whenever ref > 1."""
+        ref = torch.tensor([1.5, -1.8, 2.3])
+        mu = ref.clone()  # zero raw residual
+        result = project_action_delta(mu, ref, limit=0.1)
+        assert (result - ref).abs().max().item() < 0.1
+
+        # Demonstrate the old buggy sequence actually violates the bound in
+        # this exact scenario, so this test would have caught the regression.
+        old_chunk = mu.clamp(-1, 1)
+        old_delta = (old_chunk - ref).clamp(-0.1, 0.1)
+        old_result = (ref + old_delta).clamp(-1, 1)
+        assert (old_result - ref).abs().max().item() > 0.1
+
+    def test_gradient_shrinks_with_saturation_but_stays_nonzero(self):
+        """Unlike a hard clamp (exactly zero gradient once saturated), the
+        tanh projection's gradient should shrink as mu moves further from
+        ref, but stay strictly positive at a moderately saturating (not
+        astronomically large, where float32 underflow would round it to
+        exactly 0) offset -- a saturated actor still receives a shrinking
+        but nonzero pull, unlike the hard-clamp sequence it replaces."""
+        ref = torch.zeros(1)
+
+        mu_near = torch.tensor([0.01], requires_grad=True)
+        project_action_delta(mu_near, ref, limit=0.1).backward()
+        grad_near = mu_near.grad.item()
+
+        mu_far = torch.tensor([0.3], requires_grad=True)
+        project_action_delta(mu_far, ref, limit=0.1).backward()
+        grad_far = mu_far.grad.item()
+
+        assert grad_far > 0.0
+        assert grad_far < grad_near
+
+
+class TestActorLossActionClipDelta:
+    def test_default_none_matches_prior_behavior_exactly(self, actor, critic, batch):
+        torch.manual_seed(0)
+        base = actor_loss(actor, critic, batch, beta=0.3)
+        torch.manual_seed(0)
+        explicit_none = actor_loss(actor, critic, batch, beta=0.3, action_clip_delta=None)
+        assert explicit_none.item() == pytest.approx(base.item())
+
+    def test_critic_is_queried_at_the_projected_action_not_raw_mu(self, actor, batch):
+        """actor_loss must maximize Q at the action that will actually be
+        deployed (ref +/- action_clip_delta), not an unconstrained mu the
+        robot would never execute."""
+
+        class _RecordingCritic:
+            def __init__(self):
+                self.seen_actions: list[torch.Tensor] = []
+
+            def min_q(self, state_vec, action_flat):
+                self.seen_actions.append(action_flat.clone())
+                return torch.zeros(state_vec.shape[0], 1)
+
+        recording_critic = _RecordingCritic()
+        with torch.no_grad():
+            raw_mu, _ = actor.forward(batch["state_vec"], batch["ref_chunk_flat"], training=True)
+
+        actor_loss(actor, recording_critic, batch, beta=0.3, action_clip_delta=0.1)
+        seen = recording_critic.seen_actions[0]
+        assert not torch.allclose(seen, raw_mu)
+        assert (seen - batch["ref_chunk_flat"]).abs().max().item() < 0.1 + 1e-4
+
+    def test_bc_regularization_still_uses_raw_mu(self, actor, batch):
+        """BC must keep pulling the *raw* mu back toward ref (unsaturating
+        gradient) even when action_clip_delta is set -- regressing the
+        already-bounded projected action instead would saturate near the
+        delta limit and lose that pull-back signal."""
+        beta = 1000.0  # dominate the loss so bc_reg's value is recoverable
+        loss = actor_loss(actor, _ZeroQCritic(), batch, beta=beta, action_clip_delta=0.05)
+        with torch.no_grad():
+            mu, _ = actor.forward(batch["state_vec"], batch["ref_chunk_flat"], training=True)
+            expected_bc = ((mu - batch["ref_chunk_flat"]) ** 2).sum(dim=-1).mean()
+        assert loss.item() == pytest.approx((beta * expected_bc).item(), rel=1e-3)
+
+
+class _ZeroQCritic:
+    def min_q(self, state_vec, action_flat):
+        return torch.zeros(state_vec.shape[0], 1)
+
+
+class TestActorLossSmoothness:
+    def test_zero_weight_is_a_no_op(self, actor, critic, batch):
+        torch.manual_seed(0)
+        base = actor_loss(actor, critic, batch, beta=0.3)
+        torch.manual_seed(0)
+        explicit_zero = actor_loss(
+            actor, critic, batch, beta=0.3, smoothness_weight=0.0, chunk_length=C,
+        )
+        assert explicit_zero.item() == pytest.approx(base.item())
+
+    def test_positive_weight_requires_chunk_length(self, actor, critic, batch):
+        with pytest.raises(ValueError, match="chunk_length"):
+            actor_loss(actor, critic, batch, beta=0.3, smoothness_weight=1.0)
+
+    def test_positive_weight_penalizes_adjacent_timestep_jumps(self, actor, batch):
+        """A hand-built actor whose raw mu jumps wildly between adjacent
+        timesteps should get a strictly larger loss under a positive
+        smoothness_weight than under zero, all else equal."""
+        action_dim = CHUNK_DIM // C
+        with torch.no_grad():
+            mu, _ = actor.forward(batch["state_vec"], batch["ref_chunk_flat"], training=True)
+        mu_chunk = unflatten_chunk(mu, C)
+        # Force alternating +/-10 across timesteps: a large, oscillating raw
+        # residual with nothing smooth about it.
+        sign = torch.tensor([1.0 if t % 2 == 0 else -1.0 for t in range(C)])
+        jumpy = (sign.view(1, C, 1) * 10.0).expand(mu_chunk.shape[0], C, action_dim).clone()
+
+        class _FixedOutputActor:
+            def forward(self, state_vec, ref, training=False):
+                flat = jumpy.flatten(start_dim=-2)
+                return flat, torch.zeros_like(flat)
+
+        loss_smooth_off = actor_loss(
+            _FixedOutputActor(), _ZeroQCritic(), batch, beta=0.0,
+            smoothness_weight=0.0, chunk_length=C,
+        )
+        loss_smooth_on = actor_loss(
+            _FixedOutputActor(), _ZeroQCritic(), batch, beta=0.0,
+            smoothness_weight=1.0, chunk_length=C,
+        )
+        assert loss_smooth_on.item() > loss_smooth_off.item()
+
+
+class TestCriticLossActionClipDelta:
+    def test_default_none_matches_prior_behavior_exactly(self, actor, critic, target_critic, batch):
+        torch.manual_seed(0)
+        base = critic_loss(critic, target_critic, actor, batch, gamma=0.99, C=C)
+        torch.manual_seed(0)
+        explicit_none = critic_loss(
+            critic, target_critic, actor, batch, gamma=0.99, C=C, action_clip_delta=None,
+        )
+        assert explicit_none.item() == pytest.approx(base.item())
+
+    def test_target_action_respects_delta_even_when_ref_exceeds_unit_range(self, actor, critic):
+        """Regression test for the exact bug: ref_next regularly exceeds
+        [-1,1] under QUANTILES normalization. mu_next must land within
+        action_clip_delta of ref_next regardless."""
+
+        class _RecordingTargetCritic:
+            def __init__(self):
+                self.seen_actions: list[torch.Tensor] = []
+
+            def min_q(self, state_vec, action_flat):
+                self.seen_actions.append(action_flat.clone())
+                return torch.zeros(state_vec.shape[0], 1)
+
+        B = 4
+        batch = {
+            "state_vec": torch.zeros(B, STATE_DIM),
+            "exec_chunk_flat": torch.zeros(B, CHUNK_DIM),
+            "ref_chunk_flat": torch.zeros(B, CHUNK_DIM),
+            "reward_seq": torch.zeros(B, C),
+            "next_state_vec": torch.zeros(B, STATE_DIM),
+            # Deliberately outside [-1, 1], matching real recorded ref_chunk
+            # statistics (up to ~2.5-3.8 in practice).
+            "next_ref_flat": torch.full((B, CHUNK_DIM), 1.8),
+            "done": torch.zeros(B),
+            "actual_steps": torch.full((B,), C),
+        }
+        target_critic = _RecordingTargetCritic()
+        critic_loss(
+            critic, target_critic, actor, batch, gamma=0.99, C=C, action_clip_delta=0.1,
+        )
+        seen = target_critic.seen_actions[0]
+        assert (seen - batch["next_ref_flat"]).abs().max().item() < 0.1 + 1e-4
+
+    def test_target_noise_cannot_push_action_outside_delta(self, actor, critic):
+        """target_noise_clip (0.3 by convention) can exceed action_clip_delta
+        (0.1) -- the noised mu_next must still be re-projected back inside
+        the deployable neighborhood, not allowed to explore a physically
+        unreachable region."""
+
+        class _RecordingTargetCritic:
+            def __init__(self):
+                self.seen_actions: list[torch.Tensor] = []
+
+            def min_q(self, state_vec, action_flat):
+                self.seen_actions.append(action_flat.clone())
+                return torch.zeros(state_vec.shape[0], 1)
+
+        B = 4
+        batch = {
+            "state_vec": torch.zeros(B, STATE_DIM),
+            "exec_chunk_flat": torch.zeros(B, CHUNK_DIM),
+            "ref_chunk_flat": torch.zeros(B, CHUNK_DIM),
+            "reward_seq": torch.zeros(B, C),
+            "next_state_vec": torch.zeros(B, STATE_DIM),
+            "next_ref_flat": torch.zeros(B, CHUNK_DIM),
+            "done": torch.zeros(B),
+            "actual_steps": torch.full((B,), C),
+        }
+        target_critic = _RecordingTargetCritic()
+        critic_loss(
+            critic, target_critic, actor, batch, gamma=0.99, C=C,
+            target_noise_std=0.5, target_noise_clip=0.3, action_clip_delta=0.1,
+        )
+        seen = target_critic.seen_actions[0]
+        assert (seen - batch["next_ref_flat"]).abs().max().item() < 0.1 + 1e-4
+
+    def test_post_noise_rebound_does_not_compound_shrinkage(self, actor, critic):
+        """Regression test: the post-noise re-bound used to call
+        project_action_delta() a second time. That projection is a smooth
+        *contraction* toward ref (tanh), not a boundary-only clip, so
+        applying it twice pulled the target action noticeably closer to ref
+        than a single projection does (e.g. a raw delta of exactly
+        action_clip_delta lands at ~0.76x of the limit after one call but
+        ~0.64x after two) -- silently biasing the target action away from
+        the one project_action_delta's own docstring promises actor_loss/
+        deployment produce for the same state. With a (numerically) zero
+        smoothing noise, the post-noise re-bound must be a no-op on an
+        already-in-bound action, so the seen action must match the
+        single-projection value exactly, not a further-shrunk one.
+        """
+
+        class _RecordingTargetCritic:
+            def __init__(self):
+                self.seen_actions: list[torch.Tensor] = []
+
+            def min_q(self, state_vec, action_flat):
+                self.seen_actions.append(action_flat.clone())
+                return torch.zeros(state_vec.shape[0], 1)
+
+        action_clip_delta = 0.1
+        B = 4
+        next_state_vec = torch.randn(B, STATE_DIM)
+        next_ref_flat = torch.randn(B, CHUNK_DIM)
+        with torch.no_grad():
+            mu_next, _ = actor.forward(next_state_vec, next_ref_flat)
+            once_projected = project_action_delta(mu_next, next_ref_flat, action_clip_delta)
+
+        batch = {
+            "state_vec": torch.zeros(B, STATE_DIM),
+            "exec_chunk_flat": torch.zeros(B, CHUNK_DIM),
+            "ref_chunk_flat": torch.zeros(B, CHUNK_DIM),
+            "reward_seq": torch.zeros(B, C),
+            "next_state_vec": next_state_vec,
+            "next_ref_flat": next_ref_flat,
+            "done": torch.zeros(B),
+            "actual_steps": torch.full((B,), C),
+        }
+        target_critic = _RecordingTargetCritic()
+        critic_loss(
+            critic, target_critic, actor, batch, gamma=0.99, C=C,
+            target_noise_std=1e-8, target_noise_clip=0.3, action_clip_delta=action_clip_delta,
+        )
+        seen = target_critic.seen_actions[0]
+        assert torch.allclose(seen, once_projected, atol=1e-5)

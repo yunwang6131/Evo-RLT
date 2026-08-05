@@ -227,6 +227,7 @@ class ChunkACPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
         tx = self._coerce_batch(batch)
 
+        critic_loss_breakdown: dict[str, Tensor] = {}
         c_loss = critic_loss(
             self.critic,
             self.target_critic,
@@ -242,6 +243,10 @@ class ChunkACPolicy(PreTrainedPolicy):
             rankq_alpha_success=getattr(self.config, "rankq_alpha_success", 0.0),
             rankq_alpha_failure=getattr(self.config, "rankq_alpha_failure", 0.0),
             action_mask=self.actor.action_mask,
+            target_noise_std=getattr(self.config, "target_noise_std", 0.0),
+            target_noise_clip=getattr(self.config, "target_noise_clip", 0.3),
+            action_clip_delta=getattr(self.config, "actor_action_clip_delta", None),
+            info=critic_loss_breakdown,
         )
         soft_update(self.target_critic, self.critic, self.config.tau)
         self._critic_step += 1
@@ -255,6 +260,7 @@ class ChunkACPolicy(PreTrainedPolicy):
                 "loss_critic": c_loss.detach(),
                 "loss_actor": a_loss.detach(),
                 "critic_step": self._critic_step.detach().clone(),
+                **critic_loss_breakdown,
             }
             return total, info
 
@@ -262,6 +268,7 @@ class ChunkACPolicy(PreTrainedPolicy):
             "loss": c_loss.detach(),
             "loss_critic": c_loss.detach(),
             "critic_step": self._critic_step.detach().clone(),
+            **critic_loss_breakdown,
         }
         return c_loss, info
 
@@ -270,7 +277,15 @@ class ChunkACPolicy(PreTrainedPolicy):
         for p in critic_params:
             p.requires_grad_(False)
         try:
-            return actor_loss(self.actor, self.critic, tx, beta=self.config.beta)
+            return actor_loss(
+                self.actor,
+                self.critic,
+                tx,
+                beta=self.config.beta,
+                action_clip_delta=getattr(self.config, "actor_action_clip_delta", None),
+                smoothness_weight=getattr(self.config, "actor_smoothness_weight", 0.0),
+                chunk_length=self.config.chunk_length,
+            )
         finally:
             for p in critic_params:
                 p.requires_grad_(True)
@@ -293,6 +308,7 @@ class ChunkACPolicy(PreTrainedPolicy):
                 chunk_exec_steps=self.config.chunk_exec_steps,
                 vla_ref=self.vla_ref,
                 action_clip_delta=self.config.actor_action_clip_delta,
+                slew_rate_limit=getattr(self.config, "actor_slew_rate_limit", None),
             )
             self._prefix_capture = PrefixOutputCapture(
                 token_pool_size=self.config.token_pool_size,
@@ -653,6 +669,16 @@ class ChunkACPolicy(PreTrainedPolicy):
         if self.modifier is None:
             return None
         return self.modifier.get_last_chunk_tensors()
+
+    def record_executed_action(self, action: Tensor) -> None:
+        """Forward the action actually dispatched this frame to the modifier.
+
+        The recording loop interacts with the policy wrapper rather than its
+        internal ``RLTActionModifier``.  Ensure the modifier exists here so an
+        intervention on the first frame can still establish the slew-rate
+        continuity reference before policy inference has run.
+        """
+        self._ensure_modifier().record_executed_action(action)
 
     def pop_step_metadata(self):
         if self._rtc_runtime_enabled:

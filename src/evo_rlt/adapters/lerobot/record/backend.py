@@ -296,6 +296,17 @@ class OnlineRLConfig:
     # sim (that alone would be hundreds of robot episodes); this is a much
     # smaller, real-hardware-sized version of the same idea.
     critic_only_episodes: int = 10
+    # When critic_only_episodes elapses, actor_update_interval used to snap
+    # straight from frozen (10**9, i.e. never) to online_actor_update_interval
+    # in one step -- letting the actor immediately chase, at full lr_actor/
+    # utd_ratio, a critic that has only just started forming a non-random
+    # value estimate (still its noisiest, most overestimation-prone state).
+    # That hard flip is a direct contributor to actor jitter right when
+    # critic_only turns off. Instead, ramp actor_update_interval down to
+    # online_actor_update_interval over this many additional episodes (see
+    # OnlineRLTrainer._actor_update_interval_for). 0 reproduces the exact old
+    # hard-flip behavior.
+    actor_unfreeze_ramp_episodes: int = 10
     replay_capacity: int = 20_000
     batch_size: int = 256
     # Terminal reward on a successful critical-phase attempt (failure is

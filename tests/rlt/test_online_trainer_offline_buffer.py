@@ -246,6 +246,52 @@ class TestRewardSchemaConsistency:
         assert replay is not None
 
 
+class TestActorUnfreezeRamp:
+    """OnlineRLTrainer._actor_update_interval_for: actor_update_interval
+    should stay frozen through critic_only, then ramp down to
+    online_actor_update_interval over actor_unfreeze_ramp_episodes episodes
+    instead of snapping straight to it (see OnlineRLConfig.
+    actor_unfreeze_ramp_episodes for why the hard flip this replaces caused
+    actor jitter)."""
+
+    def _trainer(self, *, online_actor_update_interval: int, ramp_episodes: int) -> OnlineRLTrainer:
+        trainer = object.__new__(OnlineRLTrainer)
+        trainer.cfg = SimpleNamespace(actor_unfreeze_ramp_episodes=ramp_episodes)
+        trainer.online_actor_update_interval = online_actor_update_interval
+        return trainer
+
+    def test_still_critic_only_is_frozen(self):
+        trainer = self._trainer(online_actor_update_interval=2, ramp_episodes=10)
+        assert trainer._actor_update_interval_for(recorded_episodes=5, critic_only_until=10) == 10**9
+
+    def test_first_episode_of_ramp_is_the_widest_interval(self):
+        trainer = self._trainer(online_actor_update_interval=2, ramp_episodes=10)
+        # episodes_since_unfreeze=0 -> multiplier=ramp_episodes=10
+        assert trainer._actor_update_interval_for(recorded_episodes=10, critic_only_until=10) == 20
+
+    def test_mid_ramp_is_between_start_and_target(self):
+        trainer = self._trainer(online_actor_update_interval=2, ramp_episodes=10)
+        # episodes_since_unfreeze=5 -> multiplier=5
+        assert trainer._actor_update_interval_for(recorded_episodes=15, critic_only_until=10) == 10
+
+    def test_last_ramp_episode_already_hits_target(self):
+        trainer = self._trainer(online_actor_update_interval=2, ramp_episodes=10)
+        # episodes_since_unfreeze=9 -> multiplier=1 -> exactly the target, no
+        # discontinuity at the boundary with the post-ramp branch below.
+        assert trainer._actor_update_interval_for(recorded_episodes=19, critic_only_until=10) == 2
+
+    def test_past_ramp_window_stays_at_target(self):
+        trainer = self._trainer(online_actor_update_interval=2, ramp_episodes=10)
+        assert trainer._actor_update_interval_for(recorded_episodes=20, critic_only_until=10) == 2
+        assert trainer._actor_update_interval_for(recorded_episodes=100, critic_only_until=10) == 2
+
+    def test_zero_ramp_episodes_reproduces_old_hard_flip(self):
+        trainer = self._trainer(online_actor_update_interval=2, ramp_episodes=0)
+        assert trainer._actor_update_interval_for(recorded_episodes=9, critic_only_until=10) == 10**9
+        assert trainer._actor_update_interval_for(recorded_episodes=10, critic_only_until=10) == 2
+        assert trainer._actor_update_interval_for(recorded_episodes=50, critic_only_until=10) == 2
+
+
 def test_episode_reward_sums_milestone_and_terminal_chunks():
     trainer = object.__new__(OnlineRLTrainer)
     trainer.replay_buffer = ReplayBuffer(capacity=10)

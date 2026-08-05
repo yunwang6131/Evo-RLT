@@ -34,6 +34,7 @@ from lerobot.processor import (
     RobotAction,
     RobotObservation,
     RobotProcessorPipeline,
+    UnnormalizerProcessorStep,
 )
 from lerobot.robots import Robot
 from evo_rlt.adapters.lerobot.record.hil import (
@@ -99,6 +100,29 @@ def _merge_right_teleop_action(
     mixed_action = dict(policy_action)
     mixed_action.update({key: value for key, value in teleop_action.items() if key.startswith("right_")})
     return mixed_action
+
+
+def _find_action_unnormalizer(
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None,
+) -> UnnormalizerProcessorStep | None:
+    """Locate the postprocessor's UnnormalizerProcessorStep (normalized model
+    output -> physical robot units), so its exact inverse (physical -> the
+    same QUANTILES-normalized space offline caches and ref_chunk use) can be
+    applied to the action actually sent to the robot before it's recorded
+    into the online replay buffer.
+
+    Using this step's own stats (rather than re-deriving normalization
+    elsewhere) guarantees the round trip is exact: whatever stats un-
+    normalized policy_action into action_values is exactly what re-
+    normalizes action_values back, with no risk of drifting from a second,
+    independently-loaded copy of the same stats.
+    """
+    if postprocessor is None:
+        return None
+    for step in postprocessor.steps:
+        if isinstance(step, UnnormalizerProcessorStep):
+            return step
+    return None
 
 
 def _blend_robot_actions(
@@ -319,6 +343,25 @@ def record_loop(
     release_blend_start_t: float | None = None
     release_blend_start_action: RobotAction | None = None
     teleop_fallback_warned = False
+
+    # Physical robot units -> the same QUANTILES-normalized space offline
+    # caches and ref_chunk use, so RLTOnlineCollector's exec_chunk lands in
+    # the same coordinate system as ref_chunk and the offline buffer (see
+    # _find_action_unnormalizer's docstring). Looked up once here, not per
+    # frame -- postprocessor.steps doesn't change during a recording run.
+    _action_unnormalizer = _find_action_unnormalizer(postprocessor)
+
+    def _normalize_executed_action(action_tensor: torch.Tensor) -> torch.Tensor:
+        if _action_unnormalizer is None:
+            raise RuntimeError(
+                "rlt_online_collector is active but the policy's postprocessor has no "
+                "UnnormalizerProcessorStep -- without it, the online replay buffer's "
+                "exec_chunk would be recorded in physical robot units while ref_chunk "
+                "and the offline cache stay in normalized [-1,1] space, corrupting "
+                "critic training on a per-batch mix of two different action scales. "
+                "Refusing to record rather than silently reintroducing that bug."
+            )
+        return _action_unnormalizer._normalize_action(action_tensor, inverse=False)
 
     teleop_arm_for_mode_switch: Any | None = None
     if isinstance(teleop, Teleoperator):
@@ -933,25 +976,35 @@ def record_loop(
             rlt_phase = PHASE_CRITICAL if rl_phase_started else PHASE_PREFIX
         else:
             rlt_phase = rlt_meta.phase if rlt_meta is not None else prev_phase
-        # Right-arm-only intervention is never RL-controlled (rl_action_arms=
-        # left masks it to the frozen VLA reference regardless), so it must
-        # NOT be recorded as SOURCE_HUMAN here -- that flows straight into
-        # RLTOnlineCollector's dominant_source/ChunkTransition.intervention
-        # tagging, and marking it human would (a) wrongly exclude the whole
-        # episode from _autonomous_success_metrics()'s autonomous_* stats
-        # even though the left arm was fully autonomous, and (b) overwrite
-        # ref_chunk with the human-puppeteered right-arm position for no
-        # benefit, since the mask forces mu=ref on those dims either way.
-        # is_intervention itself stays True for this state (still needed for
-        # the takeover/release blend, which is a physical smoothness concern,
-        # not an RL-bookkeeping one) -- only the *source* recorded here is
-        # scoped down. complementary_info.is_intervention/.state (written a
-        # few lines below from is_intervention/intervention_state directly)
-        # are intentionally left untouched, so the raw dataset still shows
-        # the true right-arm-active state for anyone reviewing footage.
+        # Right-arm-only intervention is never RL-controlled under
+        # actor_rl_arm="left" (rl_action_arms=left masks it to the frozen VLA
+        # reference regardless), so in that case it must NOT be recorded as
+        # SOURCE_HUMAN here -- that flows straight into RLTOnlineCollector's
+        # dominant_source/ChunkTransition.intervention tagging, and marking
+        # it human would (a) wrongly exclude the whole episode from
+        # _autonomous_success_metrics()'s autonomous_* stats even though the
+        # left arm was fully autonomous, and (b) overwrite ref_chunk with the
+        # human-puppeteered right-arm position for no benefit, since the mask
+        # forces mu=ref on those dims either way. Under actor_rl_arm="both"
+        # neither justification holds -- the right arm is genuinely
+        # RL-controlled, so a right-arm-only takeover is a real intervention
+        # and must be tagged SOURCE_HUMAN like any other, hence the
+        # actor_rl_arm=="left" gate below.
+        # is_intervention itself stays True for this state regardless (still
+        # needed for the takeover/release blend, which is a physical
+        # smoothness concern, not an RL-bookkeeping one) -- only the *source*
+        # recorded here is scoped down, and only under "left".
+        # complementary_info.is_intervention/.state (written a few lines
+        # below from is_intervention/intervention_state directly) are
+        # intentionally left untouched either way, so the raw dataset always
+        # shows the true right-arm-active state for anyone reviewing footage.
+        actor_rl_arm = getattr(getattr(policy, "config", None), "actor_rl_arm", None)
+        right_arm_exempt_from_rl = (
+            intervention_state == INTERVENTION_STATE_RIGHT_ACTIVE and actor_rl_arm == "left"
+        )
         rlt_source = (
             SOURCE_HUMAN
-            if is_intervention and intervention_state != INTERVENTION_STATE_RIGHT_ACTIVE
+            if is_intervention and not right_arm_exempt_from_rl
             else (rlt_meta.source_type if rlt_meta else SOURCE_VLA)
         )
         rlt_is_critical = float(rlt_phase == PHASE_CRITICAL)
@@ -983,7 +1036,25 @@ def record_loop(
                 _write_recovery_row(frame)
 
         if rlt_online_collector is not None:
-            action_tensor = build_action_tensor(action_values)
+            # action_values is post-postprocessor (physical robot units, e.g.
+            # joint degrees); normalize back to the QUANTILES [-1,1] space
+            # ref_chunk and the offline cache use, so exec_chunk isn't
+            # recorded on a different scale than everything else the critic
+            # trains on (see _normalize_executed_action/_find_action_
+            # unnormalizer above).
+            action_tensor = _normalize_executed_action(build_action_tensor(action_values))
+            if rlt is not None:
+                # Authoritative "what actually got sent this frame", covering
+                # the case pop_action() can't: during human intervention,
+                # policy inference (and therefore pop_action()) never runs at
+                # all, so without this the slew-rate limiter would resume
+                # RL/VLA control against a stale pre-intervention position
+                # instead of wherever the human actually left the arm. Safe
+                # to call on every frame, not just intervention ones -- on a
+                # normal policy-driven frame this just re-confirms what
+                # pop_action() already recorded a few lines above (inside
+                # act_processed_policy's computation).
+                rlt.record_executed_action(action_tensor)
             # Peek (non-consuming): the most recent real VLA/RL-token encoding,
             # possibly several frames old if human intervention is active (policy
             # inference -- and therefore compute_chunk() -- is skipped while

@@ -51,6 +51,37 @@ def unflatten_chunk(flat: torch.Tensor, chunk_length: int) -> torch.Tensor:
     return flat.view(B, chunk_length, action_dim)
 
 
+def project_action_delta(
+    mu: torch.Tensor, ref: torch.Tensor, limit: float | None,
+) -> torch.Tensor:
+    """Differentiable projection of `mu` onto `{a : |a - ref| < limit}`.
+
+    `ref + limit * tanh((mu - ref) / limit)` guarantees the output is within
+    `limit` of `ref` for *any* finite `mu`, including when `ref` itself lies
+    outside [-1, 1] (a real, common occurrence under QUANTILES normalization
+    -- not a rare edge case). This is the invariant that matters for a
+    residual-to-ref actor under a deployment delta bound; a hard
+    `clamp(mu, -1, 1)` followed by `clamp(chunk - ref, -limit, limit)`
+    followed by another `clamp(-1, 1)` does NOT guarantee it; whenever `ref`
+    itself exceeds [-1, 1], that last clamp can pull the result back toward
+    +/-1 and away from `ref` by however far `ref` overshot, silently blowing
+    the delta bound open by multiples of `limit`. Smooth and non-zero
+    gradient everywhere (unlike the hard-clamp sequence), so a saturated
+    actor still gets a shrinking-but-nonzero gradient instead of an abrupt
+    zero -- used identically at training time (actor_loss/critic_loss) and
+    at deployment (RLTActionModifier.compute_chunk) so the action Q is
+    trained/bootstrapped against is the same one that ever gets executed.
+
+    `limit=None` returns `mu` unchanged (no constraint configured).
+    `limit<=0` returns `ref` unchanged (zero authority -- avoids a
+    division by zero for the degenerate limit=0 case).
+    """
+    if limit is None:
+        return mu
+    if limit <= 0:
+        return ref
+    return ref + limit * torch.tanh((mu - ref) / limit)
+
 
 def compute_discount_vector(gamma: float, length: int, device: torch.device | None = None) -> torch.Tensor:
     """Return [1, gamma, gamma^2, ..., gamma^(length-1)]."""

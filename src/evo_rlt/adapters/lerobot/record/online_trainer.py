@@ -359,6 +359,11 @@ class OnlineRLTrainer:
                 "rankq_alpha_success": getattr(policy_cfg, "rankq_alpha_success", None),
                 "rankq_alpha_failure": getattr(policy_cfg, "rankq_alpha_failure", None),
                 "rankq_noise_scale": getattr(policy_cfg, "rankq_noise_scale", None),
+                "target_noise_std": getattr(policy_cfg, "target_noise_std", None),
+                "target_noise_clip": getattr(policy_cfg, "target_noise_clip", None),
+                "actor_action_clip_delta": getattr(policy_cfg, "actor_action_clip_delta", None),
+                "actor_slew_rate_limit": getattr(policy_cfg, "actor_slew_rate_limit", None),
+                "actor_smoothness_weight": getattr(policy_cfg, "actor_smoothness_weight", None),
             },
             settings=wandb.Settings(save_code=False),
         )
@@ -486,6 +491,27 @@ class OnlineRLTrainer:
         )
         return True
 
+    def _actor_update_interval_for(self, recorded_episodes: int, critic_only_until: int) -> int:
+        """actor_update_interval for this update cycle: still frozen (10**9)
+        before critic_only_until, then ramped down to
+        online_actor_update_interval over cfg.actor_unfreeze_ramp_episodes
+        episodes instead of snapping straight to it -- see
+        OnlineRLConfig.actor_unfreeze_ramp_episodes for why the hard flip
+        this replaces is a direct contributor to actor jitter. The interval
+        decreases by one online_actor_update_interval-sized step per
+        episode, reaching the target exactly at the end of the ramp (no
+        discontinuity at the boundary). ramp_episodes <= 0 reproduces the
+        exact old hard-flip behavior.
+        """
+        if recorded_episodes < critic_only_until:
+            return 10**9
+        episodes_since_unfreeze = recorded_episodes - critic_only_until
+        ramp_episodes = self.cfg.actor_unfreeze_ramp_episodes
+        if ramp_episodes > 0 and episodes_since_unfreeze < ramp_episodes:
+            multiplier = ramp_episodes - episodes_since_unfreeze
+            return self.online_actor_update_interval * multiplier
+        return self.online_actor_update_interval
+
     def maybe_update(self, recorded_episodes: int, buffer_total_added_before: int) -> dict | None:
         """Run gradient steps scaled to how much data this cycle actually
         added, in place on `policy` -- the very next rollout episode uses
@@ -543,9 +569,15 @@ class OnlineRLTrainer:
         # would already be in the past, skipping critic-only entirely.
         assert self.warmup_completed_at_episode is not None
         critic_only_until = self.warmup_completed_at_episode + self.cfg.critic_only_episodes
-        self.policy_cfg.actor_update_interval = (
-            10**9 if recorded_episodes < critic_only_until else self.online_actor_update_interval
+        # Captured separately from self.policy_cfg.actor_update_interval because
+        # the finally block below restores that attribute to
+        # online_actor_update_interval before this cycle's stats get logged --
+        # without this local, online_rl/actor_update_interval would always
+        # report the post-ramp target instead of what this cycle actually used.
+        actor_update_interval_this_cycle = self._actor_update_interval_for(
+            recorded_episodes, critic_only_until
         )
+        self.policy_cfg.actor_update_interval = actor_update_interval_this_cycle
         # See the comment at online_tau's definition: disable forward()'s
         # own (mistimed) soft update for the duration of this call, then
         # do it correctly ourselves after each real critic.step() below.
@@ -670,6 +702,7 @@ class OnlineRLTrainer:
             {
                 "online_rl/warmup_satisfied": 1,
                 "online_rl/critic_only": float(recorded_episodes < critic_only_until),
+                "online_rl/actor_update_interval": actor_update_interval_this_cycle,
                 "online_rl/new_transitions": new_transitions,
                 "online_rl/actual_updates": num_updates,
                 "online_rl/effective_utd": (num_updates / new_transitions) if new_transitions > 0 else 0.0,

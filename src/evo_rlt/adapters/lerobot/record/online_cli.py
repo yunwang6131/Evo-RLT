@@ -93,6 +93,9 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--policy.rankq_alpha_success={args.rankq_alpha_success}",
         f"--policy.rankq_alpha_failure={args.rankq_alpha_failure}",
         f"--policy.rankq_noise_scale={args.rankq_noise_scale}",
+        f"--policy.target_noise_std={args.target_noise_std}",
+        f"--policy.target_noise_clip={args.target_noise_clip}",
+        f"--policy.actor_smoothness_weight={args.actor_smoothness_weight}",
         "--policy.device=cuda",
         *build_dataset_argv(
             dataset_name=paths.dataset_name,
@@ -143,6 +146,7 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         "--online_rl.enable=true",
         f"--online_rl.warmup_episodes={args.warmup_episodes}",
         f"--online_rl.critic_only_episodes={args.critic_only_episodes}",
+        f"--online_rl.actor_unfreeze_ramp_episodes={args.actor_unfreeze_ramp_episodes}",
         f"--online_rl.min_warmup_transitions={args.min_warmup_transitions}",
         f"--online_rl.min_warmup_successes={args.min_warmup_successes}",
         f"--online_rl.min_warmup_failures={args.min_warmup_failures}",
@@ -165,6 +169,8 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
     ]
     if args.actor_action_clip_delta is not None:
         argv.append(f"--policy.actor_action_clip_delta={args.actor_action_clip_delta}")
+    if args.actor_slew_rate_limit is not None:
+        argv.append(f"--policy.actor_slew_rate_limit={args.actor_slew_rate_limit}")
     if args.offline_cache_path is not None:
         argv.append(f"--online_rl.offline_cache_path={args.offline_cache_path}")
     if args.go_home_positions is not None:
@@ -196,7 +202,8 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
     print(
         f"RL: warmup_episodes={args.warmup_episodes} (+min_transitions={args.min_warmup_transitions} "
         f"min_successes={args.min_warmup_successes} min_failures={args.min_warmup_failures}) "
-        f"critic_only_episodes={args.critic_only_episodes} batch_size={args.batch_size} "
+        f"critic_only_episodes={args.critic_only_episodes} "
+        f"actor_unfreeze_ramp_episodes={args.actor_unfreeze_ramp_episodes} batch_size={args.batch_size} "
         f"lr_actor={args.lr_actor} lr_critic={args.lr_critic} utd_ratio={args.utd_ratio} "
         f"max_updates_per_episode={args.max_updates_per_episode} "
         f"stratified_sampling={args.stratified_sampling} save_every={args.save_every_episodes}"
@@ -212,8 +219,17 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
         f"noise_scale={args.rankq_noise_scale}"
     )
     print(
-        f"Safety: actor_action_clip_delta={args.actor_action_clip_delta}; "
+        f"Target policy smoothing: noise_std={args.target_noise_std} noise_clip={args.target_noise_clip}"
+        + (" (disabled)" if args.target_noise_std <= 0 else "")
+    )
+    print(
+        f"Safety: actor_action_clip_delta={args.actor_action_clip_delta} "
+        f"slew_rate_limit={args.actor_slew_rate_limit}; "
         "stay near the leader arm / physical power cutoff"
+    )
+    print(
+        f"Actor smoothness_weight={args.actor_smoothness_weight}"
+        + (" (disabled)" if args.actor_smoothness_weight <= 0 else "")
     )
     print(
         f"Controls: {args.rlt_toggle_key}=start/end critical-phase attempt as success, "
@@ -440,13 +456,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Std of the Gaussian perturbation RankQ uses to build 'noisy'/'very-noisy' "
         "negative actions from the executed action.",
     )
+    parser.add_argument(
+        "--target-noise-std", type=float, default=0.1,
+        help="TD3-style target policy smoothing: std of clipped noise added to the target "
+        "actor's action before evaluating target_critic on it, so the critic can't fit an "
+        "arbitrarily sharp function right at one exact action (a known source of the actor "
+        "chasing local Q noise into jittery real-robot output). 0 disables it.",
+    )
+    parser.add_argument(
+        "--target-noise-clip", type=float, default=0.3,
+        help="Clip range for --target-noise-std's injected noise.",
+    )
 
     # Safety.
     parser.add_argument(
         "--actor-action-clip-delta", type=float, default=0.1,
-        help="Clamp the RL actor's per-step output deviation from the VLA reference "
-        "chunk during critical phase. Set to a large value or handle with care if "
-        "disabling; there is no hardware E-stop.",
+        help="Bound the RL actor's per-step output deviation from the VLA reference "
+        "chunk during critical phase to within this value (see project_action_delta -- "
+        "a smooth ref+limit*tanh(...) projection, not a plain clamp, so the bound holds "
+        "exactly even when the reference itself lies outside [-1,1]). Applied identically "
+        "at deploy time and in actor_loss/critic_loss's target computation during "
+        "training. Set to a large value or handle with care if disabling; there is no "
+        "hardware E-stop.",
+    )
+    parser.add_argument(
+        "--actor-slew-rate-limit", type=float, default=None,
+        help="Cap how much the RL actor's executed action may change from one physical "
+        "timestep to the next (see RLTActionModifier._apply_slew_rate_limit), "
+        "independent of --actor-action-clip-delta -- that bound only limits how far an "
+        "action sits from its own reference, not how much it can change frame-to-frame, "
+        "so adjacent frames could otherwise swing from one end of the delta bound to the "
+        "other. None (default) disables it.",
+    )
+    parser.add_argument(
+        "--actor-smoothness-weight", type=float, default=0.0,
+        help="Training-time complement to --actor-slew-rate-limit: weight on a penalty "
+        "for adjacent-timestep differences in the actor's raw output within a chunk (see "
+        "losses.actor_loss), discouraging oscillation in the residual itself rather than "
+        "only clipping it at deploy time. 0.0 (default) disables it.",
     )
 
     # Online RL loop.
@@ -456,6 +503,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Episodes after warmup where only the critic updates (actor frozen at its "
         "zero-init-residual, VLA-equivalent behavior) so the critic isn't acting on a "
         "random value estimate when the actor starts moving.",
+    )
+    parser.add_argument(
+        "--actor-unfreeze-ramp-episodes", type=int, default=10,
+        help="Instead of snapping actor_update_interval straight from frozen to its "
+        "configured value the instant --critic-only-episodes elapses, ramp it there over "
+        "this many additional episodes. A hard flip lets the actor immediately chase, at "
+        "full lr_actor/utd_ratio, a critic that has only just started forming a "
+        "non-random value estimate -- a direct contributor to actor jitter right when "
+        "critic-only ends. 0 reproduces the old hard-flip behavior.",
     )
     parser.add_argument(
         "--min-warmup-transitions", type=int, default=1000,
@@ -543,10 +599,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--go-home-positions",
         default=(
-            '{"left_shoulder_pan.pos": 2054, "left_shoulder_lift.pos": 2099, '
-            '"left_elbow_flex.pos": 3041, "left_wrist_flex.pos": 1448, "left_gripper.pos": 1789, '
-            '"right_shoulder_pan.pos": 2095, "right_shoulder_lift.pos": 2132, '
-            '"right_elbow_flex.pos": 2984, "right_wrist_flex.pos": 1428, "right_gripper.pos": 1991}'
+            '{"left_shoulder_pan.pos": 2038, "left_shoulder_lift.pos": 2081, '
+            '"left_elbow_flex.pos": 3034, "left_wrist_flex.pos": 1142, "left_gripper.pos": 2164, '
+            '"right_shoulder_pan.pos": 2066, "right_shoulder_lift.pos": 2160, '
+            '"right_elbow_flex.pos": 2880, "right_wrist_flex.pos": 1066, "right_gripper.pos": 2209}'
         ),
         help="Per-joint go-home targets as raw motor ticks, as a JSON object -- paste the "
         "POS column straight from lerobot-calibrate's \"recording positions\" screen, no "
