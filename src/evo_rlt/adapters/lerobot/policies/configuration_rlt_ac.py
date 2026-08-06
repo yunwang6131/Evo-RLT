@@ -66,21 +66,14 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     # disables the bound everywhere (existing pre-fix behavior: mu only ever
     # clamped to [-1,1], independent of ref).
     actor_action_clip_delta: float | None = None
-    # Optional runtime slew-rate limit: caps how much the actor's *executed*
-    # action may change from one physical timestep to the next (see
-    # RLTActionModifier._apply_slew_rate_limit), independent of and in
-    # addition to actor_action_clip_delta above -- the delta bound only
-    # limits how far an action sits from its own reference, not how much it
-    # can change from the immediately preceding frame, so adjacent frames
-    # could otherwise swing from -actor_action_clip_delta to
-    # +actor_action_clip_delta with nothing to stop them. None disables it
-    # (existing behavior).
+    # Optional runtime slew-rate limit on the actor residual (action - VLA
+    # reference).  The VLA trajectory itself remains untouched; only how fast
+    # the learned contribution may change is bounded.  None disables it.
     actor_slew_rate_limit: float | None = None
     # Optional training-time complement to actor_slew_rate_limit: penalizes
-    # squared differences between adjacent-timestep raw mu within a chunk
-    # (see losses.actor_loss), discouraging the actor's own residual from
-    # oscillating step-to-step in the first place rather than only clipping
-    # the symptom at deploy time. 0.0 (default) is a no-op.
+    # squared differences between adjacent actor residuals within a chunk
+    # (see losses.actor_loss), discouraging oscillation before runtime
+    # limiting is needed. 0.0 (default) is a no-op.
     actor_smoothness_weight: float = 0.0
 
     # --- Critic + target ---
@@ -97,13 +90,18 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     # --- TD3+BC hyperparams ---
     gamma: float = 0.99
     beta: float = 0.3
+    # Dedicated coefficient for trusted successful demonstrations (offline
+    # demos and online human corrections). Kept separate from beta, which
+    # anchors non-demonstrated elements to VLA, so known-correct supervision
+    # cannot be weakened merely to allow more Q-driven policy improvement.
+    actor_demo_bc_weight: float = 1.0
     tau: float = 0.005
     utd_ratio: int = 5
     actor_update_interval: int = 2
     target_q_clip: float = 100.0
 
     # --- RankQ self-supervised ranking loss (Choi & Xu, 2026) ---
-    # Augments the critic TD loss with a pairwise softplus ranking term over
+    # Augments the critic TD loss with a pairwise ranking term over
     # noisy/very-noisy/random/permuted variants of each executed action, so
     # Q-gradients w.r.t. action point toward higher-quality behavior instead
     # of just being clamped. Applied only where the sampled batch carries a
@@ -117,6 +115,11 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     rankq_alpha_success: float = 1.0
     rankq_alpha_failure: float = 1.0
     rankq_noise_scale: float = 0.15
+    # Positive values use a hard hinge and stop pushing once the ordered Q
+    # pair is separated by this amount.  This prevents the unbounded scale
+    # growth possible with softplus on separable ranking pairs.  Zero retains
+    # the original paper-style softplus for compatibility.
+    rankq_margin: float = 0.1
 
     # TD3-style target policy smoothing: clipped noise added to the target
     # actor's action before evaluating target_critic on it, so the critic
@@ -180,6 +183,10 @@ class ChunkACPolicyConfig(PreTrainedConfig):
             raise ValueError("actor_slew_rate_limit must be >= 0 when set")
         if self.actor_smoothness_weight < 0:
             raise ValueError("actor_smoothness_weight must be >= 0")
+        if self.actor_demo_bc_weight < 0:
+            raise ValueError("actor_demo_bc_weight must be >= 0")
+        if self.rankq_margin < 0:
+            raise ValueError("rankq_margin must be >= 0")
 
     @property
     def type(self) -> str:

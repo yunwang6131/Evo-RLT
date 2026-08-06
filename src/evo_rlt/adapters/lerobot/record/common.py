@@ -50,6 +50,65 @@ FOLLOWER_ID_SINGLE = "so_follower"
 TELEOP_ID_SINGLE = "so_leader"
 
 
+def install_safe_follower_torque_enable(robot: Any) -> None:
+    """Make follower torque-enable hold the measured pose, not a stale goal.
+
+    STS3215 ``Goal_Position`` is RAM-backed and can read as zero after a
+    power cycle while the arm is physically near the middle of its range.
+    LeRobot's SOFollower.configure() enables torque before the first normal
+    action is sent.  If that stale zero remains, all joints immediately try
+    to chase it; the resulting inrush can trip the servo's input-voltage or
+    overload protection while ``enable_torque()`` is writing the following
+    ``Lock=1`` register.
+
+    Wrap each follower bus instance so every future disabled->enabled
+    transition first copies raw Present_Position to raw Goal_Position and
+    verifies the write.  This is installed before connect/configure, and is
+    deliberately follower-only: leader arms remain torque-disabled.
+    """
+
+    arms = [
+        arm
+        for arm in (getattr(robot, "left_arm", None), getattr(robot, "right_arm", None))
+        if arm is not None
+    ]
+    if not arms and hasattr(robot, "bus"):
+        arms = [robot]
+
+    for arm in arms:
+        bus = getattr(arm, "bus", None)
+        if bus is None or getattr(bus, "_evo_rlt_safe_torque_enable", False):
+            continue
+        original_enable_torque = bus.enable_torque
+
+        def safe_enable_torque(
+            motors=None,
+            num_retry: int = 0,
+            *,
+            _bus=bus,
+            _original=original_enable_torque,
+        ) -> None:
+            present = _bus.sync_read(
+                "Present_Position", motors=motors, normalize=False, num_retry=num_retry
+            )
+            _bus.sync_write(
+                "Goal_Position", present, normalize=False, num_retry=num_retry
+            )
+            written = _bus.sync_read(
+                "Goal_Position", motors=motors, normalize=False, num_retry=num_retry
+            )
+            if written != present:
+                raise RuntimeError(
+                    "Refusing to enable follower torque: failed to synchronize "
+                    f"Goal_Position to Present_Position (present={present}, goal={written})"
+                )
+            log.info("Primed follower Goal_Position from Present_Position before torque enable")
+            _original(motors, num_retry=num_retry)
+
+        bus.enable_torque = safe_enable_torque
+        bus._evo_rlt_safe_torque_enable = True
+
+
 @dataclass(frozen=True)
 class RobotSetup:
     setup: dict[str, Any]
@@ -356,6 +415,7 @@ def preflight_motor_connections(
                 right_arm_config=SOFollowerConfig(port=followers[1]["port"], use_degrees=True),
             )
         )
+    install_safe_follower_torque_enable(robot)
     try:
         robot.connect(calibrate=True)
         log.info("Preflight follower motor check passed")

@@ -275,7 +275,7 @@ def _compose_exec_chunk(
     ref_chunk: Tensor,
     rl_action_arms: str,
 ) -> Tensor:
-    """Project demonstrations onto the action support used during deployment."""
+    """Keep the action that was truly demonstrated and received the label."""
     if demonstrated_chunk.shape != ref_chunk.shape:
         raise ValueError(
             f"Demonstrated action shape {tuple(demonstrated_chunk.shape)} does not match "
@@ -290,6 +290,33 @@ def _compose_exec_chunk(
     elif rl_action_arms != "both":
         raise ValueError(f"Unknown rl_action_arms={rl_action_arms!r}")
     return exec_chunk
+
+
+def _demonstration_supervision_mask(
+    exec_chunk: Tensor,
+    rl_action_arms: str,
+    episode_success: bool,
+) -> Tensor:
+    """Mark successful demonstrated action dimensions for direct Actor BC.
+
+    ``intervention_mask`` is also used as the per-element Actor-supervision
+    mask by ``actor_loss``.  Offline demonstrations are not online human
+    interventions (their scalar ``intervention`` remains zero), but a
+    successful demonstration is still a trusted action target.  Only mark
+    dimensions the residual Actor is allowed to control.
+    """
+    mask = torch.zeros_like(exec_chunk)
+    if not episode_success:
+        return mask
+    if rl_action_arms == "both":
+        return torch.ones_like(exec_chunk)
+    if rl_action_arms == "left":
+        action_dim = exec_chunk.shape[-1]
+        if action_dim % 2 != 0:
+            raise ValueError("--rl-action-arms=left requires an even action_dim")
+        mask[..., : action_dim // 2] = 1
+        return mask
+    raise ValueError(f"Unknown rl_action_arms={rl_action_arms!r}")
 
 
 def _encode_episode(
@@ -355,8 +382,9 @@ def _encode_episode(
         state_vec = torch.cat([z.detach().to("cpu"), proprio], dim=-1)
         ref_chunk = vla_chunk[:, :chunk_length, :action_dim].detach().to("cpu")
         demonstrated_chunk = pre["action"][:, :chunk_length, :action_dim].detach().to("cpu")
-        # Online deployment only gives the actor authority over the selected
-        # arm(s). Project demos onto that same action support.
+        # Preserve the behavior action that actually produced the recorded
+        # outcome. Fabricating a clipped action here while retaining the
+        # original success label would teach the critic a false transition.
         exec_chunk = _compose_exec_chunk(demonstrated_chunk, ref_chunk, rl_action_arms)
         state_vecs.append(state_vec)
         ref_chunks.append(ref_chunk)
@@ -435,6 +463,13 @@ def _encode_episode(
                 "episode_id": torch.tensor(ep_id, dtype=torch.int64),
                 "is_critical": torch.tensor(1.0),
                 "outcome": torch.tensor(float(episode_success)),
+                # Offline demos are not online interventions, so the scalar
+                # intervention flag above stays zero.  This per-element mask
+                # separately tells actor_loss which successful demonstrated
+                # action dimensions are trusted direct-supervision targets.
+                "intervention_mask": _demonstration_supervision_mask(
+                    exec_chunks_t[i], rl_action_arms, episode_success
+                ),
             }
         )
     return out
@@ -446,6 +481,14 @@ def _save_partial(out_dir: pathlib.Path, split: str, transitions: list, label: s
     torch.save(transitions, tmp)
     tmp.replace(path)
     _log(f"  [{label}] checkpointed {len(transitions)} transitions -> {path.name}")
+
+
+def _write_cache_metadata(out_dir: pathlib.Path, metadata: dict) -> None:
+    """Atomically publish cache metadata, including its completion state."""
+    path = out_dir / "cache_metadata.json"
+    tmp = out_dir / ".cache_metadata.tmp.json"
+    tmp.write_text(json.dumps(metadata, indent=2) + "\n")
+    tmp.replace(path)
 
 
 def main() -> None:
@@ -481,34 +524,38 @@ def main() -> None:
             "prefix/critical-phase segments."
         )
 
-    (out_dir / "cache_metadata.json").write_text(
-        json.dumps(
-            {
-                "format_version": 2,
-                "exec_chunk_source": "demonstrated_action",
-                "rl_action_arms": args.rl_action_arms,
-                "chunk_length": args.chunk_length,
-                "task_instruction": args.task_instruction,
-                "vla_pretrained_path": args.vla_pretrained_path,
-                "rl_token_policy_path": args.rl_token_policy_path,
-                "critical_segments_path": (
-                    str(critical_segments_path) if critical_segments else None
-                ),
-                "cropped_to_critical_segment": bool(critical_segments),
-                "milestone_reward": args.milestone_reward,
-                "terminal_reward": args.terminal_reward,
-                "time_decay": args.time_decay,
-                # Bump if the reward formula/placement semantics ever change
-                # again -- online_trainer.py's _load_offline_buffer() uses
-                # this to refuse loading a cache whose reward scale can't be
-                # verified against the current online_rl milestone/decay
-                # config (see its reward_schema_version check).
-                "reward_schema_version": 2,
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+    metadata = {
+        "format_version": 4,
+        # Written false before any expensive work and changed to true only
+        # after both split files finish. The online loader rejects a cache
+        # left partial by an interrupted build.
+        "build_complete": False,
+        "exec_chunk_source": "demonstrated_action",
+        # v1 means successful offline demonstrations carry a nonzero
+        # per-element intervention_mask and therefore directly train the
+        # Actor, rather than only supplying behavior actions to the Critic.
+        # The loader rejects caches without this marker.
+        "actor_supervision_schema_version": 1,
+        "actor_supervision_source": "successful_demonstration",
+        "rl_action_arms": args.rl_action_arms,
+        "chunk_length": args.chunk_length,
+        "task_instruction": args.task_instruction,
+        "vla_pretrained_path": args.vla_pretrained_path,
+        "rl_token_policy_path": args.rl_token_policy_path,
+        "critical_segments_path": (
+            str(critical_segments_path) if critical_segments else None
+        ),
+        "cropped_to_critical_segment": bool(critical_segments),
+        "milestone_reward": args.milestone_reward,
+        "terminal_reward": args.terminal_reward,
+        "time_decay": args.time_decay,
+        # Bump if the reward formula/placement semantics ever change again --
+        # online_trainer.py's _load_offline_buffer() uses this to refuse
+        # loading a cache whose reward scale can't be verified against the
+        # current online_rl milestone/decay config.
+        "reward_schema_version": 2,
+    }
+    _write_cache_metadata(out_dir, metadata)
 
     _log(f"args: {vars(args)}")
     _log(f"load RLTokenPolicy from {args.rl_token_policy_path}")
@@ -547,6 +594,7 @@ def main() -> None:
         num_image_tokens=policy._num_image_tokens,
     )
     capture.attach(policy._pi05)
+    split_summaries: dict[str, dict[str, int]] = {}
     try:
         ep_indices = list(range(n_episodes))
         random.shuffle(ep_indices)
@@ -615,13 +663,27 @@ def main() -> None:
                     time_decay=args.time_decay,
                 )
                 all_tx.extend(ep_tx)
-                if (k + 1) % 5 == 0 or (k + 1) == len(eps):
+                if (k + 1) % 5 == 0:
                     _save_partial(out_dir, split_name, all_tx, f"{split_name} ep {k+1}/{len(eps)}")
+            # Always publish the exact final split. In particular, the last
+            # episode(s) may have been skipped before reaching the periodic
+            # checkpoint above; without this write, build_complete=true could
+            # otherwise describe a stale or truncated split file.
+            _save_partial(out_dir, split_name, all_tx, f"{split_name} final")
             if critical_segments:
                 _log(f"  [{split_name}] done: {len(eps) - n_skipped} episodes used, {n_skipped} skipped (unlabeled/no_critical), {len(all_tx)} transitions")
+            split_summaries[split_name] = {
+                "episodes_requested": len(eps),
+                "episodes_used": len(eps) - n_skipped,
+                "episodes_skipped": n_skipped,
+                "transitions": len(all_tx),
+            }
     finally:
         capture.detach()
 
+    metadata["build_complete"] = True
+    metadata["splits"] = split_summaries
+    _write_cache_metadata(out_dir, metadata)
     _log(f"done, total wall {time.time()-t_start:.0f}s")
 
 

@@ -8,9 +8,12 @@ from evo_rlt.core.losses import (
     discounted_chunk_return,
     critic_loss,
     actor_loss,
+    actor_behavior_cloning_loss,
     rankq_ranking_loss,
     q_action_sensitivity,
     _masked_candidate,
+    _apply_slew_rate_limit_flat,
+    _random_action_like,
 )
 from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.critic import TwinCritic
@@ -306,6 +309,42 @@ class TestRankQRankingLoss:
         assert torch.isfinite(loss)
         assert loss.item() != 0.0
 
+    def test_positive_margin_stops_satisfied_failure_pair(self):
+        class _CallOrderedCritic:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, state_vec, action_flat):
+                # Candidate order is exec/noisy/very_noisy/random/permuted.
+                value = 1.0 if self.calls == 0 else 0.0
+                self.calls += 1
+                q = torch.full((action_flat.shape[0], 1), value)
+                return q, q
+
+        state = torch.zeros(4, STATE_DIM)
+        action = torch.randn(4, CHUNK_DIM)
+        outcome = torch.zeros(4)  # failures use only exec > random
+
+        hinge = rankq_ranking_loss(
+            _CallOrderedCritic(), state, action, outcome, margin=0.1
+        )
+        softplus = rankq_ranking_loss(
+            _CallOrderedCritic(), state, action, outcome, margin=0.0
+        )
+
+        assert hinge.item() == pytest.approx(0.0)
+        assert softplus.item() > 0.0
+
+    def test_negative_margin_is_rejected(self, critic):
+        with pytest.raises(ValueError, match="margin"):
+            rankq_ranking_loss(
+                critic,
+                torch.zeros(2, STATE_DIM),
+                torch.zeros(2, CHUNK_DIM),
+                torch.ones(2),
+                margin=-0.1,
+            )
+
     def test_success_action_preferred_after_training_step(self, critic):
         """A single gradient step on the ranking loss should push Q(exec) up
         relative to Q(random) for a success transition -- i.e. the loss is
@@ -430,6 +469,23 @@ class TestMaskedCandidate:
         assert torch.equal(_masked_candidate(base, alt, None), alt)
 
 
+class TestRandomActionLike:
+    def test_preserves_every_dimension_marginal(self):
+        action = torch.tensor(
+            [[-4.0, 10.0], [2.0, -3.0], [7.0, 5.0], [1.0, 9.0]]
+        )
+        torch.manual_seed(0)
+        shuffled = _random_action_like(action)
+        assert torch.equal(
+            torch.sort(shuffled, dim=0).values,
+            torch.sort(action, dim=0).values,
+        )
+
+    def test_singleton_batch_is_unchanged(self):
+        action = torch.tensor([[3.0, -7.0]])
+        assert torch.equal(_random_action_like(action), action)
+
+
 class TestRankQActionMask:
     """actor_rl_arm="left"-style masking: candidates must never differ from
     the executed action on a frozen (masked-out) dim, since the actor could
@@ -489,6 +545,21 @@ class TestQActionSensitivity:
         state = torch.randn(16, STATE_DIM)
         action = torch.randn(16, CHUNK_DIM)
         sensitivity = q_action_sensitivity(_StateOnlyCritic(), state, action)
+        assert sensitivity.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_uses_batch_marginals_instead_of_uniform_unit_actions(self):
+        class _ActionSumCritic:
+            def min_q(self, state_vec, action_flat):
+                return action_flat.sum(dim=-1, keepdim=True)
+
+        # With zero Gaussian noise, identical rows remain identical under
+        # marginal shuffle/permutation. The former U[-1,1] candidate made
+        # this diagnostic spuriously nonzero.
+        state = torch.zeros(4, STATE_DIM)
+        action = torch.full((4, CHUNK_DIM), 10.0)
+        sensitivity = q_action_sensitivity(
+            _ActionSumCritic(), state, action, noise_scale=0.0
+        )
         assert sensitivity.item() == pytest.approx(0.0, abs=1e-6)
 
     def test_does_not_require_grad_tracking(self, critic):
@@ -626,10 +697,226 @@ class TestActorLossActionClipDelta:
             expected_bc = ((mu - batch["ref_chunk_flat"]) ** 2).sum(dim=-1).mean()
         assert loss.item() == pytest.approx((beta * expected_bc).item(), rel=1e-3)
 
+    def test_zero_deploy_scale_queries_q_at_exact_vla_reference(self, actor, batch):
+        class _RecordingCritic:
+            def __init__(self):
+                self.seen = None
+
+            def min_q(self, state_vec, action_flat):
+                self.seen = action_flat.detach().clone()
+                return torch.zeros(state_vec.shape[0], 1)
+
+        critic = _RecordingCritic()
+        actor_loss(actor, critic, batch, beta=0.3, actor_deploy_scale=0.0)
+        assert torch.equal(critic.seen, batch["ref_chunk_flat"])
+
 
 class _ZeroQCritic:
     def min_q(self, state_vec, action_flat):
         return torch.zeros(state_vec.shape[0], 1)
+
+
+class TestActorLossHumanCorrection:
+    def test_demo_bc_has_independent_weight_when_vla_beta_is_zero(self):
+        """Known-correct demonstrations must not disappear when beta is
+        lowered to relax the ordinary VLA anchor."""
+        ref = torch.zeros(1, 4)
+
+        class _LearnableActor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mu = torch.nn.Parameter(torch.zeros_like(ref))
+
+            def forward(self, state_vec, ref_flat, training=False):
+                return self.mu.expand_as(ref_flat), None
+
+        actor = _LearnableActor()
+        batch = {
+            "state_vec": torch.zeros(1, 3),
+            "ref_chunk_flat": ref,
+            "exec_chunk_flat": torch.full_like(ref, 0.05),
+            "intervention_mask_flat": torch.ones_like(ref),
+            "actual_steps": torch.tensor([2]),
+            "outcome": torch.tensor([1.0]),
+        }
+
+        loss = actor_behavior_cloning_loss(
+            actor,
+            batch,
+            beta=0.0,
+            demo_bc_weight=1.0,
+            action_clip_delta=0.1,
+            chunk_length=2,
+        )
+        loss.backward()
+
+        assert loss.item() > 0
+        assert torch.all(actor.mu.grad < 0)
+
+    def test_intervened_dims_pull_actor_toward_executed_human_action(self):
+        """Human takeover must supervise the residual, not merely label Q."""
+        chunk_length = 2
+        action_dim = 2
+        ref = torch.zeros(1, chunk_length * action_dim)
+
+        class _LearnableActor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mu = torch.nn.Parameter(torch.zeros_like(ref))
+
+            def forward(self, state_vec, ref_flat, training=False):
+                return self.mu.expand_as(ref_flat), None
+
+        actor = _LearnableActor()
+        human_exec = torch.tensor([[0.05, 0.0, 0.0, 0.0]])
+        batch = {
+            "state_vec": torch.zeros(1, 3),
+            "ref_chunk_flat": ref,
+            "exec_chunk_flat": human_exec,
+            "intervention_mask_flat": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "actual_steps": torch.tensor([2]),
+            "outcome": torch.tensor([1.0]),
+        }
+        loss = actor_loss(
+            actor,
+            _ZeroQCritic(),
+            batch,
+            beta=1.0,
+            action_clip_delta=0.1,
+            chunk_length=chunk_length,
+        )
+        loss.backward()
+
+        # Gradient descent subtracts this negative gradient, increasing the
+        # first actor output toward the positive human correction.
+        assert actor.mu.grad[0, 0].item() < 0
+        assert torch.equal(actor.mu.grad[0, 1:], torch.zeros(3))
+
+    def test_failed_human_action_is_not_cloned_into_actor(self):
+        chunk_length = 2
+        ref = torch.zeros(1, 4)
+
+        class _LearnableActor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mu = torch.nn.Parameter(torch.zeros_like(ref))
+
+            def forward(self, state_vec, ref_flat, training=False):
+                return self.mu.expand_as(ref_flat), None
+
+        actor = _LearnableActor()
+        batch = {
+            "state_vec": torch.zeros(1, 3),
+            "ref_chunk_flat": ref,
+            "exec_chunk_flat": torch.full_like(ref, 0.05),
+            "intervention_mask_flat": torch.ones_like(ref),
+            "actual_steps": torch.tensor([2]),
+            "outcome": torch.tensor([0.0]),
+        }
+        loss = actor_loss(
+            actor,
+            _ZeroQCritic(),
+            batch,
+            beta=1.0,
+            action_clip_delta=0.1,
+            chunk_length=chunk_length,
+        )
+        loss.backward()
+
+        assert torch.equal(actor.mu.grad, torch.zeros_like(actor.mu.grad))
+
+    def test_non_intervened_dims_are_not_pulled_toward_human_action(self):
+        """Complements test_intervened_dims_pull_actor_toward_executed_human_
+        action: that test's human_exec happens to be 0.0 on the non-masked
+        dims, same as ref -- so a bug that silently ignored intervention_mask
+        entirely would produce the exact same (zero) gradient there by pure
+        coincidence, and the test couldn't tell the difference. Use a
+        human_exec that's clearly nonzero on every dim, so an ignored mask
+        would show up as nonzero gradient on the non-intervened ones too."""
+        chunk_length = 2
+        action_dim = 2
+        ref = torch.zeros(1, chunk_length * action_dim)
+
+        class _LearnableActor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mu = torch.nn.Parameter(torch.zeros_like(ref))
+
+            def forward(self, state_vec, ref_flat, training=False):
+                return self.mu.expand_as(ref_flat), None
+
+        actor = _LearnableActor()
+        # Every dim is far from ref -- an ignored mask would pull all 4
+        # toward this, not just dim 0.
+        human_exec = torch.tensor([[0.05, 0.05, 0.05, 0.05]])
+        batch = {
+            "state_vec": torch.zeros(1, 3),
+            "ref_chunk_flat": ref,
+            "exec_chunk_flat": human_exec,
+            "intervention_mask_flat": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "actual_steps": torch.tensor([2]),
+            "outcome": torch.tensor([1.0]),
+        }
+        loss = actor_loss(
+            actor,
+            _ZeroQCritic(),
+            batch,
+            beta=1.0,
+            action_clip_delta=0.1,
+            chunk_length=chunk_length,
+        )
+        loss.backward()
+
+        assert actor.mu.grad[0, 0].item() < 0  # masked-in dim: pulled toward human_exec
+        assert torch.equal(actor.mu.grad[0, 1:], torch.zeros(3))  # masked-out dims: untouched
+
+    def test_partial_chunk_padding_is_excluded_from_bc(self):
+        chunk_length = 2
+        ref = torch.zeros(1, 4)
+
+        class _FixedActor:
+            def forward(self, state_vec, ref_flat, training=False):
+                # Only the never-executed second timestep differs.
+                return torch.tensor([[0.0, 0.0, 9.0, -9.0]]), None
+
+        batch = {
+            "state_vec": torch.zeros(1, 3),
+            "ref_chunk_flat": ref,
+            "exec_chunk_flat": ref.clone(),
+            "actual_steps": torch.tensor([1]),
+        }
+        loss = actor_loss(
+            _FixedActor(),
+            _ZeroQCritic(),
+            batch,
+            beta=1.0,
+            chunk_length=chunk_length,
+        )
+        assert loss.item() == pytest.approx(0.0)
+
+
+def test_training_slew_limiter_is_sequential_and_uses_residual_anchor():
+    ref = torch.tensor([[1.0, 2.0, 3.0]])
+    action = ref + torch.tensor([[0.0, 0.2, -0.2]])
+    limited = _apply_slew_rate_limit_flat(
+        action,
+        ref,
+        chunk_length=3,
+        slew_rate_limit=0.05,
+        prev_residual=torch.tensor([[-0.1]]),
+    )
+    assert torch.allclose(limited - ref, torch.tensor([[-0.05, 0.0, -0.05]]))
+
+
+def test_training_slew_limiter_does_not_limit_reference_motion():
+    ref = torch.tensor([[0.0, 1.5, -2.0]])
+    limited = _apply_slew_rate_limit_flat(
+        ref,
+        ref,
+        chunk_length=3,
+        slew_rate_limit=0.01,
+    )
+    assert torch.equal(limited, ref)
 
 
 class TestActorLossSmoothness:
@@ -674,6 +961,32 @@ class TestActorLossSmoothness:
         )
         assert loss_smooth_on.item() > loss_smooth_off.item()
 
+    def test_vla_reference_motion_is_not_penalized(self):
+        action_dim = CHUNK_DIM // C
+        ref_chunk = torch.arange(C, dtype=torch.float32).view(1, C, 1)
+        ref_chunk = ref_chunk.expand(2, C, action_dim).clone()
+        ref = ref_chunk.flatten(start_dim=-2)
+
+        class _ZeroResidualActor:
+            def forward(self, state_vec, ref_flat, training=False):
+                return ref_flat, torch.zeros_like(ref_flat)
+
+        batch = {
+            "state_vec": torch.zeros(2, STATE_DIM),
+            "ref_chunk_flat": ref,
+            "exec_chunk_flat": ref.clone(),
+            "actual_steps": torch.full((2,), C),
+        }
+        loss = actor_loss(
+            _ZeroResidualActor(),
+            _ZeroQCritic(),
+            batch,
+            beta=0.0,
+            smoothness_weight=1.0,
+            chunk_length=C,
+        )
+        assert loss.item() == pytest.approx(0.0)
+
 
 class TestCriticLossActionClipDelta:
     def test_default_none_matches_prior_behavior_exactly(self, actor, critic, target_critic, batch):
@@ -717,6 +1030,39 @@ class TestCriticLossActionClipDelta:
         )
         seen = target_critic.seen_actions[0]
         assert (seen - batch["next_ref_flat"]).abs().max().item() < 0.1 + 1e-4
+
+    def test_zero_deploy_scale_bootstraps_at_exact_vla_reference(self, actor, critic):
+        class _RecordingTargetCritic:
+            def __init__(self):
+                self.seen = None
+
+            def min_q(self, state_vec, action_flat):
+                self.seen = action_flat.detach().clone()
+                return torch.zeros(state_vec.shape[0], 1)
+
+        B = 4
+        next_ref = torch.full((B, CHUNK_DIM), 1.8)
+        batch = {
+            "state_vec": torch.zeros(B, STATE_DIM),
+            "exec_chunk_flat": torch.zeros(B, CHUNK_DIM),
+            "ref_chunk_flat": torch.zeros(B, CHUNK_DIM),
+            "reward_seq": torch.zeros(B, C),
+            "next_state_vec": torch.zeros(B, STATE_DIM),
+            "next_ref_flat": next_ref,
+            "done": torch.zeros(B),
+            "actual_steps": torch.full((B,), C),
+        }
+        target_critic = _RecordingTargetCritic()
+        critic_loss(
+            critic,
+            target_critic,
+            actor,
+            batch,
+            gamma=0.99,
+            C=C,
+            actor_deploy_scale=0.0,
+        )
+        assert torch.equal(target_critic.seen, next_ref)
 
     def test_target_noise_cannot_push_action_outside_delta(self, actor, critic):
         """target_noise_clip (0.3 by convention) can exceed action_clip_delta

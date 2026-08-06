@@ -266,6 +266,11 @@ evo-rlt-build-transition-cache-v2 \
   --device cuda
 ```
 
+The current cache format marks each successful offline demonstration as a
+direct Actor imitation target (on the arm dimensions controlled by RL), while
+retaining its real executed action for Critic training. Rebuild older caches;
+the online trainer deliberately rejects caches without this supervision schema.
+
 <a id="train-chunk-actor-critic"></a>
 
 ### 6) Train Chunk Actor-Critic

@@ -110,6 +110,11 @@ class ChunkACPolicy(PreTrainedPolicy):
         # Persistent step counter — survives ckpt save/load.
         self.register_buffer("_critic_step", torch.zeros((), dtype=torch.long), persistent=True)
 
+        # Runtime-only safety gate. Generic/offline inference preserves the
+        # historical full-Actor behavior (1.0); OnlineRLTrainer immediately
+        # sets it to 0 and schedules the gradual deployment ramp.
+        self.actor_deploy_scale: float = 1.0
+
         # Deploy-only: lazy build at .reset() time.
         self.modifier: RLTActionModifier | None = None
         # Deploy toggle (set by lerobot_rlt_record). False => the actor sees a
@@ -222,6 +227,13 @@ class ChunkACPolicy(PreTrainedPolicy):
         if "outcome" in batch:
             v = batch["outcome"]
             out["outcome"] = v if isinstance(v, Tensor) else torch.as_tensor(v)
+        if "intervention_mask_flat" in batch:
+            v = batch["intervention_mask_flat"]
+            out["intervention_mask_flat"] = v if isinstance(v, Tensor) else torch.as_tensor(v)
+        elif "intervention_mask" in batch:
+            v = batch["intervention_mask"]
+            v = v if isinstance(v, Tensor) else torch.as_tensor(v)
+            out["intervention_mask_flat"] = v.flatten(start_dim=-2)
         return out
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
@@ -242,10 +254,13 @@ class ChunkACPolicy(PreTrainedPolicy):
             rankq_noise_scale=getattr(self.config, "rankq_noise_scale", 0.15),
             rankq_alpha_success=getattr(self.config, "rankq_alpha_success", 0.0),
             rankq_alpha_failure=getattr(self.config, "rankq_alpha_failure", 0.0),
+            rankq_margin=getattr(self.config, "rankq_margin", 0.0),
             action_mask=self.actor.action_mask,
             target_noise_std=getattr(self.config, "target_noise_std", 0.0),
             target_noise_clip=getattr(self.config, "target_noise_clip", 0.3),
             action_clip_delta=getattr(self.config, "actor_action_clip_delta", None),
+            slew_rate_limit=getattr(self.config, "actor_slew_rate_limit", None),
+            actor_deploy_scale=getattr(self, "actor_deploy_scale", 1.0),
             info=critic_loss_breakdown,
         )
         soft_update(self.target_critic, self.critic, self.config.tau)
@@ -253,7 +268,8 @@ class ChunkACPolicy(PreTrainedPolicy):
 
         do_actor = (int(self._critic_step.item()) % self.config.actor_update_interval) == 0
         if do_actor:
-            a_loss = self._actor_loss_without_critic_grads(tx)
+            actor_loss_breakdown: dict[str, Tensor] = {}
+            a_loss = self._actor_loss_without_critic_grads(tx, info=actor_loss_breakdown)
             total = c_loss + a_loss
             info = {
                 "loss": total.detach(),
@@ -261,6 +277,7 @@ class ChunkACPolicy(PreTrainedPolicy):
                 "loss_actor": a_loss.detach(),
                 "critic_step": self._critic_step.detach().clone(),
                 **critic_loss_breakdown,
+                **actor_loss_breakdown,
             }
             return total, info
 
@@ -272,7 +289,11 @@ class ChunkACPolicy(PreTrainedPolicy):
         }
         return c_loss, info
 
-    def _actor_loss_without_critic_grads(self, tx: dict[str, Tensor]) -> Tensor:
+    def _actor_loss_without_critic_grads(
+        self,
+        tx: dict[str, Tensor],
+        info: dict[str, Tensor] | None = None,
+    ) -> Tensor:
         critic_params = [p for p in self.critic.parameters() if p.requires_grad]
         for p in critic_params:
             p.requires_grad_(False)
@@ -282,9 +303,13 @@ class ChunkACPolicy(PreTrainedPolicy):
                 self.critic,
                 tx,
                 beta=self.config.beta,
+                demo_bc_weight=getattr(self.config, "actor_demo_bc_weight", 1.0),
                 action_clip_delta=getattr(self.config, "actor_action_clip_delta", None),
                 smoothness_weight=getattr(self.config, "actor_smoothness_weight", 0.0),
                 chunk_length=self.config.chunk_length,
+                slew_rate_limit=getattr(self.config, "actor_slew_rate_limit", None),
+                actor_deploy_scale=getattr(self, "actor_deploy_scale", 1.0),
+                info=info,
             )
         finally:
             for p in critic_params:
@@ -309,6 +334,7 @@ class ChunkACPolicy(PreTrainedPolicy):
                 vla_ref=self.vla_ref,
                 action_clip_delta=self.config.actor_action_clip_delta,
                 slew_rate_limit=getattr(self.config, "actor_slew_rate_limit", None),
+                actor_deploy_scale=getattr(self, "actor_deploy_scale", 1.0),
             )
             self._prefix_capture = PrefixOutputCapture(
                 token_pool_size=self.config.token_pool_size,
@@ -317,6 +343,15 @@ class ChunkACPolicy(PreTrainedPolicy):
             )
             self._prefix_capture.attach(self._rl_token_policy._pi05)
         return self.modifier
+
+    def set_actor_deploy_scale(self, scale: float) -> None:
+        """Set the runtime fraction of Actor residual sent to the robot."""
+        scale = float(scale)
+        if not 0.0 <= scale <= 1.0:
+            raise ValueError("actor_deploy_scale must be in [0, 1]")
+        self.actor_deploy_scale = scale
+        if self.modifier is not None:
+            self.modifier.set_actor_deploy_scale(scale)
 
     def _apply_phase_mode(self, ctrl: PhaseController) -> None:
         """Pin the phase controller to the phase encoded by phase_mode.
@@ -669,16 +704,6 @@ class ChunkACPolicy(PreTrainedPolicy):
         if self.modifier is None:
             return None
         return self.modifier.get_last_chunk_tensors()
-
-    def record_executed_action(self, action: Tensor) -> None:
-        """Forward the action actually dispatched this frame to the modifier.
-
-        The recording loop interacts with the policy wrapper rather than its
-        internal ``RLTActionModifier``.  Ensure the modifier exists here so an
-        intervention on the first frame can still establish the slew-rate
-        continuity reference before policy inference has run.
-        """
-        self._ensure_modifier().record_executed_action(action)
 
     def pop_step_metadata(self):
         if self._rtc_runtime_enabled:

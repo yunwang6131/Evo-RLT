@@ -33,6 +33,7 @@ def _make_modifier(
     mu_chunk: torch.Tensor,
     action_clip_delta: float | None = None,
     slew_rate_limit: float | None = None,
+    actor_deploy_scale: float = 1.0,
     phase_ctrl: PhaseController | None = None,
 ) -> RLTActionModifier:
     if phase_ctrl is None:
@@ -48,6 +49,7 @@ def _make_modifier(
         chunk_exec_steps=CHUNK_LENGTH,
         action_clip_delta=action_clip_delta,
         slew_rate_limit=slew_rate_limit,
+        actor_deploy_scale=actor_deploy_scale,
     )
 
 
@@ -62,10 +64,9 @@ def _run_full_chunk(modifier: RLTActionModifier, ref_chunk: torch.Tensor) -> tor
     """Simulate real per-frame consumption -- compute the chunk, enqueue it,
     then pop every frame one at a time, as select_action() would each real
     control step (see modeling_rlt_ac.py's needs_new_chunk/enqueue/
-    pop_action). _last_executed_action is only ever updated by a real
-    pop_action() (or record_executed_action()), never by compute_chunk()
-    alone -- calling compute_chunk() directly without this, as the tests
-    below used to, does not exercise the actual continuity-tracking path."""
+    pop_action). _last_actor_residual is only updated by a real pop_action(),
+    never by compute_chunk() alone -- calling compute_chunk() directly does
+    not exercise the actual residual continuity-tracking path."""
     chunk = _compute(modifier, ref_chunk)
     modifier.enqueue(chunk)
     popped = [modifier.pop_action() for _ in range(chunk.shape[1])]
@@ -102,6 +103,46 @@ class TestComputeChunkActionClipDelta:
         assert torch.allclose(chunk, torch.ones_like(chunk))
 
 
+class TestActorDeployScale:
+    def test_zero_scale_is_exact_vla_even_after_actor_has_moved(self):
+        ref_chunk = torch.full((1, CHUNK_LENGTH, ACTION_DIM), 1.7)
+        actor_chunk = torch.full_like(ref_chunk, -50.0)
+        modifier = _make_modifier(
+            mu_chunk=actor_chunk,
+            action_clip_delta=None,
+            slew_rate_limit=0.01,
+            actor_deploy_scale=0.0,
+        )
+        assert torch.equal(_compute(modifier, ref_chunk), ref_chunk)
+
+    def test_partial_scale_blends_only_the_actor_residual(self):
+        ref_chunk = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM)
+        actor_chunk = torch.ones_like(ref_chunk)
+        modifier = _make_modifier(
+            mu_chunk=actor_chunk,
+            action_clip_delta=None,
+            actor_deploy_scale=0.25,
+        )
+        assert torch.allclose(_compute(modifier, ref_chunk), torch.full_like(ref_chunk, 0.25))
+
+    def test_changing_scale_discards_already_queued_old_scale_actions(self):
+        ref_chunk = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM)
+        modifier = _make_modifier(
+            mu_chunk=torch.ones_like(ref_chunk),
+            actor_deploy_scale=1.0,
+        )
+        modifier.enqueue(_compute(modifier, ref_chunk))
+        assert not modifier.needs_new_chunk
+        modifier.set_actor_deploy_scale(0.0)
+        assert modifier.needs_new_chunk
+
+    @pytest.mark.parametrize("scale", [-0.01, 1.01, float("nan")])
+    def test_rejects_invalid_scale(self, scale):
+        ref_chunk = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM)
+        with pytest.raises(ValueError, match="actor_deploy_scale"):
+            _make_modifier(mu_chunk=ref_chunk, actor_deploy_scale=scale)
+
+
 class TestSlewRateLimit:
     def test_limits_within_chunk_jumps(self):
         ref_chunk = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM)
@@ -115,11 +156,10 @@ class TestSlewRateLimit:
 
     def test_limits_across_chunk_boundary(self):
         """The delta bound only constrains an action relative to its own
-        ref, not relative to the immediately preceding physical frame --
-        nothing else stops a new chunk from starting far from where the
-        previous one ended. Must be limited across the boundary too. Uses
+        ref, not relative to the preceding actor residual. The learned
+        contribution must still be limited across a chunk boundary. Uses
         _run_full_chunk (compute + enqueue + pop every frame) since
-        _last_executed_action is only updated by real pop_action() calls,
+        _last_actor_residual is only updated by real pop_action() calls,
         not by compute_chunk() alone."""
         ref_chunk = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM)
         modifier = _make_modifier(mu_chunk=ref_chunk, slew_rate_limit=0.05)
@@ -131,6 +171,38 @@ class TestSlewRateLimit:
 
         first_step_jump = (chunk_2[:, 0, :] - last_step_of_chunk_1).abs()
         assert first_step_jump.max().item() <= 0.05 + 1e-4
+
+    def test_reference_jump_is_not_rate_limited(self):
+        """A zero actor residual must follow a newly replanned VLA reference
+        exactly, even when the absolute reference jump exceeds the residual
+        limit by a large amount."""
+        first_ref = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM)
+        modifier = _make_modifier(mu_chunk=first_ref, slew_rate_limit=0.03)
+        _run_full_chunk(modifier, first_ref)
+
+        # Stay inside the legacy no-delta [-1, 1] actor clamp so this test
+        # isolates slew behavior. The following test covers out-of-range
+        # QUANTILES references with action_clip_delta enabled.
+        next_ref = torch.full_like(first_ref, 0.8)
+        modifier.actor = _FixedActor(next_ref)
+        next_chunk = _run_full_chunk(modifier, next_ref)
+
+        assert torch.equal(next_chunk, next_ref)
+
+    def test_reference_jump_preserves_action_clip_delta(self):
+        first_ref = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM)
+        modifier = _make_modifier(
+            mu_chunk=torch.full_like(first_ref, 0.1),
+            action_clip_delta=0.1,
+            slew_rate_limit=0.03,
+        )
+        _run_full_chunk(modifier, first_ref)
+
+        next_ref = torch.full_like(first_ref, 2.0)
+        modifier.actor = _FixedActor(next_ref)
+        next_chunk = _run_full_chunk(modifier, next_ref)
+
+        assert (next_chunk - next_ref).abs().max().item() <= 0.1 + 1e-4
 
     def test_tracks_last_action_through_vla_phase_too(self):
         """The first RL-phase step right after a VLA->RL handoff must be
@@ -161,30 +233,29 @@ class TestSlewRateLimit:
 
 
 class TestReset:
-    def test_reset_clears_last_executed_action(self):
+    def test_reset_clears_last_residual(self):
         ref_chunk = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM)
         modifier = _make_modifier(mu_chunk=ref_chunk, slew_rate_limit=0.05)
         _run_full_chunk(modifier, ref_chunk)
-        assert modifier._last_executed_action is not None
+        assert modifier._last_actor_residual is not None
         modifier.reset()
-        assert modifier._last_executed_action is None
+        assert modifier._last_actor_residual is None
 
 
-class TestLastExecutedActionTiming:
-    """Regression tests for the exact reported bug: _last_executed_action
-    must reflect what was really popped/dispatched for execution, not what
+class TestLastActorResidualTiming:
+    """The residual anchor must reflect what was really popped, not what
     a chunk happened to contain when merely computed -- a chunk can be
     interrupted (queue cleared) after only some of its frames were ever
     actually consumed, e.g. the user switches VLA->RL after only the first
     of a 25-frame chunk has run."""
 
-    def test_compute_chunk_alone_does_not_set_last_executed_action(self):
+    def test_compute_chunk_alone_does_not_set_last_residual(self):
         """Computing a chunk (without enqueueing/popping anything from it)
         must not by itself update the slew-rate continuity reference."""
         ref_chunk = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM)
         modifier = _make_modifier(mu_chunk=ref_chunk, slew_rate_limit=0.05)
         _compute(modifier, ref_chunk)
-        assert modifier._last_executed_action is None
+        assert modifier._last_actor_residual is None
 
     def test_interrupted_chunk_uses_the_real_last_popped_frame(self):
         """A 3-frame chunk is computed with a big internal swing (0 -> 1 ->
@@ -201,43 +272,11 @@ class TestLastExecutedActionTiming:
         chunk = _compute(modifier, ref_chunk)
         modifier.enqueue(chunk)
         frame_0 = modifier.pop_action()  # only one frame actually consumed
-        assert torch.allclose(modifier._last_executed_action, frame_0)
-        modifier._action_queue.clear()  # simulates interrupt_chunk()
+        assert torch.allclose(modifier._last_actor_residual, frame_0)
+        modifier.interrupt_chunk()
 
         modifier.slew_rate_limit = 0.05
         modifier.actor = _FixedActor(torch.ones(1, CHUNK_LENGTH, ACTION_DIM))
         next_chunk = _compute(modifier, ref_chunk)
         first_step_jump = (next_chunk[:, 0, :] - frame_0).abs()
         assert first_step_jump.max().item() <= 0.05 + 1e-4
-
-    def test_record_executed_action_updates_continuity_reference(self):
-        """Simulates the human-intervention path (loop.py calls this
-        directly; pop_action() is never invoked while intervention is
-        active, since policy inference is skipped entirely then)."""
-        modifier = _make_modifier(
-            mu_chunk=torch.zeros(1, CHUNK_LENGTH, ACTION_DIM), slew_rate_limit=0.05,
-        )
-        human_action = torch.full((1, ACTION_DIM), 0.9)
-        modifier.record_executed_action(human_action)
-        assert torch.equal(modifier._last_executed_action, human_action)
-
-        ref_chunk = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM)
-        modifier.actor = _FixedActor(torch.zeros(1, CHUNK_LENGTH, ACTION_DIM))
-        chunk = _compute(modifier, ref_chunk)
-        first_step_jump = (chunk[:, 0, :] - human_action).abs()
-        assert first_step_jump.max().item() <= 0.05 + 1e-4
-
-    def test_recorded_action_is_aligned_to_inference_dtype(self):
-        """Robot-reported actions can differ from inference tensors in
-        device/dtype (CPU vs CUDA in deployment). The slew reference must be
-        aligned without changing the generated chunk's dtype."""
-        modifier = _make_modifier(
-            mu_chunk=torch.zeros(1, CHUNK_LENGTH, ACTION_DIM), slew_rate_limit=0.05,
-        )
-        modifier.record_executed_action(torch.full((1, ACTION_DIM), 0.9, dtype=torch.float64))
-
-        ref_chunk = torch.zeros(1, CHUNK_LENGTH, ACTION_DIM, dtype=torch.float32)
-        chunk = _compute(modifier, ref_chunk)
-
-        assert chunk.dtype == ref_chunk.dtype
-        assert (chunk[:, 0, :] - 0.9).abs().max().item() <= 0.05 + 1e-4

@@ -76,6 +76,7 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         "--policy.actor_ref_dropout_p=0.0",
         f"--policy.gamma={args.gamma}",
         f"--policy.beta={args.beta}",
+        f"--policy.actor_demo_bc_weight={args.demo_bc_weight}",
         f"--policy.tau={args.tau}",
         f"--policy.utd_ratio={args.utd_ratio}",
         f"--policy.actor_update_interval={args.actor_update_interval}",
@@ -93,6 +94,7 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--policy.rankq_alpha_success={args.rankq_alpha_success}",
         f"--policy.rankq_alpha_failure={args.rankq_alpha_failure}",
         f"--policy.rankq_noise_scale={args.rankq_noise_scale}",
+        f"--policy.rankq_margin={args.rankq_margin}",
         f"--policy.target_noise_std={args.target_noise_std}",
         f"--policy.target_noise_clip={args.target_noise_clip}",
         f"--policy.actor_smoothness_weight={args.actor_smoothness_weight}",
@@ -216,7 +218,7 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
     )
     print(
         f"RankQ: alpha_success={args.rankq_alpha_success} alpha_failure={args.rankq_alpha_failure} "
-        f"noise_scale={args.rankq_noise_scale}"
+        f"noise_scale={args.rankq_noise_scale} margin={args.rankq_margin}"
     )
     print(
         f"Target policy smoothing: noise_std={args.target_noise_std} noise_clip={args.target_noise_clip}"
@@ -395,6 +397,12 @@ def build_parser() -> argparse.ArgumentParser:
     # TD3+BC hyperparameters.
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--beta", type=float, default=0.3)
+    parser.add_argument(
+        "--demo-bc-weight", type=float, default=1.0,
+        help="Dedicated weight for direct Actor imitation of successful offline "
+        "demonstrations and successful human corrections. Separate from --beta, "
+        "which anchors non-demonstrated actions to the VLA reference.",
+    )
     parser.add_argument("--tau", type=float, default=0.005)
     # Gradient updates per NEW transition this episode added, capped by
     # --max-updates-per-episode (not a fixed count per episode). Default 1
@@ -457,6 +465,12 @@ def build_parser() -> argparse.ArgumentParser:
         "negative actions from the executed action.",
     )
     parser.add_argument(
+        "--rankq-margin", type=float, default=0.1,
+        help="Hard-hinge margin for RankQ pairs. Positive values stop the ranking loss "
+        "once a pair is separated by this amount, preventing unbounded Q-gap growth. "
+        "Set to 0 only to restore the original softplus behavior.",
+    )
+    parser.add_argument(
         "--target-noise-std", type=float, default=0.1,
         help="TD3-style target policy smoothing: std of clipped noise added to the target "
         "actor's action before evaluating target_critic on it, so the critic can't fit an "
@@ -481,28 +495,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--actor-slew-rate-limit", type=float, default=None,
-        help="Cap how much the RL actor's executed action may change from one physical "
-        "timestep to the next (see RLTActionModifier._apply_slew_rate_limit), "
-        "independent of --actor-action-clip-delta -- that bound only limits how far an "
-        "action sits from its own reference, not how much it can change frame-to-frame, "
-        "so adjacent frames could otherwise swing from one end of the delta bound to the "
-        "other. None (default) disables it.",
+        help="Cap how much the RL actor residual (action minus VLA reference) may change "
+        "per physical timestep. The trusted VLA trajectory itself is not rate-limited. "
+        "None (default) disables it.",
     )
     parser.add_argument(
         "--actor-smoothness-weight", type=float, default=0.0,
         help="Training-time complement to --actor-slew-rate-limit: weight on a penalty "
-        "for adjacent-timestep differences in the actor's raw output within a chunk (see "
-        "losses.actor_loss), discouraging oscillation in the residual itself rather than "
-        "only clipping it at deploy time. 0.0 (default) disables it.",
+        "for adjacent-timestep differences in the actor residual within a chunk (see "
+        "losses.actor_loss), discouraging oscillation rather than only clipping it at "
+        "deploy time. 0.0 (default) disables it.",
     )
 
     # Online RL loop.
     parser.add_argument("--warmup-episodes", type=int, default=5)
     parser.add_argument(
         "--critic-only-episodes", type=int, default=10,
-        help="Episodes after warmup where only the critic updates (actor frozen at its "
-        "zero-init-residual, VLA-equivalent behavior) so the critic isn't acting on a "
-        "random value estimate when the actor starts moving.",
+        help="Episodes after warmup where Q-driven Actor updates remain frozen. Trusted "
+        "demonstration BC may continue in the background, while actor_deploy_scale=0 "
+        "keeps physical control exactly VLA-equivalent.",
     )
     parser.add_argument(
         "--actor-unfreeze-ramp-episodes", type=int, default=10,
@@ -511,7 +522,8 @@ def build_parser() -> argparse.ArgumentParser:
         "this many additional episodes. A hard flip lets the actor immediately chase, at "
         "full lr_actor/utd_ratio, a critic that has only just started forming a "
         "non-random value estimate -- a direct contributor to actor jitter right when "
-        "critic-only ends. 0 reproduces the old hard-flip behavior.",
+        "critic-only ends. The physical Actor residual is ramped from 0 to 1 over the "
+        "same window; its first rollout remains at 0. 0 enables a hard flip.",
     )
     parser.add_argument(
         "--min-warmup-transitions", type=int, default=1000,

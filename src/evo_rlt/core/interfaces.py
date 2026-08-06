@@ -64,3 +64,10 @@ class ChunkTransition:
     # Keep this separate from reward_seq: shaping rewards (e.g. milestones)
     # may be positive even when the episode ultimately fails.
     outcome: torch.Tensor = field(default_factory=lambda: torch.tensor(-1.0))
+    # Exact trusted Actor-supervision elements. Shape: (C, action_dim). For
+    # online data these are the human-controlled elements; for successful
+    # offline demonstrations these are the demonstrated dimensions the Actor
+    # controls. This is intentionally separate from the chunk-level
+    # ``intervention`` flag, which only records an online takeover.
+    # Legacy transitions may leave it empty.
+    intervention_mask: torch.Tensor = field(default_factory=lambda: torch.empty(0))

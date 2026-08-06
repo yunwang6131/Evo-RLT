@@ -14,6 +14,8 @@ def test_register_loads_chunk_transition_dataset_from_cache_dir(tmp_path):
             {
                 "state_vec": torch.zeros(3),
                 "exec_chunk": torch.zeros(2, 1),
+                "outcome": torch.tensor(1.0),
+                "intervention_mask": torch.ones(2, 1),
             }
         ],
         cache_dir / "chunk_transitions_train.pt",
@@ -30,3 +32,17 @@ def test_register_loads_chunk_transition_dataset_from_cache_dir(tmp_path):
     assert isinstance(dataset, ChunkTransitionDataset)
     assert len(dataset) == 1
     assert dataset[0]["state_vec"].shape == (3,)
+
+
+def test_chunk_transition_dataset_rejects_cache_without_actor_supervision(tmp_path):
+    torch.save(
+        [{"state_vec": torch.zeros(3), "exec_chunk": torch.zeros(2, 1)}],
+        tmp_path / "chunk_transitions_train.pt",
+    )
+
+    try:
+        ChunkTransitionDataset(tmp_path)
+    except ValueError as exc:
+        assert "predates direct offline Actor supervision" in str(exc)
+    else:
+        raise AssertionError("legacy cache should have been rejected")

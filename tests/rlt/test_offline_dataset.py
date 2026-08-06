@@ -113,6 +113,8 @@ def test_build_transitions_basic():
     # Sparse binary reward only appears on the terminal chunk, at the final step.
     assert torch.equal(transitions[0].reward_seq, torch.zeros(C))
     assert torch.equal(transitions[1].reward_seq, torch.tensor([0.0, 0.0, 1.0]))
+    assert all(t.outcome.item() == 1.0 for t in transitions)
+    assert all(torch.equal(t.intervention_mask, torch.ones_like(t.exec_chunk)) for t in transitions)
 
     # Shapes
     for t in transitions:

@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from evo_rlt.adapters.lerobot.online_collector import RLTOnlineCollector
-from evo_rlt.adapters.lerobot.record.annotations import SOURCE_RL
+from evo_rlt.adapters.lerobot.record.annotations import SOURCE_HUMAN, SOURCE_RL
 from evo_rlt.core.replay_buffer import ReplayBuffer
 
 CHUNK_LENGTH = 4
@@ -321,3 +321,157 @@ class TestMilestoneReward:
             _feed_frame(collector, i)
         collector.flush_episode(episode_success=True)
         assert buffer.buffer[0].reward_seq.sum().item() == pytest.approx(1.0)  # no stray 0.5
+
+
+class TestHumanChunkPreservesVLAReference:
+    """Regression test: a human-dominant chunk used to overwrite ref with
+    exec_chunk, erasing the "VLA would have done X, the correction was
+    delta=Y" signal the residual actor (mu = ref + delta) is supposed to
+    learn from a successful intervention -- turning it into a tautological
+    ref==exec, delta==0 pair instead. ref must stay the true, current VLA
+    reference regardless of who executed the chunk."""
+
+    def test_human_dominant_chunk_keeps_vla_ref_not_exec(self):
+        collector, buffer = _make_collector()
+        vla_ref = torch.randn(CHUNK_LENGTH, ACTION_DIM)
+        human_action = torch.randn(ACTION_DIM) + 5.0  # far from vla_ref, unmistakably distinct
+        for i in range(CHUNK_LENGTH):
+            collector.on_frame(
+                action=human_action,
+                state_vec=torch.randn(STATE_DIM) if i == 0 else None,
+                ref_chunk=vla_ref if i == 0 else None,
+                source_type=SOURCE_HUMAN,
+                is_critical=1.0,
+            )
+        collector.flush_episode(episode_success=True)
+
+        transition = buffer.buffer[0]
+        assert torch.equal(transition.ref_chunk, vla_ref)
+        assert not torch.allclose(transition.ref_chunk, transition.exec_chunk)
+        assert transition.intervention.item() == 1.0
+
+    def test_human_chunk_without_current_context_is_dropped_not_fabricated(self):
+        """A caller must supply current counterfactual VLA context.
+        The collector never reuses the prior chunk's state/ref just to keep a
+        human replay item; that tuple would be temporally false."""
+        collector, buffer = _make_collector()
+        first_ref = torch.randn(CHUNK_LENGTH, ACTION_DIM)
+        for i in range(CHUNK_LENGTH):
+            collector.on_frame(
+                action=torch.randn(ACTION_DIM),
+                state_vec=torch.randn(STATE_DIM) if i == 0 else None,
+                ref_chunk=first_ref if i == 0 else None,
+                source_type=SOURCE_RL,
+                is_critical=1.0,
+            )
+        human_action = torch.randn(ACTION_DIM) + 5.0
+        for i in range(CHUNK_LENGTH):
+            collector.on_frame(
+                action=human_action,
+                state_vec=None,
+                ref_chunk=None,
+                source_type=SOURCE_HUMAN,
+                is_critical=1.0,
+            )
+        collector.flush_episode(episode_success=True)
+
+        assert len(buffer) == 1
+        first_transition = buffer.buffer[0]
+        assert torch.equal(first_transition.next_ref_chunk, first_ref)
+        # The context-free human frames were dropped completely.
+        assert first_transition.intervention.item() == 0.0
+        assert first_transition.intervention_mask.sum().item() == 0.0
+
+    def test_any_human_element_marks_the_actual_transition_intervened(self):
+        collector, buffer = _make_collector()
+        state = torch.randn(STATE_DIM)
+        ref = torch.randn(CHUNK_LENGTH, ACTION_DIM)
+        for i in range(CHUNK_LENGTH):
+            mask = torch.zeros(ACTION_DIM)
+            source = SOURCE_RL
+            action = torch.zeros(ACTION_DIM)
+            if i == CHUNK_LENGTH - 1:
+                mask[0] = 1.0
+                source = SOURCE_HUMAN
+                action[0] = 0.4
+            collector.on_frame(
+                action=action,
+                state_vec=state if i == 0 else None,
+                ref_chunk=ref if i == 0 else None,
+                source_type=source,
+                is_critical=1.0,
+                intervention_mask=mask,
+            )
+        collector.flush_episode(True)
+
+        transition = buffer.buffer[0]
+        assert transition.intervention.item() == 1.0
+        # Source remains the dominant RL source, demonstrating that the
+        # intervention tag now follows the exact mask rather than majority.
+        assert transition.source.item() == SOURCE_RL
+        assert transition.intervention_mask.sum().item() == 1.0
+        assert transition.outcome.item() == 1.0
+
+
+class TestControlBoundaryAlignment:
+    def test_begin_attempt_drops_prefix_residue_and_aligns_first_rl_chunk(self):
+        collector, buffer = _make_collector()
+        for _ in range(2):
+            collector.on_frame(
+                action=torch.full((ACTION_DIM,), -1.0),
+                state_vec=None,
+                ref_chunk=None,
+                source_type=SOURCE_RL,
+                is_critical=0.0,
+            )
+
+        collector.begin_attempt()
+        state = torch.randn(STATE_DIM)
+        ref = torch.randn(CHUNK_LENGTH, ACTION_DIM)
+        actions = [torch.full((ACTION_DIM,), float(i)) for i in range(CHUNK_LENGTH)]
+        for i, action in enumerate(actions):
+            collector.on_frame(
+                action=action,
+                state_vec=state if i == 0 else None,
+                ref_chunk=ref if i == 0 else None,
+                source_type=SOURCE_RL,
+                is_critical=1.0,
+            )
+        collector.flush_episode(True)
+
+        assert len(buffer) == 1
+        assert torch.equal(buffer.buffer[0].exec_chunk, torch.stack(actions))
+        assert torch.equal(buffer.buffer[0].state_vec, state)
+
+    def test_cut_chunk_keeps_partial_validity_and_new_context_separate(self):
+        collector, buffer = _make_collector()
+        first_ref = torch.randn(CHUNK_LENGTH, ACTION_DIM)
+        first_actions = [torch.randn(ACTION_DIM) for _ in range(2)]
+        for i, action in enumerate(first_actions):
+            collector.on_frame(
+                action=action,
+                state_vec=torch.randn(STATE_DIM) if i == 0 else None,
+                ref_chunk=first_ref if i == 0 else None,
+                source_type=SOURCE_RL,
+                is_critical=1.0,
+            )
+        collector.cut_chunk()
+
+        second_ref = torch.randn(CHUNK_LENGTH, ACTION_DIM)
+        human = torch.randn(ACTION_DIM)
+        human_mask = torch.cat([torch.ones(ACTION_DIM // 2), torch.zeros(ACTION_DIM // 2)])
+        collector.on_frame(
+            action=human,
+            state_vec=torch.randn(STATE_DIM),
+            ref_chunk=second_ref,
+            source_type=SOURCE_HUMAN,
+            is_critical=1.0,
+            intervention_mask=human_mask,
+        )
+        collector.flush_episode(True)
+
+        first, second = buffer.buffer
+        assert first.actual_steps.item() == 2
+        assert torch.equal(first.exec_chunk[2:], first_ref[2:])
+        assert torch.equal(second.intervention_mask[0], human_mask)
+        assert second.intervention_mask[1:].sum().item() == 0.0

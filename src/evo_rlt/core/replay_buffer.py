@@ -160,7 +160,13 @@ class ReplayBuffer:
             if t.intervention.item() == 1.0:
                 intervention_idx.append(i)
                 continue
-            outcome = outcomes.get(int(t.episode_id.item()))
+            explicit = getattr(t, "outcome", None)
+            explicit_value = float(explicit.item()) if explicit is not None else -1.0
+            outcome = (
+                "success" if explicit_value >= 0.5
+                else "failure" if explicit_value >= 0.0
+                else outcomes.get(int(t.episode_id.item()))
+            )
             if outcome == "success":
                 success_idx.append(i)
             elif outcome == "failure":
@@ -197,6 +203,12 @@ class ReplayBuffer:
         stacked_exec = torch.stack([t.exec_chunk for t in batch])
         stacked_ref = torch.stack([t.ref_chunk for t in batch])
         stacked_next_ref = torch.stack([t.next_ref_chunk for t in batch])
+        intervention_masks = []
+        for t in batch:
+            mask = getattr(t, "intervention_mask", None)
+            if mask is None or mask.numel() == 0:
+                mask = torch.full_like(t.exec_chunk, float(t.intervention.item()))
+            intervention_masks.append(mask)
         return {
             STATE_VEC: torch.stack([t.state_vec for t in batch]),
             EXEC_CHUNK_FLAT: stacked_exec.flatten(start_dim=-2),
@@ -209,4 +221,11 @@ class ReplayBuffer:
             SOURCE: torch.stack([t.source for t in batch]),
             EPISODE_ID: torch.stack([t.episode_id for t in batch]),
             IS_CRITICAL: torch.stack([t.is_critical for t in batch]),
+            "outcome": torch.stack(
+                [
+                    getattr(t, "outcome", torch.tensor(-1.0))
+                    for t in batch
+                ]
+            ),
+            "intervention_mask_flat": torch.stack(intervention_masks).flatten(start_dim=-2),
         }

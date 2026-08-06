@@ -1,12 +1,9 @@
 #!/usr/bin/env python
 """Build a 3-bucket chunk-transition cache for RLT online-offline training.
 
-For each bucket:
-  - warmup_vla:   ref_chunk = VLA-proposed action (no replacement)
-  - human_expert: ref_chunk = exec_chunk (always, teleop-only dataset)
-  - rl_rollout:   ref_chunk = exec_chunk only for chunks where the dominant
-                  per-frame source is human intervention (chunk-level vote,
-                  matching online_collector.py semantics)
+For every bucket ref_chunk remains the counterfactual VLA proposal. Human
+actions are represented by exec_chunk + intervention_mask; overwriting ref
+would destroy the residual target (human - VLA).
 """
 from __future__ import annotations
 
@@ -139,7 +136,7 @@ def main() -> None:
 
         split_start = time.time()
         transitions = []
-        n_ref_replaced = 0
+        n_human_tagged = 0
         n_total = 0
         for ep_index, episode_id in enumerate(sorted(episode_ids), start=1):
             frame_start, frame_stop = _episode_frame_range(dataset, episode_id)
@@ -182,43 +179,32 @@ def main() -> None:
                     f"vs transitions={len(ep_transitions)}"
                 )
 
-            replaced_flags = [False] * len(ep_transitions)
             for tr_idx, t in enumerate(ep_transitions):
                 n_total += 1
                 if args.bucket_mode == "human_expert":
-                    t.ref_chunk = t.exec_chunk.clone()
                     t.intervention = torch.tensor(1.0)
-                    replaced_flags[tr_idx] = True
-                    n_ref_replaced += 1
+                    t.intervention_mask = torch.ones_like(t.exec_chunk)
+                    n_human_tagged += 1
                 elif args.bucket_mode == "rl_rollout":
                     start_frame = start_anchors[tr_idx]
                     if _dominant_is_human(interventions, start_frame, config.chunk_length):
-                        t.ref_chunk = t.exec_chunk.clone()
                         t.intervention = torch.tensor(1.0)
-                        replaced_flags[tr_idx] = True
-                        n_ref_replaced += 1
-
-            # Second pass: propagate next_ref_chunk using the anchor map.
-            anchor_to_idx = {a: i for i, a in enumerate(start_anchors)}
-            for tr_idx, t in enumerate(ep_transitions):
-                next_anchor = start_anchors[tr_idx] + config.chunk_length
-                nxt = anchor_to_idx.get(next_anchor)
-                if nxt is not None and replaced_flags[nxt]:
-                    t.next_ref_chunk = ep_transitions[nxt].ref_chunk.clone()
+                        t.intervention_mask = torch.ones_like(t.exec_chunk)
+                        n_human_tagged += 1
 
             transitions.extend(ep_transitions)
             if ep_index % 20 == 0:
                 logger.info(
-                    "[%s/%s] %d/%d ep, %d transitions, %d ref-replaced",
+                    "[%s/%s] %d/%d ep, %d transitions, %d human-tagged",
                     args.bucket_mode, split_name, ep_index, len(episode_ids),
-                    len(transitions), n_ref_replaced,
+                    len(transitions), n_human_tagged,
                 )
 
         save_transition_cache(transitions, args.transition_cache_dir, split_name)
         logger.info(
-            "[%s/%s] split done: %d transitions, %d ref-replaced (%.1f%%), %.1fs",
-            args.bucket_mode, split_name, len(transitions), n_ref_replaced,
-            100.0 * n_ref_replaced / max(n_total, 1),
+            "[%s/%s] split done: %d transitions, %d human-tagged (%.1f%%), %.1fs",
+            args.bucket_mode, split_name, len(transitions), n_human_tagged,
+            100.0 * n_human_tagged / max(n_total, 1),
             time.time() - split_start,
         )
 

@@ -164,6 +164,12 @@ def _encoded_to_transitions(
             source=torch.tensor(source),
             episode_id=torch.tensor(episode_id),
             is_critical=torch.tensor(is_critical),
+            outcome=torch.tensor(float(episode_success)),
+            # A successful offline trajectory is a trusted demonstration for
+            # the Actor even though it is not an online intervention.
+            intervention_mask=(
+                torch.ones_like(e) if episode_success else torch.zeros_like(e)
+            ),
         ))
     if episode_success and transitions and not any(t.done.item() == 1.0 for t in transitions):
         raise ValueError(
@@ -306,6 +312,12 @@ def save_transition_cache(
             "source": t.source,
             "episode_id": t.episode_id,
             "is_critical": t.is_critical,
+            "outcome": t.outcome,
+            "intervention_mask": (
+                t.intervention_mask
+                if getattr(t, "intervention_mask", torch.empty(0)).numel() > 0
+                else torch.full_like(t.exec_chunk, float(t.intervention.item()))
+            ),
         }
         for t in transitions
     ]

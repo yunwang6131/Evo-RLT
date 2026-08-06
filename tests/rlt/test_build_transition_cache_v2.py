@@ -20,6 +20,48 @@ def test_left_only_exec_chunk_uses_demo_left_and_vla_right():
     assert torch.equal(demonstrated, torch.arange(24, dtype=torch.float32).view(1, 2, 12))
 
 
+def test_exec_chunk_preserves_real_demonstrated_action_outside_actor_bound():
+    module = pytest.importorskip("evo_rlt.cli.build_transition_cache_v2")
+    demonstrated = torch.tensor([[[-2.0, -0.05, 0.05, 2.0]]])
+    reference = torch.zeros_like(demonstrated)
+
+    executed = module._compose_exec_chunk(demonstrated, reference, "both")
+
+    # The critic's behavior action must be the one that actually earned the
+    # outcome. Actor bounds are applied to actor candidates, not by inventing
+    # a different successful behavior transition in the cache.
+    assert torch.equal(executed, demonstrated)
+
+
+@pytest.mark.parametrize(
+    ("rl_action_arms", "expected"),
+    [
+        ("both", [[1.0, 1.0, 1.0, 1.0]]),
+        ("left", [[1.0, 1.0, 0.0, 0.0]]),
+    ],
+)
+def test_successful_demo_supervises_actor_controlled_dimensions(rl_action_arms, expected):
+    module = pytest.importorskip("evo_rlt.cli.build_transition_cache_v2")
+    exec_chunk = torch.zeros(1, 4)
+
+    mask = module._demonstration_supervision_mask(
+        exec_chunk, rl_action_arms, episode_success=True
+    )
+
+    assert torch.equal(mask, torch.tensor(expected))
+
+
+def test_failed_demo_does_not_directly_supervise_actor():
+    module = pytest.importorskip("evo_rlt.cli.build_transition_cache_v2")
+    exec_chunk = torch.zeros(2, 4)
+
+    mask = module._demonstration_supervision_mask(
+        exec_chunk, "both", episode_success=False
+    )
+
+    assert torch.equal(mask, torch.zeros_like(exec_chunk))
+
+
 def test_missing_demo_outcome_can_default_to_success():
     module = pytest.importorskip("evo_rlt.cli.build_transition_cache_v2")
     dataset = SimpleNamespace(meta=SimpleNamespace(episodes={}))
@@ -299,3 +341,10 @@ def test_transition_cache_v2_passes_video_backend(monkeypatch, tmp_path):
     module.main()
 
     assert captured["video_backend"] == "video_reader"
+    metadata = __import__("json").loads((tmp_path / "cache_metadata.json").read_text())
+    assert metadata["format_version"] == 4
+    assert metadata["build_complete"] is True
+    assert metadata["splits"]["train"]["transitions"] == 0
+    assert metadata["splits"]["val"]["transitions"] == 0
+    assert (tmp_path / "chunk_transitions_train.pt").exists()
+    assert (tmp_path / "chunk_transitions_val.pt").exists()

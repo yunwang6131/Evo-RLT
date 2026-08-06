@@ -47,6 +47,8 @@ class ChunkTransitionDataset(Dataset):
       done           ()
       intervention   ()
       actual_steps   ()
+      outcome        ()
+      intervention_mask (C, action_dim)
       (optional) source, episode_id, is_critical
 
     The samples are returned exactly as stored (dicts of tensors); the
@@ -64,6 +66,24 @@ class ChunkTransitionDataset(Dataset):
         )
         if not self._transitions:
             raise ValueError(f"empty cache at {path}")
+        for index, transition in enumerate(self._transitions):
+            outcome = transition.get("outcome")
+            supervision_mask = transition.get("intervention_mask")
+            exec_chunk = transition.get("exec_chunk")
+            if outcome is None or supervision_mask is None:
+                raise ValueError(
+                    f"Transition {index} in {path} predates direct offline Actor "
+                    "supervision; rebuild the cache with the current cache builder"
+                )
+            if exec_chunk is None or supervision_mask.shape != exec_chunk.shape:
+                raise ValueError(
+                    f"Transition {index} in {path} has an invalid Actor supervision mask"
+                )
+            if float(outcome.item()) >= 0.5 and not bool(supervision_mask.any().item()):
+                raise ValueError(
+                    f"Successful transition {index} in {path} has an empty Actor "
+                    "supervision mask"
+                )
         self.num_frames = len(self._transitions)
         self.num_episodes = 1  # cache is flattened; treat as one mega-episode.
         self.fps = 30

@@ -29,7 +29,7 @@ import torch
 
 from evo_rlt.adapters.lerobot.online_collector import RLTOnlineCollector
 from evo_rlt.core.interfaces import ChunkTransition
-from evo_rlt.core.losses import q_action_sensitivity
+from evo_rlt.core.losses import actor_behavior_cloning_loss, q_action_sensitivity
 from evo_rlt.core.replay_buffer import ReplayBuffer
 from evo_rlt.core.utils import soft_update, unflatten_chunk
 
@@ -82,6 +82,12 @@ class OnlineRLTrainer:
         # Set once, the episode warmup actually finished on -- see
         # warmup_satisfied(). None means warmup hasn't completed yet.
         self.warmup_completed_at_episode: int | None = None
+
+        # Actor weights may learn trusted demonstrations during warmup, but
+        # those weights must not immediately drive real hardware. Deployment
+        # starts as exact VLA pass-through and is scheduled in start_episode.
+        self.actor_deploy_scale = 0.0
+        self.policy.set_actor_deploy_scale(0.0)
 
         self.wandb_run = self._init_wandb(online_rl_cfg, policy_cfg)
 
@@ -168,6 +174,20 @@ class OnlineRLTrainer:
                 raise ValueError(
                     f"Offline cache {cache_path} does not contain demonstrated exec_chunk data"
                 )
+            if metadata.get("build_complete") is not True:
+                raise ValueError(
+                    f"Offline cache {cache_path} is incomplete or predates the build "
+                    "completion marker. Let evo-rlt-build-transition-cache-v2 finish "
+                    "successfully and write build_complete=true before starting online "
+                    "training."
+                )
+            if metadata.get("actor_supervision_schema_version") != 1:
+                raise ValueError(
+                    f"Offline cache {cache_path} does not mark successful demonstrations "
+                    "for direct Actor supervision. Rebuild it with the current "
+                    "evo-rlt-build-transition-cache-v2; otherwise offline data would "
+                    "train only the Critic."
+                )
             cached_arms = metadata.get("rl_action_arms")
             policy_arms = getattr(policy_cfg, "actor_rl_arm", "both")
             if cached_arms is not None and cached_arms != policy_arms:
@@ -238,6 +258,26 @@ class OnlineRLTrainer:
                     f"{tuple(transition.exec_chunk.shape)} != "
                     f"({policy_cfg.chunk_length}, {policy_cfg.action_dim})"
                 )
+            supervision_mask = getattr(transition, "intervention_mask", None)
+            if (
+                supervision_mask is None
+                or supervision_mask.shape != transition.exec_chunk.shape
+            ):
+                raise ValueError(
+                    f"Offline transition {index} in {cache_path} has no valid "
+                    "per-element Actor supervision mask"
+                )
+            outcome = getattr(transition, "outcome", None)
+            if outcome is None:
+                raise ValueError(
+                    f"Offline transition {index} in {cache_path} has no outcome label "
+                    "for gating Actor demonstration loss"
+                )
+            if float(outcome.item()) >= 0.5 and not bool(supervision_mask.any().item()):
+                raise ValueError(
+                    f"Successful offline transition {index} in {cache_path} has an empty "
+                    "Actor supervision mask"
+                )
             buffer.add(transition)
 
         logging.info(
@@ -287,9 +327,14 @@ class OnlineRLTrainer:
             online = self.replay_buffer.sample_stratified(online_n)
         else:
             online = self.replay_buffer.sample(online_n)
-        # RankQ ranking loss (see losses.rankq_ranking_loss): tag each online
-        # transition with its trajectory's resolved success/failure outcome.
-        online["outcome"] = self.replay_buffer.outcome_labels(online["episode_id"])
+        # Fresh transitions carry their own resolved critical-attempt outcome.
+        # Fall back to episode-id lookup only for legacy replay entries.
+        resolved_online = self.replay_buffer.outcome_labels(online["episode_id"])
+        online["outcome"] = torch.where(
+            online["outcome"] >= 0.0,
+            online["outcome"],
+            resolved_online,
+        )
         if offline_n == 0:
             actual_online_n = next(iter(online.values())).shape[0]
             return online, 0, actual_online_n
@@ -300,9 +345,13 @@ class OnlineRLTrainer:
         # that demonstrated trajectories are successes.
         offline_outcome = self.offline_buffer.outcome_labels(offline["episode_id"])
         offline["outcome"] = torch.where(
-            offline_outcome >= 0.0,
-            offline_outcome,
-            torch.ones_like(offline_outcome),
+            offline["outcome"] >= 0.0,
+            offline["outcome"],
+            torch.where(
+                offline_outcome >= 0.0,
+                offline_outcome,
+                torch.ones_like(offline_outcome),
+            ),
         )
         actual_offline_n = next(iter(offline.values())).shape[0]
         actual_online_n = next(iter(online.values())).shape[0]
@@ -311,6 +360,71 @@ class OnlineRLTrainer:
             actual_offline_n,
             actual_online_n,
         )
+
+    def _actor_bc_step(
+        self,
+        raw: dict[str, torch.Tensor],
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """One Critic-free Actor BC step on a replay-format batch."""
+        batch = {
+            "state_vec": raw["state_vec"].to(device),
+            "ref_chunk_flat": raw["ref_chunk_flat"].to(device),
+            "exec_chunk_flat": raw["exec_chunk_flat"].to(device),
+            "actual_steps": raw["actual_steps"].to(device),
+            "outcome": raw["outcome"].to(device),
+            "intervention_mask_flat": raw["intervention_mask_flat"].to(device),
+        }
+        info: dict[str, torch.Tensor] = {}
+        loss = actor_behavior_cloning_loss(
+            self.policy.actor,
+            batch,
+            beta=self.policy_cfg.beta,
+            demo_bc_weight=getattr(self.policy_cfg, "actor_demo_bc_weight", 1.0),
+            action_clip_delta=getattr(self.policy_cfg, "actor_action_clip_delta", None),
+            chunk_length=self.policy_cfg.chunk_length,
+            info=info,
+        )
+        if not bool(torch.isfinite(loss).item()):
+            raise FloatingPointError("Non-finite Actor BC warm-start loss")
+        self.actor_optimizer.zero_grad()
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.policy.actor.parameters(), max_norm=1.0
+        )
+        if not bool(torch.isfinite(grad_norm).item()):
+            raise FloatingPointError("Non-finite Actor BC warm-start gradient")
+        self.actor_optimizer.step()
+        return {
+            "loss_actor": loss.detach(),
+            "actor_grad_norm": grad_norm.detach(),
+            **info,
+        }
+
+    def _run_offline_bc_warmstart(self, requested_updates: int) -> tuple[int, dict]:
+        """Train Actor from trusted offline demos while online RL is warming up.
+
+        Match the eventual delayed-Actor cadence: ``requested_updates`` is a
+        critic-equivalent budget, and one BC step runs per configured Actor
+        interval. No Critic/Q term is consulted in this phase.
+        """
+        if self.offline_buffer is None or requested_updates <= 0:
+            return 0, {}
+        interval = max(int(self.online_actor_update_interval), 1)
+        num_bc_updates = (requested_updates + interval - 1) // interval
+        device = next(self.policy.parameters()).device
+        latest: dict[str, torch.Tensor] = {}
+        self.policy.train()
+        try:
+            for _ in range(num_bc_updates):
+                raw = self.offline_buffer.sample(self.cfg.batch_size)
+                latest = self._actor_bc_step(raw, device)
+        finally:
+            self.policy.eval()
+        return num_bc_updates, {
+            key: value.item() if torch.is_tensor(value) else value
+            for key, value in latest.items()
+        }
 
     def _init_wandb(self, online_rl_cfg: Any, policy_cfg: Any) -> Any | None:
         if not getattr(online_rl_cfg, "wandb", False):
@@ -332,6 +446,7 @@ class OnlineRLTrainer:
             config={
                 "warmup_episodes": online_rl_cfg.warmup_episodes,
                 "critic_only_episodes": online_rl_cfg.critic_only_episodes,
+                "actor_unfreeze_ramp_episodes": online_rl_cfg.actor_unfreeze_ramp_episodes,
                 "min_warmup_transitions": online_rl_cfg.min_warmup_transitions,
                 "min_warmup_successes": online_rl_cfg.min_warmup_successes,
                 "min_warmup_failures": online_rl_cfg.min_warmup_failures,
@@ -342,6 +457,7 @@ class OnlineRLTrainer:
                 "batch_size": online_rl_cfg.batch_size,
                 "offline_cache_path": online_rl_cfg.offline_cache_path,
                 "offline_batch_fraction": online_rl_cfg.offline_batch_fraction,
+                "actor_demo_bc_weight": getattr(policy_cfg, "actor_demo_bc_weight", 1.0),
                 "offline_buffer_transitions": (
                     len(self.offline_buffer) if self.offline_buffer is not None else 0
                 ),
@@ -359,6 +475,7 @@ class OnlineRLTrainer:
                 "rankq_alpha_success": getattr(policy_cfg, "rankq_alpha_success", None),
                 "rankq_alpha_failure": getattr(policy_cfg, "rankq_alpha_failure", None),
                 "rankq_noise_scale": getattr(policy_cfg, "rankq_noise_scale", None),
+                "rankq_margin": getattr(policy_cfg, "rankq_margin", None),
                 "target_noise_std": getattr(policy_cfg, "target_noise_std", None),
                 "target_noise_clip": getattr(policy_cfg, "target_noise_clip", None),
                 "actor_action_clip_delta": getattr(policy_cfg, "actor_action_clip_delta", None),
@@ -450,6 +567,51 @@ class OnlineRLTrainer:
             ),
         }
 
+    def _intervention_correction_metrics(self) -> dict[str, float]:
+        """How far human interventions actually move the executed action
+        away from ref (the frozen VLA reference) -- i.e. the correction
+        magnitude the residual actor (mu = ref + delta) would need to
+        reproduce on its own to close the same gap autonomously. Compared
+        against actor_action_clip_delta, the hard bound on how far the
+        actor's own output may ever deviate from ref: if real corrections
+        routinely exceed that bound, no amount of training closes the gap,
+        since the actor is structurally incapable of ever reaching that
+        action regardless of how good the learning signal is otherwise.
+        Scans the whole buffer, same as buffer_successes/buffer_failures
+        (ReplayBuffer.count_outcomes()) -- cheap relative to the gradient
+        updates this runs alongside.
+        """
+        deltas = []
+        for transition in self.replay_buffer.buffer:
+            mask = getattr(transition, "intervention_mask", None)
+            if mask is None or mask.numel() == 0:
+                # Legacy cache/checkpoint compatibility. Fresh collectors
+                # always persist the exact per-element teaching mask.
+                if transition.intervention is None or transition.intervention.item() != 1.0:
+                    continue
+                mask = torch.ones_like(transition.exec_chunk)
+            if not bool(mask.any().item()):
+                continue
+            valid_steps = int(transition.actual_steps.item())
+            valid_mask = mask[:valid_steps].bool()
+            correction = (transition.exec_chunk - transition.ref_chunk).abs()
+            deltas.append(correction[:valid_steps][valid_mask].max().item())
+        if not deltas:
+            return {
+                "online_rl/intervention_correction_max_mean": 0.0,
+                "online_rl/intervention_correction_frac_exceeds_clip": 0.0,
+            }
+        action_clip_delta = getattr(self.policy_cfg, "actor_action_clip_delta", None)
+        frac_exceeds = (
+            sum(d > action_clip_delta for d in deltas) / len(deltas)
+            if action_clip_delta is not None and action_clip_delta > 0
+            else 0.0
+        )
+        return {
+            "online_rl/intervention_correction_max_mean": sum(deltas) / len(deltas),
+            "online_rl/intervention_correction_frac_exceeds_clip": frac_exceeds,
+        }
+
     def close(self) -> None:
         if self.wandb_run is not None:
             self.wandb_run.finish()
@@ -457,8 +619,35 @@ class OnlineRLTrainer:
     def start_episode(self, episode_id: int) -> int:
         """Call at the start of every rollout episode. Returns the replay
         buffer's `total_added` baseline to pass back into `maybe_update()`."""
+        self.actor_deploy_scale = self._actor_deploy_scale_for(episode_id)
+        self.policy.set_actor_deploy_scale(self.actor_deploy_scale)
+        logging.info(
+            "Online RL episode %d: actor_deploy_scale=%.3f",
+            episode_id,
+            self.actor_deploy_scale,
+        )
         self.collector.start_episode(episode_id)
         return self.replay_buffer.total_added
+
+    def _actor_deploy_scale_for(self, episode_id: int) -> float:
+        """Residual fraction used by the upcoming physical rollout.
+
+        Actor training is allowed in the background, but deployment remains
+        exact VLA throughout warmup and critic-only. At the unfreeze boundary
+        the first rollout is still scale 0; subsequent episodes linearly ramp
+        to full Actor control over ``actor_unfreeze_ramp_episodes``.
+        """
+        if self.warmup_completed_at_episode is None:
+            return 0.0
+        critic_only_until = (
+            self.warmup_completed_at_episode + self.cfg.critic_only_episodes
+        )
+        if episode_id <= critic_only_until:
+            return 0.0
+        ramp_episodes = self.cfg.actor_unfreeze_ramp_episodes
+        if ramp_episodes <= 0:
+            return 1.0
+        return min((episode_id - critic_only_until) / ramp_episodes, 1.0)
 
     def discard_episode(self, buffer_total_added_before: int) -> None:
         """Roll back every transition this cycle's critical-phase attempt(s)
@@ -530,29 +719,45 @@ class OnlineRLTrainer:
         if new_transitions == 0:
             return None  # no critical-phase attempt was flushed this cycle
 
+        # Use the same per-new-transition budget before and after warmup. If
+        # warmup has not completed yet, this budget drives safe offline BC
+        # instead of being discarded completely.
+        requested_updates = max(new_transitions, 0) * self.policy_cfg.utd_ratio
+        num_updates = min(requested_updates, self.cfg.max_updates_per_episode)
+
         if not self.warmup_satisfied(recorded_episodes):
+            bc_updates, bc_info = self._run_offline_bc_warmstart(num_updates)
             successes, failures = self.replay_buffer.count_outcomes()
             logging.info(
                 "Online RL warmup not yet satisfied after episode %d: "
-                "transitions=%d (need %d), successes=%d (need %d), failures=%d (need %d)",
+                "transitions=%d (need %d), successes=%d (need %d), failures=%d (need %d), "
+                "offline_bc_updates=%d",
                 recorded_episodes, len(self.replay_buffer), self.cfg.min_warmup_transitions,
                 successes, self.cfg.min_warmup_successes,
                 failures, self.cfg.min_warmup_failures,
+                bc_updates,
             )
             self._log(
                 {
                     "online_rl/warmup_satisfied": 0,
+                    "online_rl/actor_deploy_scale": self.actor_deploy_scale,
+                    "online_rl/offline_bc_warmstart_updates": bc_updates,
                     "online_rl/buffer_transitions": len(self.replay_buffer),
                     "online_rl/buffer_successes": successes,
                     "online_rl/buffer_failures": failures,
                     **self._autonomous_success_metrics(),
+                    **self._intervention_correction_metrics(),
+                    **{f"online_rl/{key}": value for key, value in bc_info.items()},
                 },
                 step=recorded_episodes,
             )
             return None
         online_n, _offline_n = self._split_batch_sizes()
         if len(self.replay_buffer) < online_n:
-            self._log(self._autonomous_success_metrics(), step=recorded_episodes)
+            self._log(
+                {**self._autonomous_success_metrics(), **self._intervention_correction_metrics()},
+                step=recorded_episodes,
+            )
             return None
 
         # Critic-only window: freeze actor updates so the critic gets a
@@ -583,11 +788,6 @@ class OnlineRLTrainer:
         # do it correctly ourselves after each real critic.step() below.
         self.policy_cfg.tau = 0.0
 
-        # UTD: gradient updates scaled to how much new data this episode
-        # added, not a fixed count regardless of episode length.
-        requested_updates = max(new_transitions, 0) * self.policy_cfg.utd_ratio
-        num_updates = min(requested_updates, self.cfg.max_updates_per_episode)
-
         device = next(self.policy.parameters()).device
         self.policy.train()
         start_t = time.perf_counter()
@@ -600,6 +800,8 @@ class OnlineRLTrainer:
         # same loop. Remember the most recent do_actor iteration's info
         # separately so its loss_actor survives to the log/wandb output.
         last_actor_info = None
+        last_actor_grad_norm = None
+        last_critic_grad_norm = None
         try:
             for _ in range(num_updates):
                 # ReplayBuffer.sample()/sample_stratified() return core/losses.py's
@@ -619,6 +821,7 @@ class OnlineRLTrainer:
                     "done": raw["done"],
                     "actual_steps": raw["actual_steps"],
                     "outcome": raw["outcome"],
+                    "intervention_mask_flat": raw["intervention_mask_flat"],
                 }
                 batch = {k: v.to(device) for k, v in batch.items()}
                 loss, info = self.policy.forward(batch)
@@ -626,16 +829,42 @@ class OnlineRLTrainer:
                     last_actor_info = info
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
+                if not bool(torch.isfinite(loss).item()):
+                    raise FloatingPointError("Non-finite online Actor/Critic loss")
                 loss.backward()
                 # Matches ChunkACPolicyConfig.get_optimizer_preset()'s
                 # grad_clip_norm=1.0 (applied automatically for offline
                 # training by lerobot's generic train loop; this custom
                 # online loop bypasses that loop entirely, so it has to be
                 # applied explicitly here to get the same protection).
-                torch.nn.utils.clip_grad_norm_(self.policy.actor.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(self.policy.critic.parameters(), max_norm=1.0)
+                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.policy.actor.parameters(), max_norm=1.0
+                )
+                critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.policy.critic.parameters(), max_norm=1.0
+                )
+                if not bool(torch.isfinite(critic_grad_norm).item()):
+                    raise FloatingPointError("Non-finite Critic gradient")
+                if "loss_actor" in info and not bool(torch.isfinite(actor_grad_norm).item()):
+                    raise FloatingPointError("Non-finite Actor gradient")
                 self.critic_optimizer.step()
                 self.actor_optimizer.step()
+                last_critic_grad_norm = critic_grad_norm.detach()
+                if "loss_actor" in info:
+                    last_actor_grad_norm = actor_grad_norm.detach()
+
+                # During the nominal critic-only window, freeze only the
+                # untrusted -Q policy update. Continue safe supervised Actor
+                # learning from successful offline/human demonstrations at
+                # the normal delayed-Actor cadence.
+                if (
+                    recorded_episodes < critic_only_until
+                    and int(self.policy._critic_step.item())
+                    % max(self.online_actor_update_interval, 1)
+                    == 0
+                ):
+                    last_actor_info = self._actor_bc_step(raw, device)
+                    last_actor_grad_norm = last_actor_info["actor_grad_norm"]
                 # Correct TD3 order: soft-update target only now, after
                 # critic.step() has actually applied this iteration's gradient.
                 soft_update(self.policy.target_critic, self.policy.critic, self.online_tau)
@@ -676,6 +905,24 @@ class OnlineRLTrainer:
                 if torch.is_tensor(last_actor_info["loss_actor"])
                 else last_actor_info["loss_actor"]
             )
+            for key in (
+                "loss_actor_q",
+                "loss_actor_vla_bc",
+                "loss_actor_demo_bc",
+                "loss_actor_smoothness",
+                "loss_actor_bc_only",
+            ):
+                if key in last_actor_info:
+                    value = last_actor_info[key]
+                    loss_dict[key] = value.item() if torch.is_tensor(value) else value
+        if last_actor_grad_norm is not None:
+            loss_dict["actor_grad_norm"] = (
+                last_actor_grad_norm.item()
+                if torch.is_tensor(last_actor_grad_norm)
+                else last_actor_grad_norm
+            )
+        if last_critic_grad_norm is not None:
+            loss_dict["critic_grad_norm"] = last_critic_grad_norm.item()
 
         logging.info(
             "Online RL update after episode %d: new_transitions=%d requested_updates=%d "
@@ -694,6 +941,7 @@ class OnlineRLTrainer:
             "training_time_s": training_time_s,
             "offline_batch_size": offline_batch_size,
             "online_batch_size": online_batch_size,
+            "actor_deploy_scale": self.actor_deploy_scale,
             "loss": loss_dict,
             "checkpoint_path": None,
         }
@@ -702,6 +950,7 @@ class OnlineRLTrainer:
             {
                 "online_rl/warmup_satisfied": 1,
                 "online_rl/critic_only": float(recorded_episodes < critic_only_until),
+                "online_rl/actor_deploy_scale": self.actor_deploy_scale,
                 "online_rl/actor_update_interval": actor_update_interval_this_cycle,
                 "online_rl/new_transitions": new_transitions,
                 "online_rl/actual_updates": num_updates,
@@ -716,6 +965,7 @@ class OnlineRLTrainer:
                 "online_rl/buffer_successes": successes,
                 "online_rl/buffer_failures": failures,
                 **self._autonomous_success_metrics(),
+                **self._intervention_correction_metrics(),
                 **{f"online_rl/{k}": v for k, v in loss_dict.items() if k != "critic_step"},
             },
             step=recorded_episodes,

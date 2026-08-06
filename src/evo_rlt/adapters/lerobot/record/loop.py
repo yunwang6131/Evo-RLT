@@ -471,6 +471,10 @@ def record_loop(
     def _start_intervention(arm_scope: str) -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
         nonlocal last_intervention_action
+        # Every teaching takeover starts a fresh counterfactual VLA context.
+        # Close the old actor chunk before the first corrected action arrives.
+        if rlt_online_collector is not None:
+            rlt_online_collector.cut_chunk()
         last_intervention_action = None
         intervention_state = {
             "left": INTERVENTION_STATE_LEFT_ACTIVE,
@@ -506,6 +510,10 @@ def record_loop(
     def _release_intervention() -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
         nonlocal release_blend_pending, release_blend_start_t, release_blend_start_action
+        # Human and post-release policy actions have different state/ref
+        # anchors. Never combine them in one replay chunk.
+        if rlt_online_collector is not None:
+            rlt_online_collector.cut_chunk()
         if rlt_intervention_tracker is not None:
             rlt_intervention_tracker.stop(get_episode_frame_index())
         intervention_state = INTERVENTION_STATE_RELEASE
@@ -642,6 +650,11 @@ def record_loop(
             set_teleop_manual_control(False)
         if rlt is not None:
             rlt.set_rl_mode()
+        if rlt_online_collector is not None:
+            # start_episode() ran before the arbitrary-length VLA prefix.
+            # Re-anchor collection to the first real RL action so fixed-size
+            # replay windows cannot stay permanently offset from actor chunks.
+            rlt_online_collector.begin_attempt()
         if critical_phase_tracker is not None and dataset is not None:
             critical_phase_tracker.toggle(dataset.episode_buffer["size"])
         rl_phase_started = True
@@ -870,7 +883,6 @@ def record_loop(
             policy is not None
             and preprocessor is not None
             and postprocessor is not None
-            and not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE)
         ):
             _t0 = time.perf_counter()
             policy_action = _predict_policy_action_with_acp_inference(
@@ -924,8 +936,6 @@ def record_loop(
         is_intervention, action_values = _select_action_values(act_processed_policy, act_processed_teleop)
         action_values = _apply_intervention_blend(is_intervention, action_values)
         action_values = _apply_release_blend(is_intervention, action_values)
-        if is_intervention:
-            last_intervention_action = _clone_robot_action(action_values)
 
         # Applies a pipeline to the action, default is IdentityProcessor
         robot_action_to_send = robot_action_processor((action_values, obs))
@@ -957,15 +967,15 @@ def record_loop(
                 lambda robot_action_to_send=robot_action_to_send: robot.send_action(robot_action_to_send),
             )
         _t_send = (time.perf_counter() - _t0) * 1000
+        if is_intervention:
+            last_intervention_action = _clone_robot_action(_sent_action)
 
         # Compute RLT metadata for both dataset writing and online collector.
-        # Only pop metadata when policy action was actually executed (not during intervention)
-        # to keep _meta_queue in sync with _action_queue.
+        # During teaching takeover the policy still produces a counterfactual
+        # action/ref, so consume its matching metadata even though the human
+        # command is what actually gets sent on controlled dimensions.
         rlt_meta = None
-        if rlt is not None and (
-            not is_intervention
-            or intervention_state in {INTERVENTION_STATE_LEFT_ACTIVE, INTERVENTION_STATE_RIGHT_ACTIVE}
-        ):
+        if rlt is not None and act_processed_policy is not None:
             rlt_meta = rlt.pop_step_metadata()
 
         if rlt is None and skip_prefix_recording:
@@ -976,42 +986,16 @@ def record_loop(
             rlt_phase = PHASE_CRITICAL if rl_phase_started else PHASE_PREFIX
         else:
             rlt_phase = rlt_meta.phase if rlt_meta is not None else prev_phase
-        # Right-arm-only intervention is never RL-controlled under
-        # actor_rl_arm="left" (rl_action_arms=left masks it to the frozen VLA
-        # reference regardless), so in that case it must NOT be recorded as
-        # SOURCE_HUMAN here -- that flows straight into RLTOnlineCollector's
-        # dominant_source/ChunkTransition.intervention tagging, and marking
-        # it human would (a) wrongly exclude the whole episode from
-        # _autonomous_success_metrics()'s autonomous_* stats even though the
-        # left arm was fully autonomous, and (b) overwrite ref_chunk with the
-        # human-puppeteered right-arm position for no benefit, since the mask
-        # forces mu=ref on those dims either way. Under actor_rl_arm="both"
-        # neither justification holds -- the right arm is genuinely
-        # RL-controlled, so a right-arm-only takeover is a real intervention
-        # and must be tagged SOURCE_HUMAN like any other, hence the
-        # actor_rl_arm=="left" gate below.
-        # is_intervention itself stays True for this state regardless (still
-        # needed for the takeover/release blend, which is a physical
-        # smoothness concern, not an RL-bookkeeping one) -- only the *source*
-        # recorded here is scoped down, and only under "left".
-        # complementary_info.is_intervention/.state (written a few lines
-        # below from is_intervention/intervention_state directly) are
-        # intentionally left untouched either way, so the raw dataset always
-        # shows the true right-arm-active state for anyone reviewing footage.
-        actor_rl_arm = getattr(getattr(policy, "config", None), "actor_rl_arm", None)
-        right_arm_exempt_from_rl = (
-            intervention_state == INTERVENTION_STATE_RIGHT_ACTIVE and actor_rl_arm == "left"
-        )
         rlt_source = (
             SOURCE_HUMAN
-            if is_intervention and not right_arm_exempt_from_rl
+            if is_intervention
             else (rlt_meta.source_type if rlt_meta else SOURCE_VLA)
         )
         rlt_is_critical = float(rlt_phase == PHASE_CRITICAL)
 
         # Write to dataset
         if dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+            action_frame = build_dataset_frame(dataset.features, _sent_action, prefix=ACTION)
             policy_action_frame = build_dataset_frame(
                 dataset.features, policy_action_for_storage, prefix="complementary_info.policy_action"
             )
@@ -1036,41 +1020,42 @@ def record_loop(
                 _write_recovery_row(frame)
 
         if rlt_online_collector is not None:
-            # action_values is post-postprocessor (physical robot units, e.g.
-            # joint degrees); normalize back to the QUANTILES [-1,1] space
+            # _sent_action is the robot-returned, potentially safety-clipped
+            # command in physical units. Normalize it back to QUANTILES space
             # ref_chunk and the offline cache use, so exec_chunk isn't
             # recorded on a different scale than everything else the critic
             # trains on (see _normalize_executed_action/_find_action_
             # unnormalizer above).
-            action_tensor = _normalize_executed_action(build_action_tensor(action_values))
-            if rlt is not None:
-                # Authoritative "what actually got sent this frame", covering
-                # the case pop_action() can't: during human intervention,
-                # policy inference (and therefore pop_action()) never runs at
-                # all, so without this the slew-rate limiter would resume
-                # RL/VLA control against a stale pre-intervention position
-                # instead of wherever the human actually left the arm. Safe
-                # to call on every frame, not just intervention ones -- on a
-                # normal policy-driven frame this just re-confirms what
-                # pop_action() already recorded a few lines above (inside
-                # act_processed_policy's computation).
-                rlt.record_executed_action(action_tensor)
-            # Peek (non-consuming): the most recent real VLA/RL-token encoding,
-            # possibly several frames old if human intervention is active (policy
-            # inference -- and therefore compute_chunk() -- is skipped while
-            # intervention is active, see the `not is_intervention` guard above).
-            # RLTOnlineCollector only actually uses this on its own chunk-start
-            # frame, so getting the same value across several frames is fine.
+            action_tensor = _normalize_executed_action(build_action_tensor(_sent_action))
+            # Peek (non-consuming): policy inference keeps running during
+            # teaching takeover, but its action is not sent on human-controlled
+            # dimensions. These tensors are the aligned counterfactual:
+            # "what VLA/RL would have done without the correction".
             last_chunk_tensors = rlt.get_last_chunk_tensors() if rlt is not None else None
             state_vec_for_collector, ref_chunk_for_collector = (
                 last_chunk_tensors if last_chunk_tensors is not None else (None, None)
             )
+            if not is_intervention:
+                intervention_mask = torch.zeros_like(action_tensor)
+            elif intervention_state == INTERVENTION_STATE_LEFT_ACTIVE:
+                intervention_mask = torch.tensor(
+                    [float(name.startswith("left_")) for name in action_feature_names],
+                    dtype=action_tensor.dtype,
+                )
+            elif intervention_state == INTERVENTION_STATE_RIGHT_ACTIVE:
+                intervention_mask = torch.tensor(
+                    [float(name.startswith("right_")) for name in action_feature_names],
+                    dtype=action_tensor.dtype,
+                )
+            else:
+                intervention_mask = torch.ones_like(action_tensor)
             rlt_online_collector.on_frame(
                 action=action_tensor,
                 state_vec=state_vec_for_collector,
                 ref_chunk=ref_chunk_for_collector,
                 source_type=rlt_source,
                 is_critical=rlt_is_critical,
+                intervention_mask=intervention_mask,
             )
 
         if display_data:

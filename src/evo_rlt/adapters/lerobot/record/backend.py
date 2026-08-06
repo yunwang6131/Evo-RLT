@@ -100,7 +100,10 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
     unitree_g1 as unitree_g1_robot,
 )
-from evo_rlt.adapters.lerobot.record.common import load_dataset_stats_from_pretrained
+from evo_rlt.adapters.lerobot.record.common import (
+    install_safe_follower_torque_enable,
+    load_dataset_stats_from_pretrained,
+)
 from evo_rlt.adapters.lerobot.record.hil import (
     ACPInferenceConfig,
     PolicySyncDualArmExecutor,
@@ -284,12 +287,14 @@ class OnlineRLConfig:
     """
 
     enable: bool = False
-    # Episodes to collect (VLA-reference rollout via the zero-init residual
-    # actor) before any gradient update runs, matching the paper's warmup
-    # phase of pre-filling the replay buffer.
+    # Episodes to collect before Critic/Q-driven updates run. Trusted offline
+    # demonstrations may train Actor weights in the background, but the
+    # physical rollout remains exact VLA via actor_deploy_scale=0.
     warmup_episodes: int = 5
-    # Episodes immediately after warmup during which only the critic updates
-    # (actor stays frozen at its zero-init-residual, VLA-equivalent behavior).
+    # Episodes immediately after warmup during which the Critic updates but
+    # Q-driven Actor updates remain frozen; trusted demonstration BC may
+    # continue. Physical control remains VLA-equivalent because
+    # actor_deploy_scale stays 0.
     # Lets the critic form a non-random value estimate before the actor starts
     # moving away from the safe VLA-equivalent starting point. Real-hardware
     # sample budgets can't afford the thousands of critic-only steps common in
@@ -304,8 +309,9 @@ class OnlineRLConfig:
     # That hard flip is a direct contributor to actor jitter right when
     # critic_only turns off. Instead, ramp actor_update_interval down to
     # online_actor_update_interval over this many additional episodes (see
-    # OnlineRLTrainer._actor_update_interval_for). 0 reproduces the exact old
-    # hard-flip behavior.
+    # OnlineRLTrainer._actor_update_interval_for). The same window also ramps
+    # the physical Actor residual contribution from 0 to 1, keeping training
+    # and deployment decoupled at startup. 0 reproduces a hard flip.
     actor_unfreeze_ramp_episodes: int = 10
     replay_capacity: int = 20_000
     batch_size: int = 256
@@ -639,6 +645,8 @@ class RecordConfig:
                 raise ValueError("`online_rl.warmup_episodes` must be >= 0.")
             if self.online_rl.critic_only_episodes < 0:
                 raise ValueError("`online_rl.critic_only_episodes` must be >= 0.")
+            if self.online_rl.actor_unfreeze_ramp_episodes < 0:
+                raise ValueError("`online_rl.actor_unfreeze_ramp_episodes` must be >= 0.")
             if self.online_rl.min_warmup_transitions < 0:
                 raise ValueError("`online_rl.min_warmup_transitions` must be >= 0.")
             if self.online_rl.min_warmup_successes < 0:
@@ -984,6 +992,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         collector_policy_id_policy = cfg.collector_policy_id_policy
         collector_policy_id_human = cfg.collector_policy_id_human
 
+        # STS3215 Goal_Position is RAM-backed and may be zero/stale after a
+        # power cycle. SOFollower.configure() enables torque before the first
+        # policy/teleop action; prime each goal from the measured pose at the
+        # exact enable boundary so startup cannot make every joint chase zero
+        # and brown out the bus (typically reported on the final ID as an
+        # Input voltage error while writing Lock=1).
+        install_safe_follower_torque_enable(robot)
         robot.connect()
         if teleop is not None:
             teleop.connect()

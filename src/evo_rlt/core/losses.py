@@ -45,6 +45,110 @@ def _masked_candidate(
     return base + action_mask * (alt - base)
 
 
+def _valid_action_mask(
+    action_flat: torch.Tensor,
+    actual_steps: torch.Tensor | None,
+    chunk_length: int,
+) -> torch.Tensor:
+    """Return a (B, C*D) mask for physically executed chunk elements."""
+    if actual_steps is None:
+        return torch.ones_like(action_flat)
+    action_dim = action_flat.shape[-1] // chunk_length
+    steps = torch.arange(chunk_length, device=action_flat.device).unsqueeze(0)
+    valid_steps = steps < actual_steps.long().unsqueeze(1)
+    return valid_steps.unsqueeze(-1).expand(-1, -1, action_dim).reshape_as(action_flat).to(action_flat)
+
+
+def _canonicalize_partial_action(
+    action_flat: torch.Tensor,
+    ref_flat: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Make never-executed suffixes identical for behavior and candidates."""
+    return ref_flat + valid_mask * (action_flat - ref_flat)
+
+
+def _apply_slew_rate_limit_flat(
+    action_flat: torch.Tensor,
+    ref_flat: torch.Tensor,
+    chunk_length: int,
+    slew_rate_limit: float | None,
+    prev_residual: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Training-time equivalent of RLTActionModifier's sequential limiter.
+
+    Rate-limits the ACTOR RESIDUAL (action - ref), not the absolute command --
+    see RLTActionModifier._apply_slew_rate_limit for the full rationale. The
+    VLA reference trajectory is trusted as-is; only the actor contribution
+    (including any correctly aligned residual carried from the prior frame)
+    is allowed to ramp.
+
+    `prev_residual`, when available, must be the actor residual paired with
+    the preceding frame's own VLA reference.  An absolute previous action is
+    not a valid substitute: subtracting this chunk's first reference would
+    rate-limit reference motion and can violate action_clip_delta.  Replay
+    data currently does not persist the counterfactual actor residual, so
+    training callers deliberately use the safe zero-residual anchor.
+    """
+    if slew_rate_limit is None:
+        return action_flat
+    chunk = unflatten_chunk(action_flat, chunk_length)
+    ref_chunk = unflatten_chunk(ref_flat, chunk_length)
+    residual = chunk - ref_chunk
+    if prev_residual is None:
+        prev = torch.zeros_like(residual[:, 0, :])
+    else:
+        prev = prev_residual.to(chunk)
+    steps = []
+    for t in range(chunk_length):
+        prev = prev + (residual[:, t, :] - prev).clamp(-slew_rate_limit, slew_rate_limit)
+        steps.append(prev)
+    return (ref_chunk + torch.stack(steps, dim=1)).flatten(start_dim=-2)
+
+
+def _random_action_like(action_flat: torch.Tensor) -> torch.Tensor:
+    """A "random action" drawn from the batch's own per-dimension marginals.
+
+    QUANTILES-normalized actions are not bounded to [-1, 1], so a fixed
+    uniform sample is an easy out-of-distribution negative.  Shuffling each
+    dimension independently across the batch preserves the observed
+    marginals while destroying joint action structure.
+    Degenerate for batch sizes below 2 (nothing to shuffle against), where
+    the executed action is returned unchanged and the corresponding ranking
+    pairs contribute a constant with no gradient direction.
+    """
+    if action_flat.shape[0] < 2:
+        return action_flat
+    shuffle = torch.argsort(
+        torch.rand(action_flat.shape, device=action_flat.device), dim=0
+    )
+    return torch.gather(action_flat, 0, shuffle)
+
+
+def _rankq_candidate_actions(
+    action_flat: torch.Tensor,
+    noise_scale: float,
+    action_mask: torch.Tensor | None,
+) -> dict[str, torch.Tensor]:
+    """Build RankQ's ordered candidate actions (shared by rankq_ranking_loss
+    and q_action_sensitivity, so the diagnostic always measures the same
+    construction the loss actually trains on)."""
+    bs = action_flat.shape[0]
+    eps = torch.randn_like(action_flat)
+    perm = torch.roll(torch.arange(bs, device=action_flat.device), shifts=-1)
+    return {
+        "exec": action_flat,
+        "noisy": _masked_candidate(action_flat, action_flat + eps * noise_scale, action_mask),
+        "very_noisy": _masked_candidate(
+            action_flat, action_flat + eps * (2.0 * noise_scale), action_mask
+        ),
+        "random": _masked_candidate(
+            action_flat, _random_action_like(action_flat), action_mask
+        ),
+        "permuted": _masked_candidate(action_flat, action_flat[perm], action_mask),
+    }
+
+
 def rankq_ranking_loss(
     critic: TwinCritic,
     state_vec: torch.Tensor,
@@ -54,6 +158,7 @@ def rankq_ranking_loss(
     alpha_success: float = 1.0,
     alpha_failure: float = 1.0,
     action_mask: torch.Tensor | None = None,
+    margin: float = 0.0,
 ) -> torch.Tensor:
     """RankQ (Choi & Xu, 2026) self-supervised action-ranking loss.
 
@@ -90,26 +195,21 @@ def rankq_ranking_loss(
     meaningful as "how much to weight ranking vs. TD" regardless of how many
     pairs the two branches happen to define, instead of that weight
     silently scaling with an implementation detail.
+
+    `margin` > 0 replaces Eq. A.5's softplus with a hard hinge,
+    relu(q_neg - q_pos + margin).  Softplus keeps a nonzero incentive to
+    widen already-correct separable pairs, while the hinge stops contributing
+    once the requested gap is reached.  Set the margin relative to the reward
+    scale. 0.0 retains the original softplus for compatibility.
     """
+    if margin < 0:
+        raise ValueError("margin must be >= 0")
     success_mask = outcome == 1
     failure_mask = outcome == 0
     if not (bool(success_mask.any()) or bool(failure_mask.any())):
         return action_flat.new_zeros(())
 
-    bs = action_flat.shape[0]
-    eps = torch.randn_like(action_flat)
-    perm = torch.roll(torch.arange(bs, device=action_flat.device), shifts=-1)
-    candidates = {
-        "exec": action_flat,
-        "noisy": _masked_candidate(action_flat, action_flat + eps * noise_scale, action_mask),
-        "very_noisy": _masked_candidate(
-            action_flat, action_flat + eps * (2.0 * noise_scale), action_mask
-        ),
-        "random": _masked_candidate(
-            action_flat, torch.rand_like(action_flat) * 2.0 - 1.0, action_mask
-        ),
-        "permuted": _masked_candidate(action_flat, action_flat[perm], action_mask),
-    }
+    candidates = _rankq_candidate_actions(action_flat, noise_scale, action_mask)
     q1, q2 = {}, {}
     for name, action in candidates.items():
         q1[name], q2[name] = critic(state_vec, action)
@@ -117,7 +217,10 @@ def rankq_ranking_loss(
     def _rank(q: dict[str, torch.Tensor], pos: str, neg: str, mask: torch.Tensor) -> torch.Tensor:
         if not bool(mask.any()):
             return action_flat.new_zeros(())
-        return F.softplus(q[neg][mask] - q[pos][mask]).mean()
+        gap = q[neg][mask] - q[pos][mask]
+        if margin > 0:
+            return F.relu(gap + margin).mean()
+        return F.softplus(gap).mean()
 
     # L^succ + L^chain (Eq. 4-5): executed action beats every suboptimal
     # variant, and the variants are themselves chained in quality order.
@@ -146,10 +249,13 @@ def critic_loss(
     rankq_noise_scale: float = 0.15,
     rankq_alpha_success: float = 0.0,
     rankq_alpha_failure: float = 0.0,
+    rankq_margin: float = 0.0,
     action_mask: torch.Tensor | None = None,
     target_noise_std: float = 0.0,
     target_noise_clip: float = 0.3,
     action_clip_delta: float | None = None,
+    slew_rate_limit: float | None = None,
+    actor_deploy_scale: float = 1.0,
     info: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """TD3-style chunk-level TD loss with correct truncated-chunk handling.
@@ -196,14 +302,24 @@ def critic_loss(
     per unsatisfied ranking pair regardless of how well the TD fit has
     converged), and the returned scalar alone can't be un-summed after the
     fact. Purely additive/optional: the returned loss is unchanged either way.
+
+    `actor_deploy_scale` mirrors the runtime residual gate: 0 bootstraps at
+    the exact VLA reference, values in (0, 1) use the same partial Actor
+    residual currently allowed onto hardware, and 1 preserves the full
+    policy behavior. This keeps TD targets aligned with physical rollout
+    during the post-warmup deployment ramp.
     """
+    if not 0.0 <= actor_deploy_scale <= 1.0:
+        raise ValueError("actor_deploy_scale must be in [0, 1]")
     x = batch["state_vec"]
-    a = batch["exec_chunk_flat"]
+    ref = batch["ref_chunk_flat"]
+    actual_steps = batch.get("actual_steps")
+    valid_mask = _valid_action_mask(batch["exec_chunk_flat"], actual_steps, C)
+    a = _canonicalize_partial_action(batch["exec_chunk_flat"], ref, valid_mask)
     x_next = batch["next_state_vec"]
     ref_next = batch["next_ref_flat"]
     reward_seq = batch["reward_seq"]
     done = batch["done"]
-    actual_steps = batch.get("actual_steps")
 
     with torch.no_grad():
         # Use deterministic mean for target action (TD3-style). Project onto
@@ -212,7 +328,11 @@ def critic_loss(
         # to mu below, so the critic's TD target reflects the policy that
         # actually runs on hardware, not an unconstrained hypothetical one.
         mu_next, _ = actor.forward(x_next, ref_next)
-        mu_next = project_action_delta(mu_next, ref_next, action_clip_delta)
+        if actor_deploy_scale <= 0.0:
+            mu_next = ref_next
+        else:
+            mu_next = ref_next + actor_deploy_scale * (mu_next - ref_next)
+            mu_next = project_action_delta(mu_next, ref_next, action_clip_delta)
         if target_noise_std > 0:
             smoothing_noise = torch.randn_like(mu_next) * target_noise_std
             smoothing_noise = smoothing_noise.clamp(-target_noise_clip, target_noise_clip)
@@ -243,8 +363,15 @@ def critic_loss(
                     ref_next if action_clip_delta <= 0
                     else ref_next + (mu_next - ref_next).clamp(-action_clip_delta, action_clip_delta)
                 )
-        if action_clip_delta is None:
+        if action_clip_delta is None and actor_deploy_scale > 0.0:
             mu_next = mu_next.clamp(-1.0, 1.0)
+        # Replay stores physical behavior actions, not the counterfactual
+        # target actor's preceding residual.  Start the target residual from
+        # zero rather than inventing one by subtracting a mismatched reference.
+        if actor_deploy_scale > 0.0:
+            mu_next = _apply_slew_rate_limit_flat(
+                mu_next, ref_next, C, slew_rate_limit
+            )
         q_next = target_critic.min_q(x_next, mu_next)
         if target_q_clip is not None and target_q_clip > 0:
             q_next = q_next.clamp(-target_q_clip, target_q_clip)
@@ -270,7 +397,8 @@ def critic_loss(
             noise_scale=rankq_noise_scale,
             alpha_success=rankq_alpha_success,
             alpha_failure=rankq_alpha_failure,
-            action_mask=action_mask,
+            margin=rankq_margin,
+            action_mask=(valid_mask if action_mask is None else valid_mask * action_mask),
         )
         loss = loss + rankq_loss
 
@@ -282,14 +410,99 @@ def critic_loss(
     return loss
 
 
+def _actor_bc_terms(
+    actor: ChunkActor,
+    batch: dict[str, torch.Tensor],
+    mu: torch.Tensor,
+    valid_mask: torch.Tensor,
+    action_clip_delta: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return separate VLA-anchor and trusted-demonstration BC terms.
+
+    Demonstrated elements are removed from the ordinary VLA anchor instead
+    of receiving two conflicting targets.  ``demo_bc`` is therefore free to
+    use a dedicated weight strong enough to remain meaningful when Critic Q
+    gradients grow during online training.
+    """
+    ref = batch["ref_chunk_flat"]
+    demo_mask = torch.zeros_like(mu)
+    demo_target = ref
+    intervention_mask = batch.get("intervention_mask_flat")
+    if intervention_mask is not None and "exec_chunk_flat" in batch:
+        demo_mask = intervention_mask.to(mu).clamp(0.0, 1.0) * valid_mask
+        outcome = batch.get("outcome")
+        if outcome is not None:
+            successful_demo = (outcome.to(mu) >= 0.5).view(-1, 1)
+            demo_mask = demo_mask * successful_demo
+        actor_action_mask = getattr(actor, "action_mask", None)
+        if actor_action_mask is not None:
+            demo_mask = demo_mask * actor_action_mask.to(mu)
+        demo_target = batch["exec_chunk_flat"].to(mu)
+        if action_clip_delta is not None:
+            if action_clip_delta <= 0:
+                demo_target = ref
+            else:
+                # Invert project_action_delta so projecting the learned raw
+                # output at deployment lands on the reachable demonstration.
+                ratio = ((demo_target - ref) / action_clip_delta).clamp(-0.999, 0.999)
+                demo_target = ref + action_clip_delta * torch.atanh(ratio)
+        else:
+            demo_target = demo_target.clamp(-1.0, 1.0)
+
+    vla_mask = valid_mask * (1.0 - demo_mask)
+    vla_bc = (((mu - ref) ** 2) * vla_mask).sum(dim=-1).mean()
+    demo_bc = (((mu - demo_target) ** 2) * demo_mask).sum(dim=-1).mean()
+    return vla_bc, demo_bc
+
+
+def actor_behavior_cloning_loss(
+    actor: ChunkActor,
+    batch: dict[str, torch.Tensor],
+    beta: float,
+    demo_bc_weight: float | None = None,
+    action_clip_delta: float | None = None,
+    chunk_length: int | None = None,
+    info: dict[str, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """BC-only Actor update, safe to run before the Critic is trustworthy.
+
+    This is used during online warmup/critic-only phases. It deliberately has
+    no Q term: successful offline demonstrations and successful human
+    corrections can train the Actor immediately without exposing it to a
+    random or immature Critic.
+    """
+    x = batch["state_vec"]
+    ref = batch["ref_chunk_flat"]
+    mu, _ = actor.forward(x, ref, training=True)
+    valid_mask = (
+        torch.ones_like(mu)
+        if chunk_length is None
+        else _valid_action_mask(mu, batch.get("actual_steps"), chunk_length)
+    )
+    vla_bc, demo_bc = _actor_bc_terms(
+        actor, batch, mu, valid_mask, action_clip_delta
+    )
+    effective_demo_weight = beta if demo_bc_weight is None else demo_bc_weight
+    loss = beta * vla_bc + effective_demo_weight * demo_bc
+    if info is not None:
+        info["loss_actor_vla_bc"] = vla_bc.detach()
+        info["loss_actor_demo_bc"] = demo_bc.detach()
+        info["loss_actor_bc_only"] = loss.detach()
+    return loss
+
+
 def actor_loss(
     actor: ChunkActor,
     critic: TwinCritic,
     batch: dict[str, torch.Tensor],
     beta: float,
+    demo_bc_weight: float | None = None,
     action_clip_delta: float | None = None,
     smoothness_weight: float = 0.0,
     chunk_length: int | None = None,
+    slew_rate_limit: float | None = None,
+    actor_deploy_scale: float = 1.0,
+    info: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Q-maximization + BC regularization toward VLA reference.
 
@@ -311,25 +524,74 @@ def actor_loss(
     prior behavior.
 
     `smoothness_weight` > 0 adds a penalty on adjacent-timestep differences
-    in the *raw* mu within each chunk (requires `chunk_length` to unflatten
-    it) -- a soft, training-time complement to the runtime slew-rate limiter
-    in RLTActionModifier: discourages the actor's own residual from
-    oscillating step-to-step in the first place, rather than only clipping
-    the symptom after the fact. 0.0 (default) is a no-op.
+    in the actor residual (mu - ref) within each chunk (requires
+    `chunk_length` to unflatten it) -- a soft, training-time complement to
+    the runtime residual limiter.  Trusted VLA reference motion is not
+    penalized. 0.0 (default) is a no-op.
+
+    `actor_deploy_scale` affects only the Q action, matching the residual
+    fraction physically deployed during online ramp-up. BC still supervises
+    the full raw Actor so it can learn demonstrations safely in the
+    background even while deployment remains at 0.
     """
+    if not 0.0 <= actor_deploy_scale <= 1.0:
+        raise ValueError("actor_deploy_scale must be in [0, 1]")
     x = batch["state_vec"]
     ref = batch["ref_chunk_flat"]
     mu, _ = actor.forward(x, ref, training=True)
-    mu_safe = project_action_delta(mu, ref, action_clip_delta)
-    q = critic.min_q(x, mu_safe)
-    bc_reg = ((mu - ref) ** 2).sum(dim=-1).mean()
-    loss = -q.mean() + beta * bc_reg
+    if actor_deploy_scale <= 0.0:
+        mu_safe = ref
+    else:
+        mu_deployed = ref + actor_deploy_scale * (mu - ref)
+        mu_safe = project_action_delta(mu_deployed, ref, action_clip_delta)
+    if action_clip_delta is None and actor_deploy_scale > 0.0:
+        mu_safe = mu_safe.clamp(-1.0, 1.0)
+    if chunk_length is None:
+        if slew_rate_limit is not None:
+            raise ValueError("slew-aware actor loss requires chunk_length")
+        valid_mask = torch.ones_like(mu)
+    else:
+        valid_mask = _valid_action_mask(mu, batch.get("actual_steps"), chunk_length)
+        if actor_deploy_scale > 0.0:
+            mu_safe = _apply_slew_rate_limit_flat(
+                mu_safe,
+                ref,
+                chunk_length,
+                slew_rate_limit,
+            )
+    q_action = _canonicalize_partial_action(mu_safe, ref, valid_mask)
+    q = critic.min_q(x, q_action)
+
+    # Successful offline demos and successful human corrections get their
+    # own BC coefficient; ordinary elements retain the VLA anchor coefficient
+    # beta. Keeping these terms separate prevents a large Critic gradient
+    # from silently drowning the known-correct demonstration signal.
+    vla_bc, demo_bc = _actor_bc_terms(
+        actor, batch, mu, valid_mask, action_clip_delta
+    )
+    effective_demo_weight = beta if demo_bc_weight is None else demo_bc_weight
+    q_objective = -q.mean()
+    loss = q_objective + beta * vla_bc + effective_demo_weight * demo_bc
     if smoothness_weight > 0:
         if chunk_length is None:
             raise ValueError("smoothness_weight > 0 requires chunk_length to unflatten mu")
-        mu_chunk = unflatten_chunk(mu, chunk_length)
-        smoothness = ((mu_chunk[:, 1:, :] - mu_chunk[:, :-1, :]) ** 2).sum(dim=(-1, -2)).mean()
+        # Penalize the actor contribution, not VLA reference motion.  A
+        # zero-residual actor following a rapidly changing trusted reference
+        # is already the desired behavior and should have zero smoothness
+        # cost.
+        residual_chunk = unflatten_chunk(mu - ref, chunk_length)
+        pair_mask = unflatten_chunk(valid_mask, chunk_length)[:, 1:, :]
+        smoothness = (
+            ((residual_chunk[:, 1:, :] - residual_chunk[:, :-1, :]) ** 2) * pair_mask
+        ).sum(dim=(-1, -2)).mean()
         loss = loss + smoothness_weight * smoothness
+    else:
+        smoothness = loss.new_zeros(())
+    if info is not None:
+        info["loss_actor_q"] = q_objective.detach()
+        info["loss_actor_vla_bc"] = vla_bc.detach()
+        info["loss_actor_demo_bc"] = demo_bc.detach()
+        info["loss_actor_smoothness"] = smoothness.detach()
     return loss
 
 
@@ -360,21 +622,8 @@ def q_action_sensitivity(
     value should track Q's own scale and stay well above 0.
     """
     with torch.no_grad():
-        bs = action_flat.shape[0]
-        eps = torch.randn_like(action_flat)
-        perm = torch.roll(torch.arange(bs, device=action_flat.device), shifts=-1)
-        candidates = [
-            action_flat,
-            _masked_candidate(action_flat, action_flat + eps * noise_scale, action_mask),
-            _masked_candidate(
-                action_flat, action_flat + eps * (2.0 * noise_scale), action_mask
-            ),
-            _masked_candidate(
-                action_flat, torch.rand_like(action_flat) * 2.0 - 1.0, action_mask
-            ),
-            _masked_candidate(action_flat, action_flat[perm], action_mask),
-        ]
+        candidates = _rankq_candidate_actions(action_flat, noise_scale, action_mask)
         q_values = torch.stack(
-            [critic.min_q(state_vec, a).squeeze(-1) for a in candidates], dim=0
+            [critic.min_q(state_vec, a).squeeze(-1) for a in candidates.values()], dim=0
         )  # (5, B)
         return q_values.std(dim=0).mean()

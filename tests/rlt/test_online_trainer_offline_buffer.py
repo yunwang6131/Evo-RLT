@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from evo_rlt.adapters.lerobot.record.online_trainer import OnlineRLTrainer
+from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.interfaces import ChunkTransition
 from evo_rlt.core.replay_buffer import ReplayBuffer
 
@@ -66,6 +67,29 @@ def test_mixed_batch_has_fixed_offline_online_split():
     assert batch["state_vec"].shape[0] == 10
 
 
+def test_sampling_preserves_transition_outcome_when_episode_id_is_shared():
+    """A critical attempt's label belongs to each transition, not to the
+    final terminal transition that happened to reuse the same dataset episode
+    id. RankQ must see both labels rather than overwriting both with the last.
+    """
+    trainer = object.__new__(OnlineRLTrainer)
+    trainer.cfg = SimpleNamespace(
+        batch_size=2,
+        offline_batch_fraction=0.0,
+        use_stratified_sampling=False,
+    )
+    trainer.offline_buffer = None
+    trainer.replay_buffer = ReplayBuffer(capacity=2)
+    failed = _outcome_transition(7, success=False, intervention=False)
+    succeeded = _outcome_transition(7, success=True, intervention=False)
+    trainer.replay_buffer.add(failed)
+    trainer.replay_buffer.add(succeeded)
+
+    batch, _, _ = trainer._sample_training_batch()
+
+    assert sorted(batch["outcome"].tolist()) == [0.0, 1.0]
+
+
 def test_split_batch_sizes_matches_sample_training_batch():
     """maybe_update()'s 'enough data yet' gate and _sample_training_batch()
     must use the identical split, or the gate can require far more online
@@ -91,8 +115,10 @@ def test_split_batch_sizes_no_offline_buffer_needs_full_batch():
     assert (online_n, offline_n) == (10, 0)
 
 
-def test_offline_cache_loader_accepts_v2_dict_cache(tmp_path):
+def test_offline_cache_loader_accepts_actor_supervised_dict_cache(tmp_path):
     transition = _transition(1.0)
+    transition.outcome = torch.tensor(1.0)
+    transition.intervention_mask = torch.ones_like(transition.exec_chunk)
     cache_dict = {
         key: getattr(transition, key)
         for key in ChunkTransition.__dataclass_fields__
@@ -104,6 +130,9 @@ def test_offline_cache_loader_accepts_v2_dict_cache(tmp_path):
         json.dumps(
             {
                 "exec_chunk_source": "demonstrated_action",
+                "build_complete": True,
+                "actor_supervision_schema_version": 1,
+                "actor_supervision_source": "successful_demonstration",
                 "rl_action_arms": "both",
             }
         )
@@ -117,6 +146,109 @@ def test_offline_cache_loader_accepts_v2_dict_cache(tmp_path):
     assert replay is not None
     assert len(replay) == 1
     assert torch.equal(replay.buffer[0].exec_chunk, transition.exec_chunk)
+    sampled = replay.sample(1)
+    assert torch.equal(sampled["intervention_mask_flat"], torch.ones(1, 8))
+    assert torch.equal(sampled["outcome"], torch.ones(1))
+
+
+def test_offline_cache_loader_rejects_cache_without_actor_supervision_schema(tmp_path):
+    transition = _transition(1.0)
+    cache_dict = {
+        key: getattr(transition, key)
+        for key in ChunkTransition.__dataclass_fields__
+        if isinstance(getattr(transition, key), torch.Tensor)
+    }
+    torch.save([cache_dict], tmp_path / "chunk_transitions_train.pt")
+    (tmp_path / "cache_metadata.json").write_text(
+        json.dumps(
+            {
+                "exec_chunk_source": "demonstrated_action",
+                "build_complete": True,
+                "rl_action_arms": "both",
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="train only the Critic"):
+        OnlineRLTrainer._load_offline_buffer(
+            str(tmp_path),
+            policy_cfg=SimpleNamespace(chunk_length=2, action_dim=4),
+        )
+
+
+def test_offline_cache_loader_rejects_incomplete_cache(tmp_path):
+    transition = _transition(1.0)
+    transition.outcome = torch.tensor(1.0)
+    transition.intervention_mask = torch.ones_like(transition.exec_chunk)
+    cache_dict = {
+        key: getattr(transition, key)
+        for key in ChunkTransition.__dataclass_fields__
+        if isinstance(getattr(transition, key), torch.Tensor)
+    }
+    torch.save([cache_dict], tmp_path / "chunk_transitions_train.pt")
+    (tmp_path / "cache_metadata.json").write_text(
+        json.dumps(
+            {
+                "exec_chunk_source": "demonstrated_action",
+                "build_complete": False,
+                "actor_supervision_schema_version": 1,
+                "rl_action_arms": "both",
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="incomplete"):
+        OnlineRLTrainer._load_offline_buffer(
+            str(tmp_path),
+            policy_cfg=SimpleNamespace(chunk_length=2, action_dim=4),
+        )
+
+
+def test_offline_bc_warmstart_updates_actor_before_online_warmup():
+    trainer = object.__new__(OnlineRLTrainer)
+    trainer.cfg = SimpleNamespace(batch_size=4)
+    trainer.policy_cfg = SimpleNamespace(
+        beta=0.0,
+        actor_demo_bc_weight=1.0,
+        actor_action_clip_delta=0.2,
+        chunk_length=2,
+    )
+    trainer.online_actor_update_interval = 2
+    trainer.offline_buffer = ReplayBuffer(capacity=4)
+    for value in (0.02, 0.04, 0.06, 0.08):
+        transition = _transition(value)
+        transition.outcome = torch.tensor(1.0)
+        transition.intervention_mask = torch.ones_like(transition.exec_chunk)
+        trainer.offline_buffer.add(transition)
+
+    actor = ChunkActor(
+        state_dim=3,
+        chunk_dim=8,
+        hidden_dim=8,
+        num_layers=1,
+        fixed_std=0.0,
+        ref_dropout_p=0.0,
+        residual_to_ref=True,
+    )
+
+    class _ActorOnlyPolicy(torch.nn.Module):
+        def __init__(self, actor):
+            super().__init__()
+            self.actor = actor
+
+    trainer.policy = _ActorOnlyPolicy(actor)
+    trainer.actor_optimizer = torch.optim.Adam(actor.parameters(), lr=1e-2)
+    before = {name: value.detach().clone() for name, value in actor.named_parameters()}
+
+    num_updates, info = trainer._run_offline_bc_warmstart(requested_updates=4)
+
+    assert num_updates == 2
+    assert info["loss_actor_demo_bc"] > 0
+    assert info["actor_grad_norm"] > 0
+    assert any(
+        not torch.equal(value, before[name])
+        for name, value in actor.named_parameters()
+    )
 
 
 def test_autonomous_success_metrics_exclude_human_rescues():
@@ -142,6 +274,8 @@ def test_autonomous_success_metrics_exclude_human_rescues():
 
 def _write_offline_cache(tmp_path, *, extra_metadata: dict) -> None:
     transition = _transition(1.0)
+    transition.outcome = torch.tensor(1.0)
+    transition.intervention_mask = torch.ones_like(transition.exec_chunk)
     cache_dict = {
         key: getattr(transition, key)
         for key in ChunkTransition.__dataclass_fields__
@@ -152,6 +286,9 @@ def _write_offline_cache(tmp_path, *, extra_metadata: dict) -> None:
         json.dumps(
             {
                 "exec_chunk_source": "demonstrated_action",
+                "build_complete": True,
+                "actor_supervision_schema_version": 1,
+                "actor_supervision_source": "successful_demonstration",
                 "rl_action_arms": "both",
                 **extra_metadata,
             }
@@ -290,6 +427,87 @@ class TestActorUnfreezeRamp:
         assert trainer._actor_update_interval_for(recorded_episodes=9, critic_only_until=10) == 10**9
         assert trainer._actor_update_interval_for(recorded_episodes=10, critic_only_until=10) == 2
         assert trainer._actor_update_interval_for(recorded_episodes=50, critic_only_until=10) == 2
+
+
+class TestActorDeployScaleRamp:
+    def _trainer(self, *, warmup_completed=5, critic_only=10, ramp=10):
+        trainer = object.__new__(OnlineRLTrainer)
+        trainer.warmup_completed_at_episode = warmup_completed
+        trainer.cfg = SimpleNamespace(
+            critic_only_episodes=critic_only,
+            actor_unfreeze_ramp_episodes=ramp,
+        )
+        return trainer
+
+    def test_warmup_and_critic_only_are_exact_vla(self):
+        trainer = self._trainer()
+        trainer.warmup_completed_at_episode = None
+        assert trainer._actor_deploy_scale_for(100) == 0.0
+        trainer.warmup_completed_at_episode = 5
+        assert trainer._actor_deploy_scale_for(14) == 0.0
+        assert trainer._actor_deploy_scale_for(15) == 0.0
+
+    def test_deploy_scale_ramps_after_zero_boundary_episode(self):
+        trainer = self._trainer()
+        assert trainer._actor_deploy_scale_for(16) == pytest.approx(0.1)
+        assert trainer._actor_deploy_scale_for(20) == pytest.approx(0.5)
+        assert trainer._actor_deploy_scale_for(25) == 1.0
+        assert trainer._actor_deploy_scale_for(100) == 1.0
+
+    def test_zero_ramp_hard_flips_only_after_critic_only_boundary(self):
+        trainer = self._trainer(ramp=0)
+        assert trainer._actor_deploy_scale_for(15) == 0.0
+        assert trainer._actor_deploy_scale_for(16) == 1.0
+
+
+class TestInterventionCorrectionMetrics:
+    """OnlineRLTrainer._intervention_correction_metrics: how far human
+    corrections actually move exec away from ref, compared against
+    actor_action_clip_delta -- the residual actor can never autonomously
+    reproduce a correction bigger than that bound, regardless of training."""
+
+    def test_computes_mean_and_frac_exceeding_clip(self):
+        trainer = object.__new__(OnlineRLTrainer)
+        trainer.replay_buffer = ReplayBuffer(capacity=10)
+        trainer.policy_cfg = SimpleNamespace(actor_action_clip_delta=0.1)
+
+        small = _transition(0.05)  # within clip
+        small.intervention = torch.tensor(1.0)
+        big = _transition(0.2)  # exceeds clip
+        big.intervention = torch.tensor(1.0)
+        autonomous = _transition(0.3)  # not an intervention chunk -- must be excluded
+        trainer.replay_buffer.add(small)
+        trainer.replay_buffer.add(big)
+        trainer.replay_buffer.add(autonomous)
+
+        metrics = trainer._intervention_correction_metrics()
+
+        assert metrics["online_rl/intervention_correction_max_mean"] == pytest.approx((0.05 + 0.2) / 2)
+        assert metrics["online_rl/intervention_correction_frac_exceeds_clip"] == pytest.approx(0.5)
+
+    def test_no_interventions_returns_zeros(self):
+        trainer = object.__new__(OnlineRLTrainer)
+        trainer.replay_buffer = ReplayBuffer(capacity=10)
+        trainer.policy_cfg = SimpleNamespace(actor_action_clip_delta=0.1)
+        trainer.replay_buffer.add(_transition(0.5))  # intervention=0.0 by default
+
+        metrics = trainer._intervention_correction_metrics()
+
+        assert metrics["online_rl/intervention_correction_max_mean"] == 0.0
+        assert metrics["online_rl/intervention_correction_frac_exceeds_clip"] == 0.0
+
+    def test_no_clip_configured_frac_is_zero_not_crash(self):
+        trainer = object.__new__(OnlineRLTrainer)
+        trainer.replay_buffer = ReplayBuffer(capacity=10)
+        trainer.policy_cfg = SimpleNamespace(actor_action_clip_delta=None)
+        t = _transition(0.5)
+        t.intervention = torch.tensor(1.0)
+        trainer.replay_buffer.add(t)
+
+        metrics = trainer._intervention_correction_metrics()
+
+        assert metrics["online_rl/intervention_correction_max_mean"] == pytest.approx(0.5)
+        assert metrics["online_rl/intervention_correction_frac_exceeds_clip"] == 0.0
 
 
 def test_episode_reward_sums_milestone_and_terminal_chunks():

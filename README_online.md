@@ -1,4 +1,16 @@
 # 在线 RL：milestone reward + 双 Replay Buffer
+## 分别查看相机
+ffplay -fflags nobuffer -flags low_delay -f v4l2 -framerate 30 -video_size 640x480 -input_format yuyv422 /dev/video2
+
+ffplay -fflags nobuffer -flags low_delay -f v4l2 -framerate 30 -video_size 640x480 -input_format yuyv422 /dev/video4
+
+ffplay -fflags nobuffer -flags low_delay -f v4l2 -framerate 30 -video_size 640x480 -input_format yuyv422 /dev/video6
+## 权限
+sudo chmod 666 /dev/ttyACM*
+## 查看端口(4条臂逐个插拔确认)
+ls -l /dev/ttyACM*
+## 查找相机
+lerobot-find-cameras opencv # or realsense for Intel Realsense cameras
 
 ## 0. 安装与环境
 
@@ -69,7 +81,7 @@ data/bimanual/merged_screw_v1/meta/critical_segments.json
 
 ## 3. 构建固定 Offline Replay Buffer
 
-离线和在线必须使用完全相同的 `chunk-length`、`rl-action-arms`、`milestone-reward`、`terminal-reward` 和 `time-decay`。
+离线和在线必须使用完全相同的 `chunk-length`、`rl-action-arms`、`milestone-reward`、`terminal-reward` 和 `time-decay`。下面的 cache 命令已与第 4 节的新训练命令对齐；修改其中任何一项时必须同步修改另一条命令并重新生成 cache。
 
 ```bash
 evo-rlt-build-transition-cache-v2 \
@@ -84,14 +96,16 @@ evo-rlt-build-transition-cache-v2 \
   --frame-stride 2 \
   --rl-action-arms both \
   --milestone-reward 0.5 \
-  --terminal-reward 1.0 \
-  --time-decay 0.995 \
+  --terminal-reward 2.0 \
+  --time-decay 0.98 \
   --batch-size 32 \
-  --num-workers 8 \
+  --num-workers 32 \
   --train-ratio 0.9 \
   --tolerance-s 0.04 \
   --device cuda
 ```
+
+当前缓存会把成功的 offline 示范动作同时用于 Critic 和 Actor：Critic 学真实执行动作的回报，Actor 在其可控手臂维度上直接模仿示范。
 
 ## 4. 在线训练：Offline + Online 双 Buffer
 
@@ -106,14 +120,15 @@ evo-rlt-online-train \
   --chunk-length 25 \
   --chunk-exec-steps 25 \
   --rl-action-arms both \
-  --actor-action-clip-delta 0.1 \
+  --actor-action-clip-delta 0.2 \
   --actor-slew-rate-limit 0.03 \
   --offline-cache-path outputs/pin_insert_offline_cache \
   --offline-batch-fraction 0.5 \
   --milestone-reward 0.5 \
-  --terminal-reward 1.0 \
-  --time-decay 0.995 \
-  --beta 50 \
+  --terminal-reward 2.0 \
+  --time-decay 0.98 \
+  --beta 0.3 \
+  --demo-bc-weight 1.0 \
   --gamma 0.9995 \
   --warmup-episodes 5 \
   --min-warmup-transitions 1000 \
@@ -124,7 +139,7 @@ evo-rlt-online-train \
   --save-every-episodes 10 \
   --wandb \
   --wandb-project rlt-both \
-  --wandb-run-name run1
+  --wandb-run-name run2
 ```
 
 ### 在线操作按键
@@ -138,7 +153,7 @@ Space      双臂人工接管；再次按下解除接管
 s / f      整个记录 episode 成功 / 失败并结束
 ```
 
-critical phase 在 `r/u` 后立即结束并切回 VLA；后续 VLA 动作不进入在线 RL buffer。Offline buffer 固定不变，Online buffer 持续增长；每个训练 batch 由 `offline-batch-fraction` 控制混合比例。warmup、success/failure 门槛和 UTD 只统计 Online buffer。
+critical phase 在 `r/u` 后立即结束并切回 VLA；后续 VLA 动作不进入在线 RL buffer。Offline buffer 固定不变，Online buffer 持续增长；每个训练 batch 由 `offline-batch-fraction` 控制混合比例。warmup、success/failure 门槛和 UTD 只统计 Online buffer。warmup 期间 Actor 可以在后台使用成功 offline 示范做纯 BC，但 `actor_deploy_scale=0`，机械臂仍然 100% 执行 VLA；critic-only 期间同样不把已更新的 Actor 输出直接交给机械臂。critic-only 结束后，`actor_deploy_scale` 才在 `actor-unfreeze-ramp-episodes` 内从 0 逐步升到 1，同时 Actor 的 Q 更新频率逐步解冻。
 
 ## 5. 自定义 Episode Reset 位置
 
@@ -149,6 +164,10 @@ critical phase 在 `r/u` 后立即结束并切回 VLA；后续 VLA 动作不进�
 ```
 
 ## 6. 恢复在线训练
+
+下面是历史 run `yiycy1r4` 的恢复命令，因此仍使用该 run 原来的
+`time-decay=0.995` 和旧奖励尺度。它不能与第 3、4 节新建的 `time-decay=0.98`
+cache/run 混用；新一轮训练不要使用这里的 `--resume-from`。
 
 ```bash
 evo-rlt-online-train \
@@ -183,6 +202,7 @@ evo-rlt-online-train \
   --rankq-alpha-success 1.0 \
   --rankq-alpha-failure 1.0 \
   --rankq-noise-scale 0.15 \
+  --rankq-margin 0.1 \
   --target-noise-std 0.1 \
   --target-noise-clip 0.3 \
   --offline-cache-path outputs/pin_insert_offline_cache \
@@ -190,7 +210,8 @@ evo-rlt-online-train \
   --milestone-reward 0.5 \
   --terminal-reward 1.0 \
   --time-decay 0.995 \
-  --beta 50 \
+  --beta 0.3 \
+  --demo-bc-weight 1.0 \
   --gamma 0.9995 \
   --tau 0.005 \
   --actor-update-interval 2 \
@@ -222,14 +243,6 @@ evo-rlt-online-train \
   --wandb-resume must
 ```
 
-当前 `latest_online_state.pt` 已完整保存到 episode 51（W&B 最后一条为 `_step=50`，
-两者采用 1-based/0-based 计数，状态一致）。`--num-episodes 300` 是恢复后的总目标，
-因此会从 episode 52 继续，而不是再训练 300 个 episode。
-
-上面的参数来自本次 run `yiycy1r4` 的实际 W&B metadata；原命令中依赖默认值的网络、
-优化器、RankQ、target smoothing、warmup、采样和 reset 参数也已显式冻结。恢复时只新增
-`--resume-from`、显式指定原 `--save-dir`，并用 `--wandb-run-id`/`--wandb-resume` 接回
-原 W&B run；不要修改其余参数。
 
 ## 7. 评测
 

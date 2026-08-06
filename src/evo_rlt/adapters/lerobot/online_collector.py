@@ -42,6 +42,7 @@ class RLTOnlineCollector:
         self._time_decay = time_decay
         self._frame_actions: list[torch.Tensor] = []
         self._frame_sources: list[float] = []
+        self._frame_intervention_masks: list[torch.Tensor] = []
         self._chunk_state: torch.Tensor | None = None
         self._chunk_ref: torch.Tensor | None = None
         self._chunk_is_critical: float = 0.0
@@ -85,6 +86,7 @@ class RLTOnlineCollector:
         self._episode_id = episode_id
         self._frame_actions.clear()
         self._frame_sources.clear()
+        self._frame_intervention_masks.clear()
         self._chunk_state = None
         self._chunk_ref = None
         self._chunk_is_critical = 0.0
@@ -96,6 +98,28 @@ class RLTOnlineCollector:
         self._pending_bonus = 0.0
         self.last_episode_reward = 0.0
 
+    def begin_attempt(self) -> None:
+        """Start the critical phase on a fresh collector/chunk boundary."""
+        self._frame_actions.clear()
+        self._frame_sources.clear()
+        self._frame_intervention_masks.clear()
+        self._chunk_state = None
+        self._chunk_ref = None
+        self._chunk_is_critical = 0.0
+        self._prev_transition = None
+        self._episode_staging = []
+        self._flushed = False
+        self._chunks_closed = 0
+        self._milestone_given = False
+        self._pending_bonus = 0.0
+        self.last_episode_reward = 0.0
+
+    def cut_chunk(self) -> ChunkTransition | None:
+        """Close a partial chunk before takeover/release changes its policy context."""
+        if self._flushed or not self._frame_actions:
+            return None
+        return self._emit_transition(done=False)
+
     def on_frame(
         self,
         action: torch.Tensor,
@@ -103,12 +127,15 @@ class RLTOnlineCollector:
         ref_chunk: torch.Tensor | None,
         source_type: float,
         is_critical: float,
+        intervention_mask: torch.Tensor | None = None,
     ) -> ChunkTransition | None:
         if self._flushed:
             return None
         if len(self._frame_actions) == 0:
-            # Capture state at chunk start. During intervention state_vec may be None;
-            # fall back to the previous transition's state so human chunks are not dropped.
+            # Capture state/ref at this chunk's own start. Never borrow the
+            # previous transition's tensors: after a control-source switch
+            # that would turn a human correction into a mislabeled
+            # (state, VLA-reference, action) tuple.
             if state_vec is not None:
                 # rlt.get_last_chunk_tensors() returns compute_chunk()'s raw
                 # batched tensors ((1, D) / (1, C, action_dim), B is always 1
@@ -121,13 +148,15 @@ class RLTOnlineCollector:
                 # torch.stack() crashes the first time a batch mixes both.
                 self._chunk_state = state_vec.squeeze(0) if state_vec.dim() > 1 else state_vec
                 self._chunk_ref = ref_chunk.squeeze(0) if ref_chunk is not None and ref_chunk.dim() > 2 else ref_chunk
-            elif self._prev_transition is not None:
-                self._chunk_state = self._prev_transition.next_state_vec
-                self._chunk_ref = self._prev_transition.next_ref_chunk
             self._chunk_is_critical = is_critical
 
         self._frame_actions.append(action.detach().cpu())
         self._frame_sources.append(source_type)
+        if intervention_mask is None:
+            intervention_mask = torch.full_like(
+                action, float(source_type == SOURCE_HUMAN), dtype=torch.float32
+            )
+        self._frame_intervention_masks.append(intervention_mask.detach().cpu().float())
 
         if len(self._frame_actions) >= self._C:
             return self._emit_transition(done=False)
@@ -201,6 +230,9 @@ class RLTOnlineCollector:
 
         explicit_outcome = torch.tensor(float(episode_success))
         for transition in self._episode_staging:
+            # Human corrections and autonomous actions belong to the same
+            # resolved critical-phase attempt. Their source affects Actor BC
+            # and sampling, not the trajectory success/failure label.
             transition.outcome = explicit_outcome.clone()
             self._buffer.add(transition)
         self._episode_staging = []
@@ -211,21 +243,43 @@ class RLTOnlineCollector:
         if self._chunk_state is None or self._chunk_ref is None:
             self._frame_actions.clear()
             self._frame_sources.clear()
+            self._frame_intervention_masks.clear()
             self._chunk_is_critical = 0.0
             return None
 
         actual = len(self._frame_actions)
         exec_list = self._frame_actions[: self._C]
         exec_chunk = torch.stack(exec_list)
+        intervention_mask = torch.stack(self._frame_intervention_masks[: self._C])
         if actual < self._C:
-            pad = torch.zeros(self._C - actual, self._action_dim, dtype=exec_chunk.dtype)
-            exec_chunk = torch.cat([exec_chunk, pad])
+            ref_for_pad = self._chunk_ref.squeeze(0) if self._chunk_ref.dim() > 2 else self._chunk_ref
+            exec_chunk = torch.cat([exec_chunk, ref_for_pad[actual:self._C].to(exec_chunk)])
+            intervention_mask = torch.cat(
+                [
+                    intervention_mask,
+                    torch.zeros(
+                        self._C - actual,
+                        self._action_dim,
+                        dtype=intervention_mask.dtype,
+                    ),
+                ]
+            )
 
         # Deterministic tie-break: human wins ties (highest priority)
         dominant_source = max(set(self._frame_sources), key=lambda s: (self._frame_sources.count(s), s))
+        # ref stays the true VLA reference (or its start-of-chunk fallback to
+        # the last known one, above) regardless of who executed the chunk --
+        # deliberately NOT exec_chunk, even for a human-dominant chunk. The
+        # actor is a residual over ref (mu = ref + delta) and actor_loss's BC
+        # term anchors to ref too, so ref==exec would erase exactly the
+        # signal a successful human correction is most valuable for ("VLA
+        # would have done X, the fix was delta=Y"), replacing it with a
+        # tautological zero-delta pair the residual actor learns nothing
+        # from. It also propagates: this chunk's ref becomes the *previous*
+        # transition's next_ref_chunk a few lines below, so overwriting it
+        # here would corrupt that transition's critic bootstrap target too,
+        # not just this chunk's own BC/residual target.
         ref = self._chunk_ref.cpu()
-        if dominant_source == SOURCE_HUMAN:
-            ref = exec_chunk.clone()
 
         state = self._chunk_state.cpu()
         reward_seq = torch.zeros(self._C)
@@ -244,11 +298,16 @@ class RLTOnlineCollector:
             next_state_vec=state,
             next_ref_chunk=ref,
             done=torch.tensor(float(done)),
-            intervention=torch.tensor(float(dominant_source == SOURCE_HUMAN)),
+            # A single corrected element is enough to make this an
+            # intervention transition; dominance is retained separately in
+            # ``source`` only. This ensures brief corrections are sampled
+            # from the actual chunk that contains them.
+            intervention=torch.tensor(float(bool(intervention_mask[:actual].any().item()))),
             actual_steps=torch.tensor(actual),
             source=torch.tensor(int(dominant_source)),
             episode_id=torch.tensor(self._episode_id),
             is_critical=torch.tensor(self._chunk_is_critical),
+            intervention_mask=intervention_mask,
         )
 
         if self._prev_transition is not None:
@@ -261,6 +320,7 @@ class RLTOnlineCollector:
 
         self._frame_actions.clear()
         self._frame_sources.clear()
+        self._frame_intervention_masks.clear()
         self._chunk_state = None
         self._chunk_ref = None
         self._chunk_is_critical = 0.0

@@ -129,6 +129,7 @@ class RLTActionModifier(nn.Module):
         vla_ref: bool = True,
         action_clip_delta: float | None = None,
         slew_rate_limit: float | None = None,
+        actor_deploy_scale: float = 1.0,
     ):
         super().__init__()
         self.rl_token = rl_token
@@ -139,10 +140,17 @@ class RLTActionModifier(nn.Module):
         self.vla_ref = vla_ref
         self.action_clip_delta = action_clip_delta
         self.slew_rate_limit = slew_rate_limit
+        self.set_actor_deploy_scale(actor_deploy_scale)
         self._cc_log_count = 0  # throttle for the compute_chunk ref diagnostic
         self.action_dim = action_dim
         self.proprio_dim = proprio_dim
         self._action_queue: deque[Tensor] = deque()
+        # Actor residuals aligned one-to-one with _action_queue.  Keeping a
+        # parallel queue lets pop_action() remember the residual of the frame
+        # that was actually dispatched, rather than the tail of a chunk that
+        # may later be interrupted and never executed.
+        self._residual_queue: deque[Tensor] = deque()
+        self._pending_residual_chunk: Tensor | None = None
         self._step_metadata: deque[RLTStepMetadata] = deque()
         # Last computed RL-phase chunk tensors, for online-RL transition
         # collection (see RLTOnlineCollector). Populated only in RL phase;
@@ -150,19 +158,11 @@ class RLTActionModifier(nn.Module):
         # or cleared by reset() -- see get_last_chunk_tensors().
         self._last_state_vec: Tensor | None = None
         self._last_ref_chunk: Tensor | None = None
-        # Last single-timestep action actually *dispatched for execution*
-        # (see pop_action/record_executed_action), for _apply_slew_rate_limit
-        # to enforce continuity across chunk boundaries, VLA<->RL phase
-        # switches, and human-intervention periods -- not just within one
-        # chunk. Deliberately NOT updated at compute_chunk() time: a freshly
-        # computed chunk can be interrupted (queue cleared via
-        # interrupt_chunk()) after only one or two of its frames were really
-        # popped -- e.g. the user switches VLA->RL mid-chunk -- and treating
-        # the whole chunk's last (never-executed) frame as "the robot's last
-        # position" would slew-limit the next chunk against a frame the
-        # robot never actually reached, which can itself produce the exact
-        # jump this limiter exists to prevent.
-        self._last_executed_action: Tensor | None = None
+        # The most recent actor residual that was actually popped.  This is
+        # deliberately not inferred from the absolute executed action: doing
+        # so would mix VLA reference motion (or a human correction) into the
+        # quantity the actor-residual limiter owns.
+        self._last_actor_residual: Tensor | None = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -205,15 +205,15 @@ class RLTActionModifier(nn.Module):
 
         if not self.is_rl_phase:
             # VLA phase: take the first chunk_exec_steps consecutive actions.
-            # Not slew-limited (VLA output is trusted as-is). _last_executed_
-            # action is intentionally left untouched here -- see
-            # pop_action/record_executed_action, which update it only when a
-            # frame is actually dispatched, not when this chunk is merely
-            # computed (it may never be fully consumed, e.g. an interrupt
-            # partway through).
+            # Not slew-limited (VLA output is trusted as-is).  Its actor
+            # residual is exactly zero, so a later VLA->RL handoff starts
+            # from the correct residual anchor without rate-limiting the VLA
+            # trajectory itself.
             n = min(self.chunk_exec_steps, vla_chunk.shape[1])
+            out = vla_chunk[:, :n, :]
+            self._pending_residual_chunk = torch.zeros_like(out)
             self._enqueue_metadata(phase_val, source_val, n)
-            return vla_chunk[:, :n, :]
+            return out
 
         # RL phase: take first chunk_length frames as actor reference
         ref_chunk = vla_chunk[:, :self.chunk_length, :]
@@ -228,36 +228,32 @@ class RLTActionModifier(nn.Module):
         should_log = self._cc_log_count < 3 or self._cc_log_count % 30 == 0
         mu, _ = self.actor(state_vec, ref_flat, training=False)
         mu_chunk = unflatten_chunk(mu, self.chunk_length)
-        if self.action_clip_delta is not None:
-            # Safety bound: limit how far the (possibly still-training) RL
-            # actor's output may deviate from the VLA reference chunk, on
-            # top of the residual-actor zero-init. Guards against a partially
-            # trained actor producing large jumps on real hardware.
-            # project_action_delta (NOT clamp(-1,1)-then-delta-then-
-            # clamp(-1,1) again) so |chunk - ref_chunk| < action_clip_delta
-            # holds exactly even when ref_chunk itself lies outside [-1,1] --
-            # a real, common QUANTILES-normalization occurrence (not a rare
-            # edge case): a trailing clamp(-1,1) after the delta-limiting
-            # step would silently blow this bound open by however far
-            # ref_chunk overshot, producing a visible jump even with a
-            # perfectly zero-residual actor (mu == ref). Same projection
-            # used in actor_loss/critic_loss, so training optimizes/
-            # bootstraps against the action that actually gets executed.
-            chunk = project_action_delta(mu_chunk, ref_chunk, self.action_clip_delta)
+        # Training and physical control are deliberately decoupled for safe
+        # online warmup.  The Actor may already be learning demonstrations,
+        # but scale=0 makes the critical-phase command an exact VLA
+        # pass-through.  Only after critic-only warmup does OnlineRLTrainer
+        # ramp this residual contribution toward 1.
+        if self.actor_deploy_scale == 0.0:
+            chunk = ref_chunk
         else:
-            chunk = mu_chunk.clamp(-1, 1)
-        if self.slew_rate_limit is not None:
-            # Runtime physical-safety bound on top of the ref-relative delta
-            # above: that bound only limits *where* each timestep's action
-            # sits relative to its own reference, not how much it can change
-            # from the immediately preceding physical timestep -- nothing
-            # stops adjacent frames from swinging from -action_clip_delta to
-            # +action_clip_delta. Target policy smoothing (see
+            mu_chunk = ref_chunk + self.actor_deploy_scale * (mu_chunk - ref_chunk)
+            if self.action_clip_delta is not None:
+                # Safety bound: limit how far the (possibly still-training)
+                # RL actor's output may deviate from the VLA reference chunk.
+                # The same projection is used in actor_loss/critic_loss so
+                # training sees the action that actually gets executed.
+                chunk = project_action_delta(mu_chunk, ref_chunk, self.action_clip_delta)
+            else:
+                chunk = mu_chunk.clamp(-1, 1)
+        if self.slew_rate_limit is not None and self.actor_deploy_scale > 0.0:
+            # Runtime bound on how quickly the learned contribution can move
+            # within the ref-relative delta range.  The trusted VLA reference
+            # itself remains untouched. Target policy smoothing (see
             # critic_loss's target_noise_std) only smooths the critic's
-            # local Q-estimate; it does not make the actor's output
-            # trajectory temporally continuous. See actor_loss's
+            # local Q-estimate; it does not make the actor residual
+            # temporally continuous. See actor_loss's
             # smoothness_weight for a training-time complement to this.
-            chunk = self._apply_slew_rate_limit(chunk)
+            chunk = self._apply_slew_rate_limit(chunk, ref_chunk)
         self._last_state_vec = state_vec.detach().clone()
         self._last_ref_chunk = ref_chunk.detach().clone()
         if should_log:
@@ -267,6 +263,7 @@ class RLTActionModifier(nn.Module):
             print(
                 f"[RLT source=RLT_ACTOR vla_ref={self.vla_ref}] "
                 f"compute_chunk #{self._cc_log_count}: "
+                f"actor_deploy_scale={self.actor_deploy_scale:.3f}, "
                 f"vla_ref[0,0,:4]={[round(v, 4) for v in ref_chunk[0, 0, :4].tolist()]}, "
                 f"actor_out[0,0,:4]={[round(v, 4) for v in chunk[0, 0, :4].tolist()]}, "
                 f"mean_abs_delta={delta.mean().item():.4f}, "
@@ -276,44 +273,60 @@ class RLTActionModifier(nn.Module):
             )
         self._cc_log_count += 1
 
-        # _last_executed_action is intentionally NOT updated here -- see
-        # pop_action/record_executed_action. This chunk may be interrupted
-        # (queue cleared) after only a few of its frames are actually
-        # popped; using its own last frame as "the robot's last position"
-        # would be wrong whenever that happens.
+        # enqueue()/pop_action() carry these residuals in lockstep with the
+        # returned actions.  Do not update _last_actor_residual here: this
+        # chunk may be interrupted before all (or any) of it is dispatched.
+        self._pending_residual_chunk = (chunk - ref_chunk).detach().clone()
         self._enqueue_metadata(phase_val, source_val, self.chunk_length)
         return chunk
 
-    def _apply_slew_rate_limit(self, chunk: Tensor) -> Tensor:
-        """Sequentially clamp each timestep's action to within
-        self.slew_rate_limit of the previous *physical* timestep's action,
-        carrying over via self._last_executed_action from whatever was
-        actually dispatched last (see pop_action/record_executed_action) --
-        the last real pop from a previous chunk, the last VLA-phase action,
-        or the last human-intervention action -- so the constraint holds
-        across chunk/phase/intervention boundaries too, not just within one
-        chunk. Hard clamp is fine here (no gradient needed: compute_chunk
-        runs under @torch.no_grad()); this is a runtime physical-safety
-        bound, not something the training loss can substitute for.
+    def set_actor_deploy_scale(self, scale: float) -> None:
+        """Set the fraction of the Actor residual allowed onto hardware.
+
+        ``0`` is an exact VLA pass-through and ``1`` is the full Actor
+        policy.  Clearing a queued chunk makes a changed scale effective at
+        the next inference rather than leaking commands computed under the
+        previous scale.
         """
-        # Actions reported by record_loop originate from the robot-action
-        # dictionary and are therefore CPU tensors, while policy inference
-        # normally produces ``chunk`` on CUDA.  Keep record_executed_action
-        # device-agnostic and align its continuity reference at the point of
-        # use; this also preserves the chunk's dtype instead of accidentally
-        # promoting the whole result when the recorded tensor has a different
-        # dtype.
-        prev = (
-            self._last_executed_action.to(device=chunk.device, dtype=chunk.dtype)
-            if self._last_executed_action is not None
-            else chunk[:, 0, :]
-        )
+        scale = float(scale)
+        if not 0.0 <= scale <= 1.0:
+            raise ValueError("actor_deploy_scale must be in [0, 1]")
+        if hasattr(self, "actor_deploy_scale") and scale != self.actor_deploy_scale:
+            self.interrupt_chunk()
+        self.actor_deploy_scale = scale
+
+    def _apply_slew_rate_limit(self, chunk: Tensor, ref_chunk: Tensor) -> Tensor:
+        """Sequentially clamp how fast the ACTOR RESIDUAL (chunk - ref_chunk)
+        may change from one physical timestep to the next.  pop_action()
+        carries the last residual that was really dispatched, so interrupted
+        chunks cannot leak unexecuted tail frames into the next chunk.
+
+        Limiting the absolute command would also rate-limit the trusted VLA
+        reference, distort gripper timing, and allow reference-relative lag
+        to exceed action_clip_delta.  Limiting only the residual keeps the
+        intended property (the actor contribution cannot jump) while leaving
+        the reference untouched.
+        Absolute continuity across an intervention release is a separate
+        concern owned by loop.py's release action blend.  Human actions are
+        therefore never converted into actor residuals.  Hard clamp is fine
+        here (no gradient needed: compute_chunk runs under @torch.no_grad()).
+        """
+        residual = chunk - ref_chunk
+        if self._last_actor_residual is None:
+            # Nothing dispatched yet (fresh reset / first frame): ramp the
+            # residual in from "actor contributes nothing", the safe default.
+            prev = torch.zeros_like(residual[:, 0, :])
+        else:
+            prev = self._last_actor_residual.to(
+                device=chunk.device, dtype=chunk.dtype
+            )
         limited_steps = []
-        for t in range(chunk.shape[1]):
-            step = prev + (chunk[:, t, :] - prev).clamp(-self.slew_rate_limit, self.slew_rate_limit)
-            limited_steps.append(step)
-            prev = step
-        return torch.stack(limited_steps, dim=1)
+        for t in range(residual.shape[1]):
+            prev = prev + (residual[:, t, :] - prev).clamp(
+                -self.slew_rate_limit, self.slew_rate_limit
+            )
+            limited_steps.append(prev)
+        return ref_chunk + torch.stack(limited_steps, dim=1)
 
     def _enqueue_metadata(self, phase: float, source: float, count: int) -> None:
         """Enqueue metadata entries for every step in the upcoming chunk."""
@@ -321,37 +334,29 @@ class RLTActionModifier(nn.Module):
             self._step_metadata.append(RLTStepMetadata(phase=phase, source_type=source))
 
     def enqueue(self, chunk: Tensor) -> None:
-        """Enqueue chunk steps into the action queue.
+        """Enqueue chunk steps and their aligned actor residuals.
 
         Args:
             chunk: (B, C, action_dim).
         """
+        residual_chunk = self._pending_residual_chunk
+        if residual_chunk is None or residual_chunk.shape != chunk.shape:
+            raise RuntimeError(
+                "enqueue() must immediately follow compute_chunk() with the returned chunk"
+            )
         self._action_queue.extend(chunk.transpose(0, 1))
+        self._residual_queue.extend(residual_chunk.transpose(0, 1))
+        self._pending_residual_chunk = None
 
     def pop_action(self) -> Tensor:
         """Pop and return the next single-step action from the queue, and
-        record it as the slew-rate limiter's continuity reference (see
-        _apply_slew_rate_limit) -- this, not compute_chunk(), is the moment
-        a frame is actually about to be dispatched for execution. See
-        record_executed_action for the human-intervention case, where
-        policy inference (and this method) is bypassed entirely."""
+        record its aligned actor residual as the slew-rate continuity
+        reference.  This, not compute_chunk(), is the moment a frame is
+        actually selected for dispatch."""
         action = self._action_queue.popleft()
-        self._last_executed_action = action.detach().clone()
+        residual = self._residual_queue.popleft()
+        self._last_actor_residual = residual.detach().clone()
         return action
-
-    def record_executed_action(self, action: Tensor) -> None:
-        """Externally record the action actually sent to the robot this
-        frame, for frames where it didn't come from pop_action() -- e.g.
-        during human intervention, where policy inference (and therefore
-        this modifier's own queue) is skipped entirely. Without this,
-        resuming RL/VLA control after an intervention would slew-limit
-        against a stale pre-intervention position instead of wherever the
-        human actually left the arm. `action` must be in the same
-        normalized action space compute_chunk operates in (see loop.py's
-        _normalize_executed_action) and shaped (B, action_dim). It may live
-        on CPU; _apply_slew_rate_limit aligns it to the inference tensor's
-        device and dtype before use."""
-        self._last_executed_action = action.detach().clone()
 
     def pop_step_metadata(self) -> RLTStepMetadata | None:
         """Pop and return the next step's metadata, or None if empty."""
@@ -363,12 +368,10 @@ class RLTActionModifier(nn.Module):
         """Peek (not pop) the (state_vec, ref_chunk) from the most recently
         computed RL-phase chunk, or None if none has been computed yet.
 
-        Deliberately non-consuming: policy inference (and therefore
-        compute_chunk()) is skipped entirely while human intervention is
-        active, so this can go several frames without a fresh value. Callers
-        that only care about it at their own chunk-start boundary (e.g.
-        RLTOnlineCollector) still get the most recent real VLA/RL-token
-        encoding available instead of losing it the instant it's read once.
+        Deliberately non-consuming: the recording loop reads it on every
+        physical frame, while it changes only when a new actor chunk is
+        computed. This keeps all frames in that chunk attached to the same
+        state/reference without removing the cache after its first read.
 
         Does NOT include the actor's output chunk: RLTOnlineCollector builds
         exec_chunk itself from the actual per-frame executed actions (which
@@ -402,17 +405,21 @@ class RLTActionModifier(nn.Module):
     def interrupt_chunk(self) -> None:
         """Clear action and metadata queues (e.g. on phase switch or human
         intervention start). Deliberately does NOT clear the last-chunk
-        tensor cache (see get_last_chunk_tensors) -- intervention stops new
-        chunks from being computed, so the cache should keep holding the most
-        recent real encoding rather than going blank the instant it's read."""
+        tensor cache (see get_last_chunk_tensors); the next inference replaces
+        it with a fresh encoding, including counterfactual inference performed
+        while a human action is selected for execution."""
         self._action_queue.clear()
+        self._residual_queue.clear()
+        self._pending_residual_chunk = None
         self._step_metadata.clear()
 
     def reset(self) -> None:
         """Reset queues and phase controller to initial state."""
         self._action_queue.clear()
+        self._residual_queue.clear()
+        self._pending_residual_chunk = None
         self._step_metadata.clear()
         self._last_state_vec = None
         self._last_ref_chunk = None
-        self._last_executed_action = None
+        self._last_actor_residual = None
         self.phase_ctrl.reset()
