@@ -309,6 +309,33 @@ class TestRankQRankingLoss:
         assert torch.isfinite(loss)
         assert loss.item() != 0.0
 
+    def test_excluded_rows_cannot_supply_cross_batch_candidates(self, critic):
+        state = torch.randn(4, STATE_DIM)
+        action = torch.randn(4, CHUNK_DIM)
+        outcome = torch.tensor([-1.0, -1.0, 1.0, 0.0])
+        changed_offline = action.clone()
+        changed_offline[:2] = changed_offline[:2] * 1000.0 + 500.0
+        batch_action_mask = torch.ones_like(action)
+
+        torch.manual_seed(7)
+        original = rankq_ranking_loss(
+            critic,
+            state,
+            action,
+            outcome,
+            action_mask=batch_action_mask,
+        )
+        torch.manual_seed(7)
+        changed = rankq_ranking_loss(
+            critic,
+            state,
+            changed_offline,
+            outcome,
+            action_mask=batch_action_mask,
+        )
+
+        assert changed.item() == pytest.approx(original.item())
+
     def test_positive_margin_stops_satisfied_failure_pair(self):
         class _CallOrderedCritic:
             def __init__(self):
@@ -396,8 +423,7 @@ class TestRankQRankingLoss:
         self, actor, critic, target_critic, batch
     ):
         """Enabling the alphas without an 'outcome' key in the batch must
-        not crash or change the loss -- offline lerobot-train batches don't
-        carry outcome labels."""
+        not crash or change the loss for generic unlabeled callers."""
         base = critic_loss(critic, target_critic, actor, batch, gamma=0.99, C=C)
         still_base = critic_loss(
             critic, target_critic, actor, batch, gamma=0.99, C=C,

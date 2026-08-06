@@ -67,8 +67,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
 
-import torch
-
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
 )
@@ -107,8 +105,7 @@ from evo_rlt.adapters.lerobot.record.common import (
 from evo_rlt.adapters.lerobot.record.hil import (
     ACPInferenceConfig,
     PolicySyncDualArmExecutor,
-    _capture_policy_runtime_state,  # noqa: F401
-    _predict_policy_action_with_acp_inference,  # noqa: F401
+    _predict_policy_action_with_acp_inference,
 )
 from evo_rlt.adapters.lerobot.record.loop import record_loop
 from lerobot.teleoperators import (  # noqa: F401
@@ -127,7 +124,6 @@ from lerobot.teleoperators import (  # noqa: F401
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
-    is_headless,
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
 )

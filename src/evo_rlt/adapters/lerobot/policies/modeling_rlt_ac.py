@@ -220,10 +220,10 @@ class ChunkACPolicy(PreTrainedPolicy):
         out["exec_chunk_flat"] = out["exec_chunk"].flatten(start_dim=-2)
         out["ref_chunk_flat"] = out["ref_chunk"].flatten(start_dim=-2)
         out["next_ref_flat"] = out["next_ref_chunk"].flatten(start_dim=-2)
-        # Optional: per-transition trajectory outcome for the RankQ ranking
-        # loss (see losses.critic_loss). Absent for batches with no resolved
-        # outcome (e.g. offline lerobot-train pretraining), in which case
-        # critic_loss simply skips the ranking term.
+        # Optional trajectory labels. ``outcome`` gates trusted demo BC;
+        # ``rankq_outcome`` independently controls RankQ eligibility so a
+        # fixed offline cache can retain success labels without entering the
+        # ranking loss. Generic callers may omit both labels.
         for key in ("outcome", "rankq_outcome"):
             if key in batch:
                 v = batch[key]

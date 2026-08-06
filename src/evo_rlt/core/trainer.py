@@ -8,10 +8,9 @@ import torch
 from evo_rlt.core.algorithm import RLTAlgorithm
 from evo_rlt.core.collector import Environment, rl_collect_step, warmup_collect
 from evo_rlt.core.config import RLTConfig
-from evo_rlt.core.losses import actor_loss, critic_loss
+from evo_rlt.core.losses import critic_loss
 from evo_rlt.core.replay_buffer import ReplayBuffer
 from evo_rlt.core.rl_token import RLTokenModule
-from evo_rlt.core.utils import soft_update
 
 logger = logging.getLogger(__name__)
 

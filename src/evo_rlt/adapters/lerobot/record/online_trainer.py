@@ -319,9 +319,9 @@ class OnlineRLTrainer:
 
         Offline demonstrations are fixed and uniformly sampled. Online data
         keeps its outcome/intervention/recent stratification. Both sources
-        retain their real outcome for TD/demo BC, while rankq_outcome marks
-        only online rows as RankQ-eligible. The warmup and UTD budget remain
-        based solely on online experience.
+        contribute ordinary TD samples and retain their real outcome for
+        demo BC, while rankq_outcome marks only online rows as RankQ-eligible.
+        The warmup and UTD budget remain based solely on online experience.
         """
         online_n, offline_n = self._split_batch_sizes()
 
@@ -346,19 +346,6 @@ class OnlineRLTrainer:
             return online, 0, actual_online_n
         assert self.offline_buffer is not None
         offline = self.offline_buffer.sample(offline_n)
-        # New caches preserve their explicit episode success/failure labels.
-        # Old demo caches have no label, so retain the historical assumption
-        # that demonstrated trajectories are successes.
-        offline_outcome = self.offline_buffer.outcome_labels(offline["episode_id"])
-        offline["outcome"] = torch.where(
-            offline["outcome"] >= 0.0,
-            offline["outcome"],
-            torch.where(
-                offline_outcome >= 0.0,
-                offline_outcome,
-                torch.ones_like(offline_outcome),
-            ),
-        )
         # Offline demonstrations still contribute TD targets and direct Actor
         # BC, but do not create RankQ pairs. ``-1`` is RankQ's existing
         # unresolved/ignored label.

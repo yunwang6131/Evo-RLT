@@ -7,9 +7,9 @@ disk. The cache is consumed by ChunkTransitionDataset at AC training time.
 This v2 replaces the legacy custom-load builder. It loads the preprocessor
 directly from the SFT pi05 ckpt so the cache is byte-aligned with the deploy
 normalization. Per-batch progress with elapsed time is written to stdout in
-unbuffered mode so a hung run is visible immediately. Each completed episode
-is checkpointed to a tmp file so a kill mid-run only forfeits the in-flight
-episode.
+unbuffered mode so a hung run is visible immediately. Completed work is
+checkpointed atomically every five episodes, so an interruption can forfeit
+the current episode plus at most four completed episodes since the last save.
 """
 from __future__ import annotations
 

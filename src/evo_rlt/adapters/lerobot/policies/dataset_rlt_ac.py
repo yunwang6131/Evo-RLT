@@ -115,10 +115,10 @@ class ChunkTransitionDataset(Dataset):
         return self.num_frames
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        # This dataset is a fixed offline demonstration cache. Preserve the
-        # real outcome for TD/demo BC, while explicitly excluding the sample
-        # from RankQ. Returning a shallow copy avoids mutating the loaded cache
-        # dictionary in place.
+        # This dataset is a fixed offline demonstration cache. Its transition
+        # fields still train TD and its real outcome still gates demo BC, while
+        # rankq_outcome explicitly excludes it from RankQ. Returning a shallow
+        # copy avoids mutating the loaded cache dictionary in place.
         transition = dict(self._transitions[idx])
         transition["rankq_outcome"] = torch.full_like(
             transition["outcome"], -1.0

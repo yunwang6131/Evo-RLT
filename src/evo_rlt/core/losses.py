@@ -204,11 +204,28 @@ def rankq_ranking_loss(
     """
     if margin < 0:
         raise ValueError("margin must be >= 0")
-    success_mask = outcome == 1
-    failure_mask = outcome == 0
-    if not (bool(success_mask.any()) or bool(failure_mask.any())):
+    eligible_mask = (outcome == 1) | (outcome == 0)
+    if not bool(eligible_mask.any()):
         return action_flat.new_zeros(())
 
+    # Remove unresolved/excluded rows *before* constructing cross-batch
+    # candidates.  Both the marginally shuffled "random" action and the
+    # batch-rolled "permuted" action borrow values from other rows; masking
+    # only the final loss would therefore still let offline demonstrations
+    # shape the negative candidates used by eligible online transitions.
+    if not bool(eligible_mask.all()):
+        state_vec = state_vec[eligible_mask]
+        action_flat = action_flat[eligible_mask]
+        outcome = outcome[eligible_mask]
+        if (
+            action_mask is not None
+            and action_mask.ndim > 1
+            and action_mask.shape[0] == eligible_mask.shape[0]
+        ):
+            action_mask = action_mask[eligible_mask]
+
+    success_mask = outcome == 1
+    failure_mask = outcome == 0
     candidates = _rankq_candidate_actions(action_flat, noise_scale, action_mask)
     q1, q2 = {}, {}
     for name, action in candidates.items():

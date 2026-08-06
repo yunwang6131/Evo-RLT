@@ -153,7 +153,7 @@ Space      双臂人工接管；再次按下解除接管
 s / f      整个记录 episode 成功 / 失败并结束
 ```
 
-critical phase 在 `r/u` 后立即结束并切回 VLA；后续 VLA 动作不进入在线 RL buffer。Offline buffer 固定不变，Online buffer 持续增长；每个训练 batch 由 `offline-batch-fraction` 控制混合比例。warmup、success/failure 门槛和 UTD 只统计 Online buffer。warmup 期间 Actor 可以在后台使用成功 offline 示范做纯 BC，但 `actor_deploy_scale=0`，机械臂仍然 100% 执行 VLA；critic-only 期间同样不把已更新的 Actor 输出直接交给机械臂。critic-only 结束后，`actor_deploy_scale` 才在 `actor-unfreeze-ramp-episodes` 内从 0 逐步升到 1，同时 Actor 的 Q 更新频率逐步解冻。
+critical phase 在 `r/u` 后立即结束并切回 VLA；后续 VLA 动作不进入在线 RL buffer。Offline buffer 固定不变，Online buffer 持续增长；每个训练 batch 由 `offline-batch-fraction` 控制混合比例。Offline transition 参与 TD，并用真实 outcome 门控成功示范 BC，但不参与 RankQ；RankQ 的成功/失败排序信号只来自 Online buffer。warmup、success/failure 门槛和 UTD 只统计 Online buffer。warmup 期间 Actor 可以在后台使用成功 offline 示范做纯 BC，但 `actor_deploy_scale=0`，机械臂仍然 100% 执行 VLA；critic-only 期间同样不把已更新的 Actor 输出直接交给机械臂。critic-only 结束后，`actor_deploy_scale` 才在 `actor-unfreeze-ramp-episodes` 内从 0 逐步升到 1，同时 Actor 的 Q 更新频率逐步解冻。
 
 ## 5. 自定义 Episode Reset 位置
 

@@ -104,9 +104,9 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     # Augments the critic TD loss with a pairwise ranking term over
     # noisy/very-noisy/random/permuted variants of each executed action, so
     # Q-gradients w.r.t. action point toward higher-quality behavior instead
-    # of just being clamped. Applied only where the sampled batch carries a
-    # resolved "outcome" label (see losses.rankq_ranking_loss); batches
-    # without one (e.g. offline lerobot-train pretraining) are unaffected.
+    # of just being clamped. Applied only to rows selected by rankq_outcome
+    # (falling back to outcome for generic callers); fixed offline cache rows
+    # explicitly use rankq_outcome=-1 and are excluded.
     # alpha0/alpha1 = 1.0, noise_scale = 0.15 match the paper's defaults.
     # rankq_ranking_loss averages each branch over its own pair count before
     # applying alpha (see that function's docstring), so alpha=1.0 here is
