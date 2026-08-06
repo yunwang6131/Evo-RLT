@@ -65,6 +65,39 @@ def test_mixed_batch_has_fixed_offline_online_split():
     assert offline_n == 4
     assert online_n == 6
     assert batch["state_vec"].shape[0] == 10
+    assert torch.equal(batch["rankq_outcome"][:offline_n], torch.full((offline_n,), -1.0))
+
+
+def test_mixed_batch_keeps_offline_success_for_bc_but_excludes_it_from_rankq():
+    trainer = object.__new__(OnlineRLTrainer)
+    trainer.cfg = SimpleNamespace(
+        batch_size=4,
+        offline_batch_fraction=0.5,
+        use_stratified_sampling=False,
+    )
+    trainer.offline_buffer = ReplayBuffer(capacity=2)
+    for episode_id in (10, 11):
+        trainer.offline_buffer.add(
+            _outcome_transition(episode_id, success=True, intervention=False)
+        )
+    trainer.replay_buffer = ReplayBuffer(capacity=2)
+    trainer.replay_buffer.add(
+        _outcome_transition(20, success=False, intervention=False)
+    )
+    trainer.replay_buffer.add(
+        _outcome_transition(21, success=True, intervention=False)
+    )
+
+    batch, offline_n, online_n = trainer._sample_training_batch()
+
+    assert (offline_n, online_n) == (2, 2)
+    assert torch.equal(batch["outcome"][:offline_n], torch.ones(offline_n))
+    assert torch.equal(
+        batch["rankq_outcome"][:offline_n], torch.full((offline_n,), -1.0)
+    )
+    assert torch.equal(
+        batch["rankq_outcome"][offline_n:], batch["outcome"][offline_n:]
+    )
 
 
 def test_sampling_preserves_transition_outcome_when_episode_id_is_shared():
@@ -88,6 +121,7 @@ def test_sampling_preserves_transition_outcome_when_episode_id_is_shared():
     batch, _, _ = trainer._sample_training_batch()
 
     assert sorted(batch["outcome"].tolist()) == [0.0, 1.0]
+    assert torch.equal(batch["rankq_outcome"], batch["outcome"])
 
 
 def test_split_batch_sizes_matches_sample_training_batch():

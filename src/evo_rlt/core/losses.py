@@ -263,7 +263,8 @@ def critic_loss(
     Uses actual_steps to compute the correct bootstrap exponent gamma^k
     instead of always using gamma^C.
 
-    If `batch["outcome"]` is present and either rankq_alpha_* is > 0, adds
+    If `batch["rankq_outcome"]` (or the backward-compatible `"outcome"`
+    fallback) is present and either rankq_alpha_* is > 0, adds
     RankQ's self-supervised ranking loss (see rankq_ranking_loss above) as
     an additional term. Fully backward compatible: with the default alphas
     (or no "outcome" key in batch) this is a no-op. `action_mask` (see
@@ -390,7 +391,10 @@ def critic_loss(
     loss = td_loss
 
     rankq_loss: torch.Tensor | None = None
-    outcome = batch.get("outcome")
+    # ``outcome`` is also used by Actor demo BC, so online training supplies
+    # a separate rankq_outcome that can exclude offline demonstrations without
+    # discarding their successful-supervision label.
+    outcome = batch.get("rankq_outcome", batch.get("outcome"))
     if outcome is not None and (rankq_alpha_success > 0 or rankq_alpha_failure > 0):
         rankq_loss = rankq_ranking_loss(
             critic, x, a, outcome,

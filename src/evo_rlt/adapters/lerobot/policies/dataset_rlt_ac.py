@@ -66,11 +66,16 @@ class ChunkTransitionDataset(Dataset):
         )
         if not self._transitions:
             raise ValueError(f"empty cache at {path}")
+
         for index, transition in enumerate(self._transitions):
             outcome = transition.get("outcome")
             supervision_mask = transition.get("intervention_mask")
             exec_chunk = transition.get("exec_chunk")
-            if outcome is None or supervision_mask is None:
+            if (
+                outcome is None
+                or float(outcome.item()) < 0.0
+                or supervision_mask is None
+            ):
                 raise ValueError(
                     f"Transition {index} in {path} predates direct offline Actor "
                     "supervision; rebuild the cache with the current cache builder"
@@ -110,4 +115,12 @@ class ChunkTransitionDataset(Dataset):
         return self.num_frames
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        return self._transitions[idx]
+        # This dataset is a fixed offline demonstration cache. Preserve the
+        # real outcome for TD/demo BC, while explicitly excluding the sample
+        # from RankQ. Returning a shallow copy avoids mutating the loaded cache
+        # dictionary in place.
+        transition = dict(self._transitions[idx])
+        transition["rankq_outcome"] = torch.full_like(
+            transition["outcome"], -1.0
+        )
+        return transition

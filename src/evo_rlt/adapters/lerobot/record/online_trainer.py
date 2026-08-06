@@ -258,6 +258,12 @@ class OnlineRLTrainer:
                     f"{tuple(transition.exec_chunk.shape)} != "
                     f"({policy_cfg.chunk_length}, {policy_cfg.action_dim})"
                 )
+            outcome = getattr(transition, "outcome", None)
+            if outcome is None or float(outcome.item()) < 0.0:
+                raise ValueError(
+                    f"Offline transition {index} in {cache_path} has no resolved outcome "
+                    "for gating Actor demonstration loss"
+                )
             supervision_mask = getattr(transition, "intervention_mask", None)
             if (
                 supervision_mask is None
@@ -266,12 +272,6 @@ class OnlineRLTrainer:
                 raise ValueError(
                     f"Offline transition {index} in {cache_path} has no valid "
                     "per-element Actor supervision mask"
-                )
-            outcome = getattr(transition, "outcome", None)
-            if outcome is None:
-                raise ValueError(
-                    f"Offline transition {index} in {cache_path} has no outcome label "
-                    "for gating Actor demonstration loss"
                 )
             if float(outcome.item()) >= 0.5 and not bool(supervision_mask.any().item()):
                 raise ValueError(
@@ -318,8 +318,10 @@ class OnlineRLTrainer:
         """Sample a controlled offline/online mixture.
 
         Offline demonstrations are fixed and uniformly sampled. Online data
-        keeps its outcome/intervention/recent stratification. The warmup and
-        UTD budget remain based solely on online experience.
+        keeps its outcome/intervention/recent stratification. Both sources
+        retain their real outcome for TD/demo BC, while rankq_outcome marks
+        only online rows as RankQ-eligible. The warmup and UTD budget remain
+        based solely on online experience.
         """
         online_n, offline_n = self._split_batch_sizes()
 
@@ -335,6 +337,10 @@ class OnlineRLTrainer:
             online["outcome"],
             resolved_online,
         )
+        # RankQ should learn its local action ordering from real online
+        # outcomes. Keep this separate from ``outcome`` because the latter is
+        # also the trust gate for successful offline demonstration BC.
+        online["rankq_outcome"] = online["outcome"].clone()
         if offline_n == 0:
             actual_online_n = next(iter(online.values())).shape[0]
             return online, 0, actual_online_n
@@ -353,6 +359,10 @@ class OnlineRLTrainer:
                 torch.ones_like(offline_outcome),
             ),
         )
+        # Offline demonstrations still contribute TD targets and direct Actor
+        # BC, but do not create RankQ pairs. ``-1`` is RankQ's existing
+        # unresolved/ignored label.
+        offline["rankq_outcome"] = torch.full_like(offline["outcome"], -1.0)
         actual_offline_n = next(iter(offline.values())).shape[0]
         actual_online_n = next(iter(online.values())).shape[0]
         return (
@@ -821,6 +831,7 @@ class OnlineRLTrainer:
                     "done": raw["done"],
                     "actual_steps": raw["actual_steps"],
                     "outcome": raw["outcome"],
+                    "rankq_outcome": raw["rankq_outcome"],
                     "intervention_mask_flat": raw["intervention_mask_flat"],
                 }
                 batch = {k: v.to(device) for k, v in batch.items()}

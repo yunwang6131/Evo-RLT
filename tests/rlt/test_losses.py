@@ -405,6 +405,29 @@ class TestRankQRankingLoss:
         )
         assert still_base.item() == pytest.approx(base.item())
 
+    def test_rankq_outcome_can_exclude_offline_rows_without_changing_bc_outcome(
+        self, actor, critic, target_critic, batch
+    ):
+        excluded = dict(batch)
+        excluded["outcome"] = torch.ones(batch["state_vec"].shape[0])
+        excluded["rankq_outcome"] = torch.full_like(excluded["outcome"], -1.0)
+
+        torch.manual_seed(3)
+        base = critic_loss(critic, target_critic, actor, batch, gamma=0.99, C=C)
+        torch.manual_seed(3)
+        with_excluded_rankq = critic_loss(
+            critic,
+            target_critic,
+            actor,
+            excluded,
+            gamma=0.99,
+            C=C,
+            rankq_alpha_success=1.0,
+            rankq_alpha_failure=1.0,
+        )
+
+        assert with_excluded_rankq.item() == pytest.approx(base.item())
+
     def test_critic_loss_forwards_action_mask_to_ranking_term(
         self, actor, critic, target_critic, batch
     ):

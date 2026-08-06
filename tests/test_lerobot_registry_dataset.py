@@ -32,6 +32,8 @@ def test_register_loads_chunk_transition_dataset_from_cache_dir(tmp_path):
     assert isinstance(dataset, ChunkTransitionDataset)
     assert len(dataset) == 1
     assert dataset[0]["state_vec"].shape == (3,)
+    assert dataset[0]["outcome"].item() == 1.0
+    assert dataset[0]["rankq_outcome"].item() == -1.0
 
 
 def test_chunk_transition_dataset_rejects_cache_without_actor_supervision(tmp_path):

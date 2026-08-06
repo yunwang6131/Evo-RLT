@@ -224,9 +224,10 @@ class ChunkACPolicy(PreTrainedPolicy):
         # loss (see losses.critic_loss). Absent for batches with no resolved
         # outcome (e.g. offline lerobot-train pretraining), in which case
         # critic_loss simply skips the ranking term.
-        if "outcome" in batch:
-            v = batch["outcome"]
-            out["outcome"] = v if isinstance(v, Tensor) else torch.as_tensor(v)
+        for key in ("outcome", "rankq_outcome"):
+            if key in batch:
+                v = batch[key]
+                out[key] = v if isinstance(v, Tensor) else torch.as_tensor(v)
         if "intervention_mask_flat" in batch:
             v = batch["intervention_mask_flat"]
             out["intervention_mask_flat"] = v if isinstance(v, Tensor) else torch.as_tensor(v)
