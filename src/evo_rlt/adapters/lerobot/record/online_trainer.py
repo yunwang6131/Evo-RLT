@@ -615,19 +615,42 @@ class OnlineRLTrainer:
         }
 
     def _empirical_return_mean(self) -> float:
-        """Mean undiscounted per-episode return actually observed in the
-        replay buffer -- the yardstick Q(s,.) is supposed to be predicting.
+        """Mean *discounted* per-episode return in the replay buffer, from
+        the episode's first step -- the quantity Q(s0, .) is defined to
+        predict, and therefore the only fair denominator for a calibration
+        ratio.
+
+        Discounting matters more here than it looks. gamma applies per
+        PHYSICAL step, not per chunk: within a chunk via
+        losses.discounted_chunk_return's gamma^i, and across chunks via
+        critic_loss's gamma^actual_steps bootstrap. At ~783 steps per episode
+        an undiscounted sum would overstate the target by 1.5x at
+        gamma=0.9995 and by ~2600x at gamma=0.99, which would make the ratio
+        read as pathological overestimation purely as an artifact of the
+        discount setting.
 
         Same whole-buffer scan as _intervention_correction_metrics(), and
         cheap for the same reason (once per episode, alongside hundreds of
         gradient steps).
         """
+        gamma = float(self.policy_cfg.gamma)
         per_episode: dict[int, float] = {}
+        elapsed: dict[int, int] = {}
+        # Buffer order is collection order, so the running step count per
+        # episode is the transition's true offset from that episode's start.
         for transition in self.replay_buffer.buffer:
             episode_id = int(transition.episode_id.item())
-            per_episode[episode_id] = (
-                per_episode.get(episode_id, 0.0) + float(transition.reward_seq.sum().item())
-            )
+            steps = int(transition.actual_steps.item())
+            offset = elapsed.get(episode_id, 0)
+            rewards = transition.reward_seq[:steps]
+            if rewards.numel():
+                discounts = gamma ** (
+                    offset + torch.arange(rewards.numel(), dtype=torch.float32)
+                )
+                per_episode[episode_id] = per_episode.get(episode_id, 0.0) + float(
+                    (rewards.to(torch.float32) * discounts).sum().item()
+                )
+            elapsed[episode_id] = offset + steps
         if not per_episode:
             return 0.0
         return sum(per_episode.values()) / len(per_episode)
@@ -639,11 +662,13 @@ class OnlineRLTrainer:
         on this project (150 episodes of a flat 0.43 intervention rate before
         either was visible in hindsight):
 
-        `q_vs_return_ratio` -- Q(s, ref) against the mean episode return the
-        buffer actually contains. TD bootstrap bias accumulates silently: a
-        run that looked converged by every logged loss had Q ~= 4.8 against a
-        best-ever observed episode return of 1.675 (ratio ~9). It should sit
-        near 1; a persistent climb means the critic is inventing value.
+        `q_vs_return_ratio` -- Q(s, ref) against the mean *discounted*
+        episode return the buffer actually contains (see
+        _empirical_return_mean: discounted, because that is what Q predicts).
+        TD bootstrap bias accumulates silently: a run that looked converged
+        by every logged loss had Q ~= 4.8 against a discounted mean return of
+        0.374 -- a 12.8x overestimate that no logged loss revealed. It should
+        sit near 1; a persistent climb means the critic is inventing value.
 
         `q_rank_margin` -- Q(s, human takeover action) minus Q(s, the action
         the actor would actually deploy), on intervened rows only. This is the

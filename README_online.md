@@ -129,7 +129,7 @@ evo-rlt-online-train \
   --time-decay 0.98 \
   --beta 0.3 \
   --demo-bc-weight 1.0 \
-  --gamma 0.99 \
+  --gamma 0.9995 \
   --target-q-clip 3.0 \
   --rankq-margin 0.1 \
   --rankq-margin-relative \
@@ -151,18 +151,24 @@ evo-rlt-online-train \
 
 ### Critic 校准参数与健康指标
 
-`--gamma 0.99`、`--target-q-clip 3.0`、`--rankq-margin-relative` 三项是针对 run6（150 集，
-自主成功 3/86，介入率始终 0.43 不降）诊断出的两个问题设的，改前的取值分别是 0.9995、
-100.0、绝对 margin：
+`--target-q-clip 3.0`、`--rankq-margin-relative` 是针对 run6（150 集，自主成功 3/86，
+介入率始终 0.43 不降）诊断出的两个问题设的，改前分别是 100.0 和绝对 margin：
 
-- **Q 高估约 9 倍**：`Q(s,ref)=4.79`，而 buffer 里每集平均回报只有 0.536、史上最好一集
-  1.675。`gamma=0.9995` 的有效视界是 `1/(1-γ)=2000` 个 chunk，实测每集只有 32.6 个，
-  错配 60 倍，自举链上的正偏差无衰减累积；`target_q_clip=100.0` 这个本该兜底的钳位，
-  对着 1.675 的真实回报上界从头到尾一次都没触发过。
+- **Q 高估 12.8 倍**：`Q(s,ref)=4.79`，而 buffer 里每集的**折扣**回报均值只有 0.374、
+  最大 1.35（gamma=0.9995 下）。`target_q_clip=100.0` 这个本该兜底的钳位是真实上界的
+  74 倍，从头到尾一次都没触发过。3.0 相当于上界的 2.2 倍，留够余量又真的能拦住发散。
 - **Critic 把动作排序排反了**：`Q(人类接管动作)=2.843` 低于 `Q(actor 自己的动作)=3.179`，
   77% 的介入样本排序是错的——而人类接管贡献了 94.9% 的成功（56/59），actor 自主成功率
   只有 3.5%。原因是 `rankq_margin` 是绝对值 0.1，Q 漂到 4.8 后它只在约束自身信号的 2%。
   改成相对 margin 后它随 Q 尺度自动缩放。
+
+`--gamma 0.9995` **保持不变**。gamma 在这里是**每物理步**的折扣（chunk 内经
+`discounted_chunk_return` 的 `gamma^i`，跨 chunk 经 `critic_loss` 的
+`gamma^actual_steps`），不是每 chunk 一次。实测每集 783 个物理步，`1/(1-0.9995)=2000`
+步的有效视界相当于 2.55 集——略长但合理，done 会在集末截断 bootstrap。按 chunk 数去
+套这个视界会得出「错配 60 倍」的错误结论，进而把 gamma 调到 0.99；那样有效视界只剩
+100 步（0.13 集），集末的 terminal reward 会被折得只剩 `0.99^783 ≈ 0.0004`，critic
+根本看不到成功信号。
 
 每次更新会额外打印一行健康检查，wandb 上对应 `online_rl/q_vs_return_ratio`、
 `online_rl/q_rank_margin`、`online_rl/q_rank_correct_frac`：
