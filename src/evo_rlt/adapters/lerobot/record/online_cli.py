@@ -95,6 +95,8 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--policy.rankq_alpha_failure={args.rankq_alpha_failure}",
         f"--policy.rankq_noise_scale={args.rankq_noise_scale}",
         f"--policy.rankq_margin={args.rankq_margin}",
+        f"--policy.rankq_margin_relative={'true' if args.rankq_margin_relative else 'false'}",
+        f"--policy.target_q_clip={args.target_q_clip}",
         f"--policy.target_noise_std={args.target_noise_std}",
         f"--policy.target_noise_clip={args.target_noise_clip}",
         f"--policy.actor_smoothness_weight={args.actor_smoothness_weight}",
@@ -219,6 +221,8 @@ def print_online_train_summary(args: argparse.Namespace, paths) -> None:
     print(
         f"RankQ: alpha_success={args.rankq_alpha_success} alpha_failure={args.rankq_alpha_failure} "
         f"noise_scale={args.rankq_noise_scale} margin={args.rankq_margin}"
+        + (" (relative to mean|Q|)" if args.rankq_margin_relative else " (absolute)")
+        + f" | target_q_clip={args.target_q_clip}"
     )
     print(
         f"Target policy smoothing: noise_std={args.target_noise_std} noise_clip={args.target_noise_clip}"
@@ -468,7 +472,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--rankq-margin", type=float, default=0.1,
         help="Hard-hinge margin for RankQ pairs. Positive values stop the ranking loss "
         "once a pair is separated by this amount, preventing unbounded Q-gap growth. "
-        "Set to 0 only to restore the original softplus behavior.",
+        "Set to 0 only to restore the original softplus behavior. With "
+        "--rankq-margin-relative this is a fraction of mean|Q| instead of an absolute gap.",
+    )
+    parser.add_argument(
+        "--rankq-margin-relative", action=argparse.BooleanOptionalAction, default=True,
+        help="Interpret --rankq-margin as a fraction of the Critic's own mean|Q| rather "
+        "than an absolute gap. Enabled by default: an absolute margin stops constraining "
+        "the action ordering once Q drifts off the reward scale it was tuned against "
+        "(observed at margin=0.1 against a Q that had drifted to ~4.8, where the ranking "
+        "term ordered 2% of its own signal and the Critic ended up scoring the human's "
+        "successful takeover action BELOW the actor's failing one).",
+    )
+    parser.add_argument(
+        "--target-q-clip", type=float, default=3.0,
+        help="Clamp on the bootstrapped target Q, the coarse backstop against TD "
+        "overestimation running away. Must be set near the largest episode return the "
+        "reward config can actually produce -- the previous default of 100.0 against a "
+        "best-observed return of 1.675 never once triggered while Q drifted to ~4.8. "
+        "0 or negative disables it.",
     )
     parser.add_argument(
         "--target-noise-std", type=float, default=0.1,
