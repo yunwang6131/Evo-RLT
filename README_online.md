@@ -121,7 +121,7 @@ evo-rlt-online-train \
   --chunk-exec-steps 25 \
   --rl-action-arms both \
   --actor-action-clip-delta 0.7 \
-  --actor-slew-rate-limit 0.02 \
+  --actor-slew-rate-limit 0.05 \
   --offline-cache-path outputs/pin_insert_offline_cache \
   --offline-batch-fraction 0.5 \
   --milestone-reward 0.5 \
@@ -175,7 +175,7 @@ Online RL critic health: Q(ref)=4.790 vs empirical_return=0.536 (ratio=8.94, wan
 
 ### 动作幅度上限：clip_delta 与 slew_rate_limit 的分工
 
-`--actor-action-clip-delta 0.7` / `--actor-slew-rate-limit 0.02` 是从 0.2 / 0.03 改过来的。
+`--actor-action-clip-delta 0.7` / `--actor-slew-rate-limit 0.05` 是从 0.2 / 0.03 改过来的。
 原来的 0.2 太小，直接卡死了人类介入数据的学习：
 
 - 逐元素统计人类介入修正 `|exec - ref|`：p50=0.13、p75=0.28、**p90=0.67**、p99=3.60。
@@ -190,11 +190,23 @@ Online RL critic health: Q(ref)=4.790 vs empirical_return=0.536 (ratio=8.94, wan
   **46.1% 已经顶到并越过 0.2 的天花板**（全局均值 0.06 是被 92.6% 被 VLA anchor
   拉住的非 demo 元素稀释出来的假象）。
 
-两个上限的分工：`clip_delta` 限制总幅度，`slew_rate_limit` 限制单步突变。谁更紧谁生效——
-`0.03 × 25 步 = 0.75` 的累积能力对上 `clip_delta=0.2`，意味着**旧配置下 slew 从未生效过**。
-新配置把总幅度放宽到覆盖人类修正的 p90，同时把单步收紧到 0.02（25 步累积 0.5），
-让「防突变」这个更贴合硬件安全的约束真正接管。0.7 并没有让 actor 超出人类演示的范围，
-它只是让 actor 有能力做人已经在做的动作。
+两个上限的分工：`clip_delta` 限制总幅度，`slew_rate_limit` 限制单步突变，谁更紧谁生效。
+旧配置 `0.03 × 25 步 = 0.75` 的累积能力对上 `clip_delta=0.2`，**slew 从未生效过**；
+反过来，slew 定得过小（如 0.02，25 步累积 0.5 < 0.7）会让它越权去限制总幅度，
+把 clip 放宽的收益吃掉大半。新配置 `0.05 × 25 = 1.25 > 0.7`，两者各司其职。
+
+slew 的取值基准是**人类介入时 actor-residual 的实际单步变化率**（人已经这样操作过机械臂，
+硬件没问题）：p50=0.008、p75=0.015、p90=0.029、**p95=0.044**、p99=0.112。
+`0.05` 覆盖其中约 96%，再往上收益递减（0.08 只多 4 个百分点，单步幅度却翻倍）。
+
+注意训练侧和部署侧的 slew 锚点不同：部署时 `_last_actor_residual` 跨 chunk 延续
+（`action_modifier.py`），训练时用零残差锚点（`losses.py` 的 `_apply_slew_rate_limit_flat`，
+replay 未持久化 counterfactual residual，这是刻意的保守选择）。所以训练侧每个 chunk 从 0
+重新爬，可复现比例是下界：clip=0.7 下 slew=0.02→64.6%、0.03→74.3%、**0.05→82.2%**、
+无 slew→90.6%。
+
+需要更强的训练时平滑约束时，用 `--actor-smoothness-weight`（软惩罚、有梯度，
+docstring 里就写着是 slew 的训练期补充），而不是继续压小 slew——后者是拿可达范围换平滑。
 
 > 这一项直接放大机械臂实际动作幅度，没有硬件 E-stop 兜底。第一轮跑的时候手放在
 > leader arm 附近，`actor_deploy_scale` 的爬坡期（`--actor-unfreeze-ramp-episodes`）

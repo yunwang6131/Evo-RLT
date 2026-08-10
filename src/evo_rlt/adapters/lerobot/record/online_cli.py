@@ -536,7 +536,16 @@ def build_parser() -> argparse.ArgumentParser:
         "while --actor-action-clip-delta is opened up enough for the actor to reproduce "
         "real human corrections. Compare the two as limit vs slew*chunk_length -- at "
         "slew=0.03 over 25 steps that is 0.75 of travel, so a clip_delta of 0.2 meant this "
-        "limit never once bound anything.",
+        "limit never once bound anything.\n"
+        "Size it against the residual slew humans actually produce during interventions, "
+        "not by intuition -- that is motion the hardware has already survived. Measured "
+        "here: p50=0.008 p75=0.015 p90=0.029 p95=0.044 p99=0.112. Keep "
+        "slew*chunk_length above action_clip_delta, or this limit stops bounding "
+        "abruptness and starts silently capping total travel below the clip instead "
+        "(at 0.02 over 25 steps it capped travel at 0.5 against a clip of 0.7, cutting "
+        "reproducible human corrections from 82% to 65%). For a stronger training-time "
+        "smoothness constraint use --actor-smoothness-weight, which penalizes rather "
+        "than truncates.",
     )
     parser.add_argument(
         "--actor-smoothness-weight", type=float, default=0.0,
