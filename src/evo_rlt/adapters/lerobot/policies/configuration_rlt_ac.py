@@ -120,6 +120,11 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     # growth possible with softplus on separable ranking pairs.  Zero retains
     # the original paper-style softplus for compatibility.
     rankq_margin: float = 0.1
+    # Interpret rankq_margin as a fraction of the critic's own mean|Q|
+    # instead of an absolute gap.  An absolute margin stops constraining
+    # anything once Q drifts off the reward scale it was tuned against; see
+    # losses.rankq_ranking_loss's margin_relative docstring.
+    rankq_margin_relative: bool = False
 
     # TD3-style target policy smoothing: clipped noise added to the target
     # actor's action before evaluating target_critic on it, so the critic

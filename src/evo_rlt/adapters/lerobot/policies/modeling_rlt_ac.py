@@ -256,6 +256,7 @@ class ChunkACPolicy(PreTrainedPolicy):
             rankq_alpha_success=getattr(self.config, "rankq_alpha_success", 0.0),
             rankq_alpha_failure=getattr(self.config, "rankq_alpha_failure", 0.0),
             rankq_margin=getattr(self.config, "rankq_margin", 0.0),
+            rankq_margin_relative=getattr(self.config, "rankq_margin_relative", False),
             action_mask=self.actor.action_mask,
             target_noise_std=getattr(self.config, "target_noise_std", 0.0),
             target_noise_clip=getattr(self.config, "target_noise_clip", 0.3),

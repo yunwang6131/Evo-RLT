@@ -503,6 +503,95 @@ class TestRankQRankingLoss:
         assert torch.isfinite(loss)
 
 
+class TestRankQRelativeMargin:
+    """margin_relative scales the requested Q separation by the critic's own
+    mean|Q|, so the hinge keeps constraining the ordering after Q drifts off
+    the reward scale the absolute margin was tuned against."""
+
+    @staticmethod
+    def _inputs(scale: float):
+        torch.manual_seed(0)
+        state = torch.randn(16, 6)
+        action = torch.randn(16, 8)
+        outcome = torch.tensor([1.0, 0.0] * 8)
+
+        class ScaledCritic(torch.nn.Module):
+            """Q with a controllable magnitude, so the two margin modes can be
+            compared at an unchanged Q *ordering* but a changed Q *scale*."""
+
+            def __init__(self, gain):
+                super().__init__()
+                self.gain = gain
+                self.lin = torch.nn.Linear(6 + 8, 1)
+
+            def forward(self, s, a):
+                q = self.gain * self.lin(torch.cat([s, a], dim=-1))
+                return q, q
+
+        return ScaledCritic(scale), state, action, outcome
+
+    @staticmethod
+    def _loss(critic, state, action, outcome, **kwargs):
+        # rankq_ranking_loss samples its own negative candidates, so every
+        # comparison here has to start from the same RNG state or it is
+        # measuring noise instead of the margin mode.
+        torch.manual_seed(1234)
+        return rankq_ranking_loss(critic, state, action, outcome, **kwargs).item()
+
+    def test_relative_margin_tracks_q_scale_while_absolute_does_not(self):
+        losses_abs, losses_rel = [], []
+        for gain in (1.0, 10.0):
+            critic, state, action, outcome = self._inputs(gain)
+            losses_abs.append(
+                self._loss(critic, state, action, outcome, margin=0.1, margin_relative=False)
+            )
+            losses_rel.append(
+                self._loss(critic, state, action, outcome, margin=0.1, margin_relative=True)
+            )
+        # At a 10x larger Q scale the absolute margin is 10x less of the
+        # signal it is ordering; the relative one asks for a 10x larger gap
+        # and so stays proportionally as binding as it was.
+        abs_ratio = losses_abs[1] / max(losses_abs[0], 1e-9)
+        rel_ratio = losses_rel[1] / max(losses_rel[0], 1e-9)
+        assert rel_ratio > abs_ratio
+
+    def test_relative_margin_is_at_least_absolute_when_q_scale_exceeds_one(self):
+        critic, state, action, outcome = self._inputs(5.0)
+        absolute = self._loss(
+            critic, state, action, outcome, margin=0.1, margin_relative=False
+        )
+        relative = self._loss(
+            critic, state, action, outcome, margin=0.1, margin_relative=True
+        )
+        assert relative > absolute
+
+    def test_relative_margin_is_a_no_op_without_a_margin(self):
+        """margin=0 keeps the paper's softplus in both modes -- the flag must
+        not silently switch the hinge on."""
+        critic, state, action, outcome = self._inputs(3.0)
+        softplus = self._loss(
+            critic, state, action, outcome, margin=0.0, margin_relative=False
+        )
+        still_softplus = self._loss(
+            critic, state, action, outcome, margin=0.0, margin_relative=True
+        )
+        assert still_softplus == pytest.approx(softplus)
+
+    def test_relative_margin_gradient_flows_to_critic_only_through_the_gap(self):
+        """The scale is detached: it sets how much separation to ask for, and
+        must not itself become something the critic can optimize (shrinking
+        |Q| to make the margin cheap)."""
+        critic, state, action, outcome = self._inputs(4.0)
+        torch.manual_seed(1234)
+        loss = rankq_ranking_loss(
+            critic, state, action, outcome, margin=0.1, margin_relative=True
+        )
+        loss.backward()
+        assert any(
+            p.grad is not None and torch.isfinite(p.grad).all() for p in critic.parameters()
+        )
+
+
 class TestMaskedCandidate:
     def test_pins_masked_out_dims_to_base_value(self):
         base = torch.zeros(2, 4)

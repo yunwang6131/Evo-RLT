@@ -29,9 +29,14 @@ import torch
 
 from evo_rlt.adapters.lerobot.online_collector import RLTOnlineCollector
 from evo_rlt.core.interfaces import ChunkTransition
-from evo_rlt.core.losses import actor_behavior_cloning_loss, q_action_sensitivity
+from evo_rlt.core.losses import (
+    _apply_slew_rate_limit_flat,
+    _valid_action_mask,
+    actor_behavior_cloning_loss,
+    q_action_sensitivity,
+)
 from evo_rlt.core.replay_buffer import ReplayBuffer
-from evo_rlt.core.utils import soft_update, unflatten_chunk
+from evo_rlt.core.utils import project_action_delta, soft_update, unflatten_chunk
 
 
 class OnlineRLTrainer:
@@ -609,6 +614,89 @@ class OnlineRLTrainer:
             "online_rl/intervention_correction_frac_exceeds_clip": frac_exceeds,
         }
 
+    def _empirical_return_mean(self) -> float:
+        """Mean undiscounted per-episode return actually observed in the
+        replay buffer -- the yardstick Q(s,.) is supposed to be predicting.
+
+        Same whole-buffer scan as _intervention_correction_metrics(), and
+        cheap for the same reason (once per episode, alongside hundreds of
+        gradient steps).
+        """
+        per_episode: dict[int, float] = {}
+        for transition in self.replay_buffer.buffer:
+            episode_id = int(transition.episode_id.item())
+            per_episode[episode_id] = (
+                per_episode.get(episode_id, 0.0) + float(transition.reward_seq.sum().item())
+            )
+        if not per_episode:
+            return 0.0
+        return sum(per_episode.values()) / len(per_episode)
+
+    def _q_calibration_metrics(
+        self, raw: dict[str, torch.Tensor], device: torch.device
+    ) -> dict[str, float]:
+        """Two things plain loss_critic cannot show, both learned the hard way
+        on this project (150 episodes of a flat 0.43 intervention rate before
+        either was visible in hindsight):
+
+        `q_vs_return_ratio` -- Q(s, ref) against the mean episode return the
+        buffer actually contains. TD bootstrap bias accumulates silently: a
+        run that looked converged by every logged loss had Q ~= 4.8 against a
+        best-ever observed episode return of 1.675 (ratio ~9). It should sit
+        near 1; a persistent climb means the critic is inventing value.
+
+        `q_rank_margin` -- Q(s, human takeover action) minus Q(s, the action
+        the actor would actually deploy), on intervened rows only. This is the
+        one ordering the actor's whole learning signal depends on, and it is
+        NOT implied by a small TD loss: measured at -0.337 on that same run,
+        i.e. the critic preferred the actor's own action over the human
+        correction that had just rescued the episode -- while human takeovers
+        accounted for 94.9% of all successes and the actor's autonomous
+        success rate was 3.5%. Negative here means actor gradients point the
+        wrong way and no amount of further training helps.
+        """
+        chunk_length = self.policy_cfg.chunk_length
+        clip_delta = getattr(self.policy_cfg, "actor_action_clip_delta", None)
+        slew = getattr(self.policy_cfg, "actor_slew_rate_limit", None)
+        state = raw["state_vec"].to(device)
+        ref = raw["ref_chunk_flat"].to(device)
+        exec_chunk = raw["exec_chunk_flat"].to(device)
+        metrics: dict[str, float] = {}
+        with torch.no_grad():
+            q_ref = self.policy.critic.min_q(state, ref).mean().item()
+            empirical_return = self._empirical_return_mean()
+            metrics["online_rl/q_ref_mean"] = q_ref
+            metrics["online_rl/empirical_return_mean"] = empirical_return
+            metrics["online_rl/q_vs_return_ratio"] = (
+                q_ref / empirical_return if abs(empirical_return) > 1e-6 else 0.0
+            )
+
+            intervened = raw.get("intervention_mask_flat")
+            if intervened is None:
+                return metrics
+            rows = (intervened.to(device) > 0).any(dim=-1)
+            if not bool(rows.any()):
+                # No intervened rows in this batch -- report nothing rather
+                # than a 0.0 that would read as "ordering is exactly neutral".
+                return metrics
+            # Reproduce the action that actually reaches the robot, matching
+            # losses.actor_loss's construction -- ranking the human action
+            # against an unconstrained mu the actor could never deploy would
+            # measure the wrong gap.
+            mu, _ = self.policy.actor.forward(state, ref, training=False)
+            mu_deployed = ref + self.actor_deploy_scale * (mu - ref)
+            mu_safe = project_action_delta(mu_deployed, ref, clip_delta)
+            if clip_delta is None:
+                mu_safe = mu_safe.clamp(-1.0, 1.0)
+            mu_safe = _apply_slew_rate_limit_flat(mu_safe, ref, chunk_length, slew)
+            q_human = self.policy.critic.min_q(state[rows], exec_chunk[rows])
+            q_actor = self.policy.critic.min_q(state[rows], mu_safe[rows])
+            metrics["online_rl/q_rank_margin"] = (q_human - q_actor).mean().item()
+            metrics["online_rl/q_rank_correct_frac"] = (
+                (q_human > q_actor).float().mean().item()
+            )
+        return metrics
+
     def close(self) -> None:
         if self.wandb_run is not None:
             self.wandb_run.finish()
@@ -880,6 +968,7 @@ class OnlineRLTrainer:
         training_time_s = time.perf_counter() - start_t
 
         loss_dict = {k: (v.item() if torch.is_tensor(v) else v) for k, v in (info or {}).items()}
+        q_calibration: dict[str, float] = {}
         if num_updates > 0:
             # Diagnostic (see losses.q_action_sensitivity): computed once per
             # update cycle, not every gradient step, on the last sampled
@@ -893,6 +982,7 @@ class OnlineRLTrainer:
                 raw["exec_chunk_flat"].to(device),
                 action_mask=self.policy.actor.action_mask,
             ).item()
+            q_calibration = self._q_calibration_metrics(raw, device)
         if last_actor_info is not None and "loss_actor" not in loss_dict:
             # The last iteration of this call didn't happen to be a do_actor
             # step, but an earlier one in the same call was -- surface that
@@ -932,6 +1022,22 @@ class OnlineRLTrainer:
             training_time_s,
             loss_dict,
         )
+        if q_calibration:
+            # Surfaced on its own line, not folded into loss=...: these two
+            # are the health check that decides whether the losses above mean
+            # anything (see _q_calibration_metrics).
+            logging.info(
+                "Online RL critic health: Q(ref)=%.3f vs empirical_return=%.3f "
+                "(ratio=%.2f, want ~1) | q_rank_margin=%s (want > 0)",
+                q_calibration.get("online_rl/q_ref_mean", float("nan")),
+                q_calibration.get("online_rl/empirical_return_mean", float("nan")),
+                q_calibration.get("online_rl/q_vs_return_ratio", float("nan")),
+                (
+                    f"{q_calibration['online_rl/q_rank_margin']:+.3f}"
+                    if "online_rl/q_rank_margin" in q_calibration
+                    else "n/a (no intervened rows in batch)"
+                ),
+            )
         stats: dict[str, Any] = {
             "new_transitions": new_transitions,
             "requested_updates": requested_updates,
@@ -964,6 +1070,7 @@ class OnlineRLTrainer:
                 "online_rl/buffer_failures": failures,
                 **self._autonomous_success_metrics(),
                 **self._intervention_correction_metrics(),
+                **q_calibration,
                 **{f"online_rl/{k}": v for k, v in loss_dict.items() if k != "critic_step"},
             },
             step=recorded_episodes,

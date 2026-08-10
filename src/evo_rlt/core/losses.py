@@ -159,6 +159,7 @@ def rankq_ranking_loss(
     alpha_failure: float = 1.0,
     action_mask: torch.Tensor | None = None,
     margin: float = 0.0,
+    margin_relative: bool = False,
 ) -> torch.Tensor:
     """RankQ (Choi & Xu, 2026) self-supervised action-ranking loss.
 
@@ -201,6 +202,21 @@ def rankq_ranking_loss(
     widen already-correct separable pairs, while the hinge stops contributing
     once the requested gap is reached.  Set the margin relative to the reward
     scale. 0.0 retains the original softplus for compatibility.
+
+    `margin_relative` reinterprets `margin` as a *fraction of the critic's
+    own current Q scale* rather than an absolute gap: the hinge becomes
+    relu(q_neg - q_pos + margin * mean|Q|), with mean|Q| taken over all
+    candidate actions and detached (it sets the constraint's strength, it
+    is not itself something to optimize).  An absolute margin silently stops
+    constraining anything once the critic's Q scale drifts away from the
+    reward scale it was tuned against -- observed on this codebase: with
+    margin=0.1 against a Q that had drifted to ~4.8, the ranking term was
+    2% of the signal it was ordering and contributed ~8% of the critic loss,
+    leaving the ranking to a TD term that had itself overestimated by ~9x
+    and had the sign backwards (Q of a human's successful takeover action
+    ranked *below* the actor's own failing action).  A relative margin keeps
+    the requested separation meaningful under exactly that drift. False
+    (default) keeps the absolute-margin behavior.
     """
     if margin < 0:
         raise ValueError("margin must be >= 0")
@@ -231,12 +247,23 @@ def rankq_ranking_loss(
     for name, action in candidates.items():
         q1[name], q2[name] = critic(state_vec, action)
 
+    # One scale for every pair in this batch, not a per-pair one: the chain
+    # constraints (exec > noisy > very_noisy > random) only compose into a
+    # consistent ordering if they all ask for the same separation.
+    effective_margin: float | torch.Tensor = margin
+    if margin > 0 and margin_relative:
+        with torch.no_grad():
+            q_scale = torch.stack(
+                [q.abs().mean() for q in (*q1.values(), *q2.values())]
+            ).mean()
+        effective_margin = margin * q_scale.clamp(min=1e-6)
+
     def _rank(q: dict[str, torch.Tensor], pos: str, neg: str, mask: torch.Tensor) -> torch.Tensor:
         if not bool(mask.any()):
             return action_flat.new_zeros(())
         gap = q[neg][mask] - q[pos][mask]
         if margin > 0:
-            return F.relu(gap + margin).mean()
+            return F.relu(gap + effective_margin).mean()
         return F.softplus(gap).mean()
 
     # L^succ + L^chain (Eq. 4-5): executed action beats every suboptimal
@@ -267,6 +294,7 @@ def critic_loss(
     rankq_alpha_success: float = 0.0,
     rankq_alpha_failure: float = 0.0,
     rankq_margin: float = 0.0,
+    rankq_margin_relative: bool = False,
     action_mask: torch.Tensor | None = None,
     target_noise_std: float = 0.0,
     target_noise_clip: float = 0.3,
@@ -419,6 +447,7 @@ def critic_loss(
             alpha_success=rankq_alpha_success,
             alpha_failure=rankq_alpha_failure,
             margin=rankq_margin,
+            margin_relative=rankq_margin_relative,
             action_mask=(valid_mask if action_mask is None else valid_mask * action_mask),
         )
         loss = loss + rankq_loss
