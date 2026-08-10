@@ -513,13 +513,30 @@ def build_parser() -> argparse.ArgumentParser:
         "exactly even when the reference itself lies outside [-1,1]). Applied identically "
         "at deploy time and in actor_loss/critic_loss's target computation during "
         "training. Set to a large value or handle with care if disabling; there is no "
-        "hardware E-stop.",
+        "hardware E-stop.\n"
+        "Size this against the human corrections actually present in the data, not just "
+        "against a comfort level: any correction larger than this bound is one the actor "
+        "is structurally incapable of ever reproducing, no matter how good the learning "
+        "signal is (the tanh projection's range is exactly +/-limit, and the deviation "
+        "does NOT accumulate across chunks -- the VLA reference returns toward its own "
+        "trajectory each chunk rather than following where the arm actually got to). "
+        "Measured on this project at limit=0.2: 34.7% of intervened action elements were "
+        "unreachable and the actor sat saturated against the bound on 46% of the elements "
+        "it was supposed to be learning from. Note this interacts with "
+        "--actor-slew-rate-limit: whichever is tighter is the one actually constraining "
+        "the robot, and a small limit here makes the slew limit dead code.",
     )
     parser.add_argument(
         "--actor-slew-rate-limit", type=float, default=None,
         help="Cap how much the RL actor residual (action minus VLA reference) may change "
         "per physical timestep. The trusted VLA trajectory itself is not rate-limited. "
-        "None (default) disables it.",
+        "None (default) disables it.\n"
+        "This is the better of the two safety bounds to lean on: it limits abruptness "
+        "(what actually damages hardware) rather than total travel, so it can stay strict "
+        "while --actor-action-clip-delta is opened up enough for the actor to reproduce "
+        "real human corrections. Compare the two as limit vs slew*chunk_length -- at "
+        "slew=0.03 over 25 steps that is 0.75 of travel, so a clip_delta of 0.2 meant this "
+        "limit never once bound anything.",
     )
     parser.add_argument(
         "--actor-smoothness-weight", type=float, default=0.0,

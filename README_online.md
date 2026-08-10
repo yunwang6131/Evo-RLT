@@ -120,8 +120,8 @@ evo-rlt-online-train \
   --chunk-length 25 \
   --chunk-exec-steps 25 \
   --rl-action-arms both \
-  --actor-action-clip-delta 0.2 \
-  --actor-slew-rate-limit 0.03 \
+  --actor-action-clip-delta 0.7 \
+  --actor-slew-rate-limit 0.02 \
   --offline-cache-path outputs/pin_insert_offline_cache \
   --offline-batch-fraction 0.5 \
   --milestone-reward 0.5 \
@@ -172,6 +172,33 @@ Online RL critic health: Q(ref)=4.790 vs empirical_return=0.536 (ratio=8.94, wan
 ```
 
 `q_rank_margin` 转正之前，其它 loss 曲线再好看都没有意义——actor 的梯度方向本身是错的。
+
+### 动作幅度上限：clip_delta 与 slew_rate_limit 的分工
+
+`--actor-action-clip-delta 0.7` / `--actor-slew-rate-limit 0.02` 是从 0.2 / 0.03 改过来的。
+原来的 0.2 太小，直接卡死了人类介入数据的学习：
+
+- 逐元素统计人类介入修正 `|exec - ref|`：p50=0.13、p75=0.28、**p90=0.67**、p99=3.60。
+  在 0.2 的上限下 **34.7% 的修正元素 actor 永远无法复现**——`project_action_delta` 用的是
+  `ref + limit*tanh(...)`，值域严格是 `±limit`，不是软性建议。
+- 而且偏移**不能跨 chunk 累积**：介入期间 `|next_ref − exec_end| = 0.146` 大于
+  `|next_ref − ref_end| = 0.105`，说明 VLA 的 ref 每个 chunk 都退回自己的轨迹，
+  不跟随机械臂实际到达的位置。
+- 这些大修正也不是介入起始的抖动：它们在 chunk 内均匀分布（各时段 90%～97%），
+  是持续的真实修正需求。
+- 后果已经发生：在 demo 监督实际激活的元素上，actor 的 raw 残差 mean=0.2733，
+  **46.1% 已经顶到并越过 0.2 的天花板**（全局均值 0.06 是被 92.6% 被 VLA anchor
+  拉住的非 demo 元素稀释出来的假象）。
+
+两个上限的分工：`clip_delta` 限制总幅度，`slew_rate_limit` 限制单步突变。谁更紧谁生效——
+`0.03 × 25 步 = 0.75` 的累积能力对上 `clip_delta=0.2`，意味着**旧配置下 slew 从未生效过**。
+新配置把总幅度放宽到覆盖人类修正的 p90，同时把单步收紧到 0.02（25 步累积 0.5），
+让「防突变」这个更贴合硬件安全的约束真正接管。0.7 并没有让 actor 超出人类演示的范围，
+它只是让 actor 有能力做人已经在做的动作。
+
+> 这一项直接放大机械臂实际动作幅度，没有硬件 E-stop 兜底。第一轮跑的时候手放在
+> leader arm 附近，`actor_deploy_scale` 的爬坡期（`--actor-unfreeze-ramp-episodes`）
+> 尤其注意。
 
 > 用旧 checkpoint `--resume-from` 时注意：critic 权重是在 `gamma=0.9995` 下训出来的，
 > Q 停在 4.8 附近，换上新的 gamma 和 3.0 钳位后前若干集 TD loss 会明显偏大，那是 Q 被
