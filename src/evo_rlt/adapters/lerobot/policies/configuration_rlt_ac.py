@@ -99,6 +99,14 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     utd_ratio: int = 5
     actor_update_interval: int = 2
     target_q_clip: float = 100.0
+    # Lower bound on the bootstrapped target Q. None keeps the symmetric
+    # -target_q_clip. Set to 0.0 whenever every reward is non-negative: Q is
+    # then a discounted sum of non-negative terms and cannot be negative, so
+    # the negative half is a region the backup should never reach. Without
+    # it, the policy-vs-data Q gap (backup fits Q(s, a_data) but bootstraps
+    # Q(s', pi(s'))) accumulates across an episode and can walk Q far below
+    # zero while every per-step TD error stays small.
+    target_q_min: float | None = None
 
     # --- RankQ self-supervised ranking loss (Choi & Xu, 2026) ---
     # Augments the critic TD loss with a pairwise ranking term over

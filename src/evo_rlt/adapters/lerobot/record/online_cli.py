@@ -97,6 +97,7 @@ def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str
         f"--policy.rankq_margin={args.rankq_margin}",
         f"--policy.rankq_margin_relative={'true' if args.rankq_margin_relative else 'false'}",
         f"--policy.target_q_clip={args.target_q_clip}",
+        f"--policy.target_q_min={args.target_q_min}",
         f"--policy.target_noise_std={args.target_noise_std}",
         f"--policy.target_noise_clip={args.target_noise_clip}",
         f"--policy.actor_smoothness_weight={args.actor_smoothness_weight}",
@@ -483,6 +484,16 @@ def build_parser() -> argparse.ArgumentParser:
         "(observed at margin=0.1 against a Q that had drifted to ~4.8, where the ranking "
         "term ordered 2% of its own signal and the Critic ended up scoring the human's "
         "successful takeover action BELOW the actor's failing one).",
+    )
+    parser.add_argument(
+        "--target-q-min", type=float, default=0.0,
+        help="Lower bound on the bootstrapped target Q. 0.0 is correct whenever every "
+        "reward is non-negative (Q is then a discounted sum of non-negative terms and "
+        "cannot be negative). Pass a negative value only if the reward function has "
+        "negative terms. Without this bound the policy-vs-data Q gap -- backup fits "
+        "Q(s, a_data) but bootstraps Q(s', pi(s')), and BC deliberately keeps the actor "
+        "below the data -- accumulates over an episode: measured here at 0.086 per step, "
+        "which walked Q to -2.7 over 100k steps while per-step TD error stayed at 0.05.",
     )
     parser.add_argument(
         "--target-q-clip", type=float, default=3.0,

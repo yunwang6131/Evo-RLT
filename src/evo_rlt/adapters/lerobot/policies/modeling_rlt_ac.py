@@ -249,6 +249,7 @@ class ChunkACPolicy(PreTrainedPolicy):
             gamma=self.config.gamma,
             C=self.config.chunk_length,
             target_q_clip=self.config.target_q_clip,
+            target_q_min=getattr(self.config, "target_q_min", None),
             # getattr, not self.config.rankq_*: some call sites (older
             # checkpoints' configs, minimal test stand-ins) may predate
             # these fields; default to "off" rather than raise.

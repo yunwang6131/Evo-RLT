@@ -290,6 +290,7 @@ def critic_loss(
     gamma: float,
     C: int,
     target_q_clip: float | None = 100.0,
+    target_q_min: float | None = None,
     rankq_noise_scale: float = 0.15,
     rankq_alpha_success: float = 0.0,
     rankq_alpha_failure: float = 0.0,
@@ -419,8 +420,22 @@ def critic_loss(
                 mu_next, ref_next, C, slew_rate_limit
             )
         q_next = target_critic.min_q(x_next, mu_next)
-        if target_q_clip is not None and target_q_clip > 0:
-            q_next = q_next.clamp(-target_q_clip, target_q_clip)
+        upper = target_q_clip if (target_q_clip is not None and target_q_clip > 0) else None
+        # Default lower bound stays -target_q_clip so existing configs are
+        # unaffected; target_q_min overrides it. Setting it to 0 for a
+        # non-negative reward function is not a heuristic -- Q is a
+        # discounted sum of rewards, so it is provably >= 0 there, and the
+        # negative half is a region the bootstrap should never have been
+        # allowed to enter. It matters because backup fits Q(s, a_data) but
+        # bootstraps Q(s', pi(s')): when the actor is worse than the behavior
+        # data (BC keeps it there by design), every backup subtracts that
+        # gap, and over a long episode the sum walks Q well below zero with
+        # no TD error to show for it -- each step stays locally consistent.
+        lower = target_q_min if target_q_min is not None else (
+            -upper if upper is not None else None
+        )
+        if lower is not None or upper is not None:
+            q_next = q_next.clamp(min=lower, max=upper)
         r = discounted_chunk_return(reward_seq, gamma, actual_steps)
 
         # Bootstrap with gamma^k where k = actual steps executed

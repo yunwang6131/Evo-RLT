@@ -614,11 +614,10 @@ class OnlineRLTrainer:
             "online_rl/intervention_correction_frac_exceeds_clip": frac_exceeds,
         }
 
-    def _empirical_return_mean(self) -> float:
-        """Mean *discounted* per-episode return in the replay buffer, from
-        the episode's first step -- the quantity Q(s0, .) is defined to
-        predict, and therefore the only fair denominator for a calibration
-        ratio.
+    @staticmethod
+    def _buffer_return_mean(transitions, gamma: float) -> float:
+        """Mean *discounted* per-episode return, measured from each episode's
+        first step -- the quantity Q(s0, .) is defined to predict.
 
         Discounting matters more here than it looks. gamma applies per
         PHYSICAL step, not per chunk: within a chunk via
@@ -628,17 +627,12 @@ class OnlineRLTrainer:
         gamma=0.9995 and by ~2600x at gamma=0.99, which would make the ratio
         read as pathological overestimation purely as an artifact of the
         discount setting.
-
-        Same whole-buffer scan as _intervention_correction_metrics(), and
-        cheap for the same reason (once per episode, alongside hundreds of
-        gradient steps).
         """
-        gamma = float(self.policy_cfg.gamma)
         per_episode: dict[int, float] = {}
         elapsed: dict[int, int] = {}
         # Buffer order is collection order, so the running step count per
         # episode is the transition's true offset from that episode's start.
-        for transition in self.replay_buffer.buffer:
+        for transition in transitions:
             episode_id = int(transition.episode_id.item())
             steps = int(transition.actual_steps.item())
             offset = elapsed.get(episode_id, 0)
@@ -654,6 +648,41 @@ class OnlineRLTrainer:
         if not per_episode:
             return 0.0
         return sum(per_episode.values()) / len(per_episode)
+
+    def _empirical_return_mean(self) -> float:
+        """Return yardstick for q_vs_return_ratio, matched to the batch mix.
+
+        Q is measured on batches that are `offline_batch_fraction` demos and
+        the rest online experience, so the denominator has to be the same
+        blend. Using the online buffer alone silently biases the ratio by
+        however far the two sources' returns differ -- measured on this
+        project, online 0.374 vs offline 0.181, which understated the
+        overestimate by 1.35x at a 50/50 mix.
+
+        The online part is rescanned each call (it grows); the offline cache
+        is fixed, so its mean is computed once and cached.
+
+        Same whole-buffer scan as _intervention_correction_metrics(), and
+        cheap for the same reason (once per episode, alongside hundreds of
+        gradient steps).
+        """
+        gamma = float(self.policy_cfg.gamma)
+        online_mean = self._buffer_return_mean(self.replay_buffer.buffer, gamma)
+        if self.offline_buffer is None or not len(self.offline_buffer):
+            return online_mean
+        cached = getattr(self, "_offline_return_mean_cache", None)
+        if cached is None or cached[0] != gamma:
+            value = self._buffer_return_mean(self.offline_buffer.buffer, gamma)
+            self._offline_return_mean_cache = (gamma, value)
+            cached = self._offline_return_mean_cache
+        offline_mean = cached[1]
+        # Weight by the split maybe_update() actually samples, not by how many
+        # transitions each buffer holds.
+        online_n, offline_n = self._split_batch_sizes()
+        total = online_n + offline_n
+        if total <= 0:
+            return online_mean
+        return (online_n * online_mean + offline_n * offline_mean) / total
 
     def _q_calibration_metrics(
         self, raw: dict[str, torch.Tensor], device: torch.device

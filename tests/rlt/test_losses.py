@@ -199,6 +199,57 @@ def test_critic_loss_respects_target_q_clip():
     assert unclipped.item() == pytest.approx(2_000_000.0)
 
 
+def test_target_q_min_bounds_the_bootstrap_from_below():
+    """With every reward non-negative, Q is a discounted sum of non-negative
+    terms and cannot be negative -- but the backup fits Q(s, a_data) while
+    bootstrapping Q(s', pi(s')), so a policy that trails the data subtracts
+    that gap on every step and can walk Q far below zero with no TD error to
+    show for it. target_q_min closes off that half of the line.
+    """
+    class _ZeroCritic(torch.nn.Module):
+        def forward(self, state_vec, action_flat):
+            z = torch.zeros(state_vec.shape[0], 1)
+            return z, z
+
+    class _NegativeTargetCritic(torch.nn.Module):
+        def min_q(self, state_vec, action_flat):
+            return torch.full((state_vec.shape[0], 1), -50.0)
+
+    class _ZeroActor:
+        def forward(self, state_vec, ref_flat):
+            return torch.zeros(ref_flat.shape), None
+
+    batch = {
+        "state_vec": torch.zeros(2, STATE_DIM),
+        "exec_chunk_flat": torch.zeros(2, CHUNK_DIM),
+        "ref_chunk_flat": torch.zeros(2, CHUNK_DIM),
+        "reward_seq": torch.zeros(2, C),
+        "next_state_vec": torch.zeros(2, STATE_DIM),
+        "next_ref_flat": torch.zeros(2, CHUNK_DIM),
+        "done": torch.zeros(2),
+        "actual_steps": torch.ones(2, dtype=torch.int64),
+    }
+    kwargs = dict(gamma=1.0, C=C, target_q_clip=3.0)
+
+    # Unset -> the previous symmetric bound, so existing configs are untouched.
+    default = critic_loss(
+        _ZeroCritic(), _NegativeTargetCritic(), _ZeroActor(), batch, **kwargs
+    )
+    floored = critic_loss(
+        _ZeroCritic(), _NegativeTargetCritic(), _ZeroActor(), batch,
+        target_q_min=0.0, **kwargs,
+    )
+    explicit = critic_loss(
+        _ZeroCritic(), _NegativeTargetCritic(), _ZeroActor(), batch,
+        target_q_min=-3.0, **kwargs,
+    )
+
+    # loss = 2 * MSE(0, target) and target == the clamped bootstrap.
+    assert default.item() == pytest.approx(2 * 3.0**2)   # clamped to -3
+    assert floored.item() == pytest.approx(0.0)          # clamped to 0
+    assert explicit.item() == pytest.approx(default.item())
+
+
 class TestTargetPolicySmoothing:
     def test_default_disabled_matches_no_smoothing_exactly(self, actor, critic, target_critic, batch):
         """target_noise_std defaults to 0.0 -- existing callers that don't
