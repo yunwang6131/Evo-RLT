@@ -25,7 +25,10 @@ lerobot = [
 ]
 test = ["pytest>=8.1", "pytest-timeout>=2.4"]
 wandb = ["wandb>=0.16"]
-dev = ["evo-rlt[lerobot,test,wandb]", "ruff>=0.6"]
+# Client side of the simulation bridge. The simulator itself runs in a separate
+# interpreter (see README_sim.md) and is deliberately not declared here.
+sim = ["pyzmq>=25"]
+dev = ["evo-rlt[lerobot,test,wandb,sim]", "ruff>=0.6"]
 
 [project.scripts]
 evo-rlt-build-transition-cache = "evo_rlt.cli.build_transition_cache:main"

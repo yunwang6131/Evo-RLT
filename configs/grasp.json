@@ -1,0 +1,14 @@
+{
+  "condim": 4,
+  "friction": [
+    1.5,
+    0.05,
+    0.0005
+  ],
+  "solref": [
+    0.01,
+    1.0
+  ],
+  "impratio": 10.0,
+  "gripper_force_limit": 0.981
+}

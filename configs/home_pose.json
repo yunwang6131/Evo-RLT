@@ -1,0 +1,28 @@
+{
+  "_comment": [
+    "复位姿态,单位是舵机原始 ticks(0~4095),取自 double_buffer 分支录制时",
+    "用的 --go-home-positions。每个 episode 开头仿真复位到这里。",
+    "",
+    "wrist_roll 不在列表里 —— 它是整圈关节,真机 go-home 也不归位它。",
+    "仿真用标定零位(URDF -90 度,即夹爪水平)。",
+    "",
+    "left_elbow_flex 原值 3034 超出重标后的行程上限,已改为 3008(差 2.3 度)。",
+    "",
+    "注意: ticks 是电机上报值,已扣除写进电机的 homing_offset。重新标定会改",
+    "homing_offset,同一物理姿态上报的 ticks 会跟着变。这组数是旧标定时期记的,",
+    "属于近似值。真机 follower 接上后若发现复位姿态偏了,把真机跑一次 go-home、",
+    "读当前 ticks 更新这里即可。"
+  ],
+  "ticks": {
+    "left_shoulder_pan": 2038,
+    "left_shoulder_lift": 2081,
+    "left_elbow_flex": 3008,
+    "left_wrist_flex": 1142,
+    "left_gripper": 2164,
+    "right_shoulder_pan": 2066,
+    "right_shoulder_lift": 2160,
+    "right_elbow_flex": 2880,
+    "right_wrist_flex": 1066,
+    "right_gripper": 2209
+  }
+}

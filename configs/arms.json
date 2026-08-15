@@ -1,0 +1,28 @@
+{
+  "_comment": [
+    "本项目专属的臂配置。用 USB 串口序列号认臂,不用 /dev/ttyACM* 序号。",
+    "序号按插入顺序分配,重启或换插口就会变,而四条臂的电机 ID 都是 1~6,",
+    "认错了不会报错,只会把一条臂的标定静默写进另一条的文件。",
+    "序列号是转接板固有的,重插不变,所以不需要每次改配置。",
+    "换了转接板就跑: python diagnostics/probe_arms.py --identify"
+  ],
+  "calibration_id_prefix": "evosim",
+  "arms": {
+    "left_follower": {
+      "serial": "5AB9065103",
+      "kind": "follower"
+    },
+    "right_follower": {
+      "serial": "5AB9065574",
+      "kind": "follower"
+    },
+    "left_leader": {
+      "serial": "5B41533735",
+      "kind": "leader"
+    },
+    "right_leader": {
+      "serial": "5AAF220248",
+      "kind": "leader"
+    }
+  }
+}
