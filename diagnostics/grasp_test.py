@@ -261,16 +261,23 @@ def apply_contact(model, cfg: dict) -> None:
     import mujoco
 
     name = lambda i: mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or ""
-    targets = [
+    generic = [
         i for i in range(model.ngeom)
         if model.geom_contype[i]
         and ("wrist_roll_follower" in name(i) or "moving_jaw" in name(i))
     ]
-    for part in ("socket", "bolt"):
-        targets.extend(_part_geoms(model, part))
-    for i in targets:
+    generic.extend(_part_geoms(model, "socket"))
+    bolt = list(_part_geoms(model, "bolt"))
+    # 螺栓的 friction 是单独一组(见 assets.GraspConfig.bolt_friction)。
+    # 这里若都写 cfg["friction"],扫参就会把螺栓那组悄悄覆盖掉,扫出来的
+    # 结论和 build 出的场景对不上。
+    for i in generic:
         model.geom_condim[i] = cfg["condim"]
         model.geom_friction[i] = cfg["friction"]
+        model.geom_solref[i][:2] = cfg["solref"]
+    for i in bolt:
+        model.geom_condim[i] = cfg["condim"]
+        model.geom_friction[i] = cfg["bolt_friction"]
         model.geom_solref[i][:2] = cfg["solref"]
     model.opt.impratio = cfg["impratio"]
 
@@ -680,8 +687,9 @@ def _render(model, data, lookat, path: Path) -> None:
 
 
 def load_config() -> dict:
-    cfg = {"condim": 4, "friction": [1.5, 0.05, 0.0005], "solref": [0.01, 1.0],
-           "impratio": 10.0, "gripper_force_limit": 0.6}
+    cfg = {"condim": 4, "friction": [1.5, 0.05, 0.0005],
+           "bolt_friction": [1.5, 0.05, 0.0005], "solref": [0.01, 1.0],
+           "impratio": 10.0, "gripper_force_limit": 0.981}
     if GRASP_CONFIG.is_file():
         cfg.update({k: v for k, v in json.loads(GRASP_CONFIG.read_text()).items()
                     if k in cfg})
@@ -694,6 +702,10 @@ SWEEP = {
     "condim": [3, 4, 6],
     "friction": [[0.6, 0.005, 0.0001], [1.0, 0.02, 0.0002],
                  [1.5, 0.05, 0.0005], [2.5, 0.1, 0.001]],
+    # bolt_friction 不扫:当前求解器配置下抬高它会让合爪时螺栓嵌进钳口
+    # (4.0/0.2 实测 -7.19mm),而且不单调 —— 2.0 穿、2.5 不穿、3.0 又穿。
+    # **这个扫描按滑移打分,发现不了穿透**(4.0/0.2 的滑移恰恰是最小的),
+    # 所以它进网格只会把坏值选出来。见 assets.GraspConfig.bolt_friction。
     # 时间常数下限是 2 倍步长(0.004)。曾经把 0.002 放进来过,扫描只看滑移量
     # 不看稳定性,那个发散的配置在当次测试里恰好没炸就被选中了 —— 结果是遥操
     # 里零件被弹飞、还能穿过桌子。坏值不该进网格,GraspConfig.validate 兜底。

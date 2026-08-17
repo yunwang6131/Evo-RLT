@@ -36,6 +36,43 @@ conda create -n rlt_sim python=3.11 -y
 
 跑起来后在终端 2 里按 `b` 复位零件，见下节。
 
+## 力反馈（主臂能感觉到从臂被挡住）
+
+从臂顶到桌子、或夹爪夹到东西合不动时，让主臂给手一个阻力。
+
+```bash
+~/anaconda3/envs/evo-rlt/bin/python diagnostics/teleop_sim.py --force-feedback
+#   --fb-gain 0.3        主臂朝从臂位置移动的比例，越大越硬也越易振荡
+#   --fb-deadband 2.0    死区，位置差小于它不出力
+#   --fb-torque 15       主臂力矩上限，占满量程百分比
+```
+
+两个关键设计，都是踩过坑换来的：
+
+1. **阻力接在从臂的「实测 − 指令」上**，不是「主臂位置 − 从臂位置」。后者在
+   正常跟随时就差一个纯延迟（实测 3 步 = 100ms，以 86°/s 挥臂时差 8.6°），
+   会被误判成「被挡住」，于是**全程**很大阻力。
+2. **自由运动时主臂是断电的**，只有误差超过死区才通电。一直通着电的话，
+   `Goal_Position` 每 33ms 才刷新一次，你一动伺服就往一个周期前的旧位置拽 ——
+   这是恒定的黏滞阻力，和有没有被挡住无关，同样表现为「动起来十分费力」。
+
+死区默认 5.0，取自真机 6258 帧实测的残余误差（对齐后 p95=2.33、p99=4.79）。
+
+跑完会打印一张表：各关节真正出过力的步数、最大误差、通断次数。全 0 说明从臂
+一次都没被挡住（手臂没碰到任何东西），不是功能坏了 —— 这两种情况没有这张表
+分不开。通断次数很多说明死区取小了，主臂会咔咔响。
+
+**通电时主臂会主动出力，而你的手正握着它。** 所以默认关闭，而且：
+
+- **第一次先在 solo 模式试**（`--no-followers`，从臂是仿真），撞坏不了东西
+- 手一直握住主臂，别撒手
+- **感觉到嗡嗡震颤就是环路在振荡** —— 降 `--fb-gain` 或加大 `--fb-deadband`。
+  这是 position-position 双边环，在 30 Hz + 实测约 100ms 纯延迟下本来就容易自激，
+  所以默认值调得很保守（只有满力矩的 15%），是"提示性阻力"不是"硬墙"
+- Ctrl-C 正常退出会自动断力矩；进程被 `kill -9` 不会，那种情况重新连一次即可
+
+原理和参数含义见 `src/evo_rlt/sim/feedback.py` 的模块说明。
+
 ## 零件复位
 
 零件被碰歪了重摆，手臂不动，不打断遥操。**在终端 2 里按 `b`** 复位全部零件。
@@ -68,10 +105,25 @@ MuJoCo 的 mesh 碰撞取凸包，孔、槽、钳口开口都会被填实。改�
 STL 之后要重新分解。
 
 ```bash
-~/anaconda3/envs/rlt_sim/bin/python diagnostics/decompose_mesh.py <stl> --threshold 0.005
-~/anaconda3/envs/rlt_sim/bin/python diagnostics/widen_holes.py --extra-mm 2.5   # 分解会啃掉约 1.5mm 孔壁
-~/anaconda3/envs/rlt_sim/bin/python diagnostics/settle_objects.py --apply       # 让物理找零件的平衡位姿
+~/anaconda3/envs/rlt_sim/bin/python diagnostics/widen_holes.py --extra-mm 1.8
+~/anaconda3/envs/rlt_sim/bin/python diagnostics/decompose_mesh.py <stl> --threshold 0.005 --max-hulls 256
+~/anaconda3/envs/rlt_sim/bin/python diagnostics/check_hole_fit.py                # 必须核对,见下
+~/anaconda3/envs/rlt_sim/bin/python diagnostics/settle_objects.py --apply        # 让物理找零件的平衡位姿
 ```
+
+**`--max-hulls` 一定要写。** 它默认只有 64,而桌子需要 255 块;用默认值分解出的
+孔壁粗得多,同样的 `--extra-mm 1.8` 下孔 B 的通路半径从 6.13mm 掉到 5.28mm
+(真值 6.00),孔凭空紧了 0.85mm。块数不够不会报错,只会让孔悄悄变形。
+
+`--extra-mm` 是补偿凸分解啃掉的孔壁,**不是想扩多大就扩多大**:目标是让最终
+通路半径等于 CAD 里的真实孔径。当前这组值的实测(螺栓杆半径 4.75mm):
+
+| 孔 | CAD 真值 | 加宽后 STL | 分解后通路 | 偏差 |
+|---|---|---|---|---|
+| B (0.220, 0.055) 插螺栓 | 6.00 mm | 7.80 | 6.13 mm | +0.13 |
+| A (0.220, 0.085) | 5.00 mm | 6.80 | 5.13 mm | +0.13 |
+
+改了孔或换了分解参数,跑 `check_hole_fit.py` 对着这张表核一遍。
 
 ## 标定
 
@@ -148,3 +200,4 @@ configs/calibration/                   项目快照，仿真读这里
 - 撞桌检测：遥操时提示 + 数据里打 flag
 
 交接说明见 `docs/SIM_HANDOFF.md`。
+还有一个我希望仿真中的关节角度能够影响到真机，意思就是在从臂是真机的时候，装到了桌子或者夹到了东西，不能够继续移动、闭合的时候，主臂也会感受到阻力。这个有办法实现吗

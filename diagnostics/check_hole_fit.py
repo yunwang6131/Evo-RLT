@@ -23,9 +23,10 @@ import numpy as np
 
 SCENE = Path("~/.cache/evo_rlt/sim_assets/scene.xml").expanduser()
 
-#: 扫描范围(米),覆盖整个台面即可
-SCAN_X = (0.14, 0.32)
-SCAN_Y = (-0.14, 0.14)
+#: 扫描区比台面碰撞体的包围盒外扩多少(米)。必须留出一圈,因为"孔"的判据是
+#: 四周被台面围住(见 scan()),贴着扫描区边界的簇会被当成台面外侧丢掉 ——
+#: 不外扩的话最外圈的孔会被误判。
+SCAN_MARGIN = 0.02
 
 #: 判定"够用"的最小单边间隙(毫米)
 GOOD_CLEARANCE_MM = 0.3
@@ -62,16 +63,42 @@ def shaft_radius(model) -> float:
     return float(np.linalg.norm(v[v[:, 2] > cut][:, :2], axis=1).max())
 
 
+def scan_area(model, data) -> tuple[tuple[float, float], tuple[float, float]]:
+    """扫描范围,从台面碰撞体的实际包围盒推出来。
+
+    曾经写死成 x(0.14,0.32)/y(-0.14,0.14)。桌子从 x=0.20 前移到 0.30 之后,
+    孔跑到了扫描区外,工具报"台面上没扫到孔" —— 看起来像凸分解把孔填平了,
+    实际只是没扫到。位姿在 configs/task_scene.json 里是可改的,所以不能写死。
+    """
+    import mujoco
+
+    name = lambda i: mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or ""
+    pts = []
+    for g in range(model.ngeom):
+        if not name(g).startswith("worktable_col"):
+            continue
+        mid = model.geom_dataid[g]
+        a, n = model.mesh_vertadr[mid], model.mesh_vertnum[mid]
+        v = model.mesh_vert[a:a + n] @ data.geom_xmat[g].reshape(3, 3).T + data.geom_xpos[g]
+        pts.append(v[:, :2])
+    if not pts:
+        raise SystemExit("场景里没有 worktable_col* 碰撞几何,先跑 mj_server.py --build")
+    xy = np.vstack(pts)
+    lo, hi = xy.min(0) - SCAN_MARGIN, xy.max(0) + SCAN_MARGIN
+    return (float(lo[0]), float(hi[0])), (float(lo[1]), float(hi[1]))
+
+
 def scan(model, data, bottom: float, step: float) -> list[tuple[np.ndarray, float]]:
     """扫出台面上所有孔的 (中心, 通路半径毫米)。"""
     import mujoco
 
+    scan_x, scan_y = scan_area(model, data)
     group = np.zeros(6, np.uint8)
     group[3] = 1
     geomid = np.zeros(1, np.int32)
     hits = []
-    for x in np.arange(*SCAN_X, step):
-        for y in np.arange(*SCAN_Y, step):
+    for x in np.arange(*scan_x, step):
+        for y in np.arange(*scan_y, step):
             dist = mujoco.mj_ray(model, data, np.array([x, y, 0.5]),
                                  np.array([0.0, 0.0, -1.0]), group, 1, -1, geomid)
             z = 0.5 - dist if dist >= 0 else -1.0
@@ -95,8 +122,8 @@ def scan(model, data, bottom: float, step: float) -> list[tuple[np.ndarray, floa
         # 是四周被台面围住,所以检查这一簇有没有贴到扫描区的边界:贴到了就是
         # 走出了台面,不是孔。
         lo, hi = cluster.min(0), cluster.max(0)
-        if (lo[0] <= SCAN_X[0] + step or hi[0] >= SCAN_X[1] - 2 * step
-                or lo[1] <= SCAN_Y[0] + step or hi[1] >= SCAN_Y[1] - 2 * step):
+        if (lo[0] <= scan_x[0] + step or hi[0] >= scan_x[1] - 2 * step
+                or lo[1] <= scan_y[0] + step or hi[1] >= scan_y[1] - 2 * step):
             continue
         centre = cluster.mean(0)
         holes.append((centre, float(np.linalg.norm(cluster - centre, axis=1).max() * 1000)))

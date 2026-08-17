@@ -174,7 +174,43 @@ class GraspConfig:
     #: 4 加上扭转摩擦,这是两点夹持能稳住的前提。
     condim: int = 4
     #: (滑动, 扭转, 滚动)。MuJoCo 默认 (1, 0.005, 1e-4) 是通用值,不是夹爪值。
+    #: 这一组套在钳口、螺套和台面上。螺栓另有一组,见 ``bolt_friction``。
     friction: tuple[float, float, float] = (1.5, 0.05, 0.0005)
+    #: 螺栓专用的 (滑动, 扭转, 滚动),只写在螺栓的碰撞几何上。
+    #:
+    #: 为什么只给螺栓:MuJoCo 对非 <pair> 接触取两边 friction 的**逐项最大**,
+    #: 所以写在螺栓这一侧,"螺栓碰钳口"就取到高值,而钳口、螺套、台面本身都
+    #: 保持 ``friction``。副作用是"螺栓碰台面"也一起变涩了 —— 同一个 max 规则,
+    #: 只给螺栓设就绕不开这条。
+    #:
+    #: **注意:这一组不影响夹爪的合拢速度**,那是关节的 damping/frictionloss
+    #: 管的(见 SceneConfig.gripper_damping)。实测把这一组从 4.0 退回 1.5,
+    #: 空载合拢时间 408ms 一位不差 —— 接触摩擦只在真的碰上之后才起作用。
+    #:
+    #: **目前必须等于 ``friction``。** 这个钩子留着是为了将来能单独调螺栓的
+    #: 摩擦,但在当前的求解器配置(pyramidal cone + impratio=10)下调不上去。
+    #:
+    #: 试过一轮,结论是负面的。固定抓取位姿下合爪,量螺栓嵌进钳口多深:
+    #:   滑动 扭转   嵌进钳口
+    #:   1.5  0.05   -0.31 mm   <- 现值
+    #:   2.0  0.08   -5.63 mm
+    #:   2.5  0.10   -0.35 mm
+    #:   3.0  0.12   -6.65 mm
+    #:   3.5  0.15   -6.36 mm
+    #:   4.0  0.20   -7.19 mm
+    #:
+    #: 摩擦锥变陡时摩擦约束在求解里挤掉法向约束,合爪那一下螺栓直接嵌进钳口
+    #: 几毫米 —— 遥操里看到的就是"螺栓穿过夹爪"。而且**不是单调的**:2.0 穿、
+    #: 2.5 不穿、3.0 又穿。所以挑不出一个"安全的高值",2.5 只是在那个位姿下
+    #: 恰好没炸,换个位姿一样会穿。
+    #:
+    #: 真要提高夹持摩擦,得先换求解器配置(elliptic cone 对大摩擦稳得多),
+    #: 或者用 <pair> 显式给"螺栓×钳口"这一对单独设参数,而不是靠 max 规则。
+    #: 在那之前不要动这个值。
+    #:
+    #: 教训和 solref 那条一样:按滑移打分的扫描选不出这种失败 —— 4.0/0.2 的
+    #: 滑移是全场最小的(12.5mm),但它穿透 7mm。选值必须同时看穿透。
+    bolt_friction: tuple[float, float, float] = (1.5, 0.05, 0.0005)
     #: 接触的 (时间常数, 阻尼比)。默认 0.02 偏软,轻零件会被压进去再弹出;
     #: 但**时间常数不能小于 2 倍步长**(见 validate),否则接触弹簧比积分器能
     #: 稳定处理的还硬,每次接触往系统里注入能量,零件被弹飞甚至穿过桌子。
@@ -206,7 +242,7 @@ class GraspConfig:
         raw = json.loads(path.read_text())
         fields = {f.name for f in dataclass_fields(cls)}
         kwargs = {k: v for k, v in raw.items() if k in fields}
-        for key in ("friction", "solref"):
+        for key in ("friction", "bolt_friction", "solref"):
             if key in kwargs:
                 kwargs[key] = tuple(kwargs[key])
         cfg = cls(**kwargs)
@@ -234,12 +270,28 @@ class GraspConfig:
             raise AssetBuildError(f"condim 只能是 1/3/4/6,给的是 {self.condim}")
         if min(self.friction) < 0:
             raise AssetBuildError(f"friction 不能为负: {self.friction}")
+        if min(self.bolt_friction) < 0:
+            raise AssetBuildError(f"bolt_friction 不能为负: {self.bolt_friction}")
+        # 见 bolt_friction 的说明:抬高它会让合爪时螺栓嵌进钳口几毫米,而且
+        # 不单调(2.0 穿、2.5 不穿、3.0 又穿),挑不出安全值。护栏卡死在
+        # "不得高于 friction",要放开必须先换求解器配置或改用 <pair>。
+        if tuple(self.bolt_friction) != tuple(self.friction):
+            raise AssetBuildError(
+                f"bolt_friction {self.bolt_friction} != friction {self.friction}。"
+                "当前求解器配置(pyramidal cone + impratio=10)下抬高螺栓摩擦会让"
+                "合爪时螺栓嵌进钳口(4.0/0.2 实测 -7.19mm,2.0/0.08 -5.63mm),"
+                "而且不单调、挑不出安全值。要放开先看 GraspConfig.bolt_friction 的说明。"
+            )
 
-    def contact_attrs(self) -> dict[str, str]:
-        """可直接塞进 <geom> 的接触属性。"""
+    def contact_attrs(self, friction: tuple[float, float, float] | None = None
+                      ) -> dict[str, str]:
+        """可直接塞进 <geom> 的接触属性。
+
+        ``friction`` 留空时用通用那一组;螺栓传 ``bolt_friction``。
+        """
         return {
             "condim": str(self.condim),
-            "friction": " ".join(f"{v:g}" for v in self.friction),
+            "friction": " ".join(f"{v:g}" for v in (friction or self.friction)),
             "solref": " ".join(f"{v:g}" for v in self.solref),
         }
 
@@ -407,7 +459,8 @@ def _add_task_objects(root: ET.Element, worldbody: ET.Element, cfg_task: dict) -
         )
     # 零件也要用夹持用的接触参数:MuJoCo 对非 <pair> 接触取两边 friction 的
     # 逐项最大、condim 的最大,所以只给钳口设是不够的,零件这边也得配上。
-    contact = GraspConfig.load().contact_attrs()
+    grasp = GraspConfig.load()
+    contact = grasp.contact_attrs()
 
     scale_attr = f"{MM_TO_M} {MM_TO_M} {MM_TO_M}"
     for i, hull in enumerate(hulls):
@@ -438,6 +491,14 @@ def _add_task_objects(root: ET.Element, worldbody: ET.Element, cfg_task: dict) -
         # 端面薄片只是视觉标记,不参与碰撞也不计质量,否则会给刚体加一层
         # 几乎零厚度的碰撞面,接触求解容易抖
         "contype": "0", "conaffinity": "0", "mass": "0",
+        # 抬 0.1mm。嵌片和螺套来自同一装配坐标系,两者都占 z 30.8~32.0,
+        # **顶面精确共面** —— 直接放会 z-fighting,渲染出来是一片黑红交错的
+        # 放射状花纹,看着像块贴在顶上的补丁。螺套 STL 顶部没有给嵌片留沉孔
+        # (按 z 逐层量截面,z=20 和 z=31.9 都是 361.04 mm²,一路实心到顶),
+        # 所以在不改 CAD 的前提下只能靠这个偏移把深度分开。
+        # 嵌片 XY 比螺套小一圈(336 vs 361 mm²),抬起来后四周留一圈黑边,
+        # 看上去是嵌在端面里的环,而不是扣在上面的盖。
+        "pos": "0 0 0.0001",
     })
 
     bolt = cfg_task["bolt"]
@@ -446,8 +507,10 @@ def _add_task_objects(root: ET.Element, worldbody: ET.Element, cfg_task: dict) -
         _body_attrs("bolt", bolt),
     )
     ET.SubElement(body, "freejoint", {"name": "bolt_free"})
+    # 只有螺栓用加大的摩擦(见 GraspConfig.bolt_friction)。MuJoCo 取两边逐项
+    # 最大,所以"螺栓碰钳口"取到高值,而钳口、螺套、台面本身都保持原值。
     _add_part_geoms(asset, body, "bolt", "task_bolt", "mat_bolt",
-                    bolt["mass"], contact)
+                    bolt["mass"], grasp.contact_attrs(grasp.bolt_friction))
 
 
 class AssetBuildError(RuntimeError):

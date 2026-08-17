@@ -54,6 +54,7 @@ from evo_rlt.sim.arms import (  # noqa: E402
     resolve_all,
 )
 from evo_rlt.sim.calib import MOTOR_NAMES  # noqa: E402
+from evo_rlt.sim.feedback import FeedbackGains, LeaderForceFeedback  # noqa: E402
 from evo_rlt.sim.protocol import ARM_SIDES, DEFAULT_ENDPOINT  # noqa: E402
 from evo_rlt.sim.sim_robot import make_sim_robot  # noqa: E402
 
@@ -392,6 +393,21 @@ def run(args) -> int:
             real.send_action(_blend(start_real, leader_now, alpha))
         time.sleep(max(0.0, period - (time.perf_counter() - loop_start)))
 
+    # 力反馈在 ramp **之后**才通电。ramp 期间从臂离主臂还很远,这时候把从臂的
+    # 位置写给主臂,主臂会朝那个远处的位姿猛拽操作者的手。
+    feedback: LeaderForceFeedback | None = None
+    if args.force_feedback:
+        feedback = LeaderForceFeedback(teleop, FeedbackGains(
+            gain=args.fb_gain, deadband=args.fb_deadband, torque_percent=args.fb_torque,
+        ))
+        limits = feedback.engage()
+        source = "真机 follower" if real is not None else "仿真"
+        print(f"\n  力反馈已启用(阻力来自{source}被挡住的程度)。")
+        print(f"  gain={args.fb_gain:g} deadband={args.fb_deadband:g} "
+              f"力矩上限={args.fb_torque:g}% (寄存器读回 {sorted(set(limits.values()))})")
+        print("  自由运动时主臂是断电的,和平时一样;只有从臂真被挡住才通电出力。")
+        print("  通电时手要握住。嗡嗡震颤=环路振荡,降 gain;咔咔通断=死区太小,加大 deadband。")
+
     print(f"\nteleoperating at {args.fps:g} Hz for {args.duration:g}s -- move every joint through its range")
 
     started = time.perf_counter()
@@ -441,6 +457,13 @@ def run(args) -> int:
             sim_obs = robot.get_observation()
             real_obs = real.get_observation() if real is not None else None
 
+            if feedback is not None:
+                # 有真机从臂时用它的实测 —— 那才是"真的被挡住了"的物理来源;
+                # solo 模式下退回仿真的实测,同样是 qpos 不是 ctrl。
+                # 传的是**指令**而不是主臂位置:见 feedback.py 模块说明,
+                # 接在主臂-从臂位置差上会把正常跟随的滞后当成被挡住。
+                feedback.update(real_obs if real_obs is not None else sim_obs, action)
+
             for key in keys:
                 if key in action:
                     commanded[key].append(action[key])
@@ -479,6 +502,13 @@ def run(args) -> int:
         # 终端设置**第一个**还原:后面几步任何一个卡住或抛异常,都不能把 shell
         # 留在 cbreak 模式里 —— 那会变成不回显、Ctrl-C 失效,只能盲敲 reset。
         keyboard.close()
+        # 断力矩排在 disconnect **之前**:总线关掉之后就写不进寄存器了,
+        # 主臂会带着力矩留在原地,手一推就顶。
+        if feedback is not None:
+            feedback.release()
+            print("  力反馈已关闭,主臂恢复自由拖动。")
+            for line in feedback.summary():
+                print(line)
         if args.show:
             try:
                 import cv2
@@ -611,6 +641,15 @@ def main() -> int:
                         help="(已废弃)改用 mj_server.py --show-cameras")
     parser.add_argument("--save", type=Path, default=None,
                         help="把逐步原始数据存成 JSON,便于事后复查或让人代为分析")
+    parser.add_argument("--force-feedback", action="store_true",
+                        help="从臂被挡住时让主臂给手阻力。**主臂会通电主动出力**,"
+                             "默认关闭,开之前先看 sim/feedback.py 的说明")
+    parser.add_argument("--fb-gain", type=float, default=FeedbackGains.gain,
+                        help="主臂朝从臂位置移动的比例(默认 %(default)s,越大越硬也越易振荡)")
+    parser.add_argument("--fb-deadband", type=float, default=FeedbackGains.deadband,
+                        help="死区,位置差小于它不出力(默认 %(default)s)")
+    parser.add_argument("--fb-torque", type=float, default=FeedbackGains.torque_percent,
+                        help="主臂力矩上限,占满量程百分比(默认 %(default)s)")
     args = parser.parse_args()
     try:
         return run(args)
