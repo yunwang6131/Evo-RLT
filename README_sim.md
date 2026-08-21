@@ -24,6 +24,15 @@ conda create -n rlt_sim python=3.11 -y
 
 `--benchmark` 建完报告耗时就退出。只写 `--build` 会接着起服务器占住终端。
 
+**重建之后必须把终端 1 的仿真器重启。** `--build` 只是重写 `scene.xml`，已经在跑的
+服务器是启动时把场景读进内存的，不会重新加载 —— 你会对着一个旧场景调半天，而且
+所有症状都指向"改动没生效"（夹不住、穿桌、穿钳口，正是修复前的样子）。
+服务器启动时会打印 scene 路径，对一下时间戳：
+
+```bash
+ls -l ~/.cache/evo_rlt/sim_assets/scene.xml   # 比服务器启动时间新 = 要重启
+```
+
 ## 启动（两个终端）
 
 ```bash
@@ -72,6 +81,30 @@ conda create -n rlt_sim python=3.11 -y
 - Ctrl-C 正常退出会自动断力矩；进程被 `kill -9` 不会，那种情况重新连一次即可
 
 原理和参数含义见 `src/evo_rlt/sim/feedback.py` 的模块说明。
+
+## 用仿真采 VLA 数据
+
+主臂是真的，从臂是仿真。先起仿真器，再用 `--sim` 跑录制：
+
+```bash
+# 终端 1
+~/anaconda3/envs/rlt_sim/bin/python src/evo_rlt/sim/mj_server.py --viewer
+
+# 终端 2：和真机录制同一个入口，只多一个 --sim
+~/anaconda3/envs/evo-rlt/bin/python -m evo_rlt.adapters.lerobot.record full \
+    --initial-source teleop --sim --setup-json configs/my_so101_manifest.json
+```
+
+`--sim` 不带值时用 `tcp://127.0.0.1:5555`。`collect` / `segment` / `full` / `live`
+四个子命令都支持。加 `--dry-run` 只打印将要执行的命令，不动硬件。
+
+仿真模式下不解析 follower 串口、不做舵机预检、不 stage follower 标定 ——
+`SimRobot` 直接读 `configs/calibration/robots/`。leader 仍然是真机。
+
+**复位时螺套会在圆形凹槽里随机摆放**（位置 + 朝向），这是 VLA 数据的初始位姿
+多样性来源；不随机的话策略学到的是「走到那个固定位置」而不是「找到零件」。
+范围在 `configs/task_scene.json` 的 `socket.reset_random` 里，实测约束见那里的
+注释。要复现同一批位姿用 `mj_server.py --random-seed 0`；把 `radius` 设 0 即关闭。
 
 ## 零件复位
 

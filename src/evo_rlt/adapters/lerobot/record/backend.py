@@ -395,7 +395,13 @@ class OnlineRLConfig:
     # position (all non-gripper joints = 0 degrees -- exactly the pose set by
     # hand during lerobot-calibrate's homing step) over this many seconds.
     # 0 disables this step (robot stays wherever the episode left it).
-    go_home_time_s: float = 3.0
+    #
+    # **默认关闭(0)。项目规则:任何时候都不复位手臂,仿真和真机都一样。**
+    # 手臂只跟随主臂。自动归位在遥操里是有害的:从臂被拉回 home,而操作者手上的
+    # 主臂不会跟着动 —— 两者一旦错开,下一帧指令就会让从臂猛地窜回主臂那边。
+    # 零件的复位由 reset 阶段的 robot.reset_objects() 负责,那个只动零件。
+    # 真要用(比如无人值守的 online RL)再显式设成 >0。
+    go_home_time_s: float = 0.0
     # Gripper target during go-home (0-100 range, no "middle" concept for an
     # open/close range). VERIFY which end means "open" for your specific
     # hardware (mounting-dependent, not fixed by lerobot) before relying on
@@ -1267,8 +1273,24 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             if not _should_run_reset_loop(recorded_episodes):
                 return
             log_say("Reset the environment", cfg.play_sounds)
+            # robot.reset() 会把**手臂**一起弹回复位姿态。项目规则是任何时候都
+            # 不复位手臂(仿真和真机都一样),所以这里只留 unitree_g1 —— 那个平台
+            # 的 reset 是它自己的站立流程,不是本项目的双臂。别把这个分支扩大到
+            # 其他机器人:仿真要用的是下面的 reset_objects(只动零件)。
             if robot.name == "unitree_g1":
                 robot.reset()
+            # 仿真:把零件摆回去(螺套在凹槽里重新随机),等同遥操里按 b。
+            # **只动零件,手臂不碰** —— 整体 reset 会把手臂弹回复位姿态,而
+            # 操作者手里的主臂不会跟着动,一松手从臂就窜回去。
+            reset_objects = getattr(robot, "reset_objects", None)
+            if callable(reset_objects):
+                try:
+                    done = reset_objects()
+                    logging.info("Sim objects reset: %s", " ".join(done))
+                except Exception:
+                    # 复位失败不该中断采集 —— 大不了这一条 episode 的初始位姿
+                    # 和上一条一样,操作者看得见,可以自己按键重录。
+                    logging.exception("Sim object reset failed; continuing with current poses.")
             record_loop(
                 robot=robot,
                 events=events,

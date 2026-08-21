@@ -145,9 +145,18 @@ TABLE_RGB2 = "0.68 0.54 0.36"
 #: 任务物体的 STL。SolidWorks 导出单位是毫米,MuJoCo 用米。
 TASK_MESH_DIR = REPO_ROOT / "data"
 MM_TO_M = 0.001
+#: ``_wide`` 后缀的是 diagnostics/widen_holes.py 把孔壁外扩过的版本 —— 凸分解
+#: 会把孔壁向内近似,不预先扩就装不进去。扩多少要让**分解后**的通径等于 CAD
+#: 真值,不是想扩多大就扩多大:
+#:   桌子小孔  CAD 5.00/6.00mm,扩 1.8mm,分解后 5.13/6.13mm
+#:   螺套内孔  CAD 5.00mm,     扩 0.2mm(不扩的话分解后只剩 4.80,而螺母杆是
+#:                             4.75 —— 单边间隙 0.05mm,接触求解的穿透量都比它大)
+#: 螺套只用扩 0.2 而桌子要 1.8,是因为桌子那 255 块要摊在整张台面上,螺套的
+#: 256 块全用在这一个小零件上,孔壁近似得细得多。
+#: 视觉也用这份加宽网格(和桌子一样的约定),0.2mm 的差别肉眼看不出来。
 TASK_MESHES = {
     "table": "桌子_h119_wide.STL",
-    "socket": "螺套_no_range.STL",
+    "socket": "螺套_no_range_wide.STL",
     "socket_insert": "螺套_no_range_白色端面嵌片.STL",
     "bolt": "螺栓.SLDPRT.STL",
 }
@@ -174,47 +183,41 @@ class GraspConfig:
     #: 4 加上扭转摩擦,这是两点夹持能稳住的前提。
     condim: int = 4
     #: (滑动, 扭转, 滚动)。MuJoCo 默认 (1, 0.005, 1e-4) 是通用值,不是夹爪值。
-    #: 这一组套在钳口、螺套和台面上。螺栓另有一组,见 ``bolt_friction``。
+    #: **这一组只套在钳口上** —— 它要涩,夹得住。零件和台面另有一组,
+    #: 见 ``part_friction``。
     friction: tuple[float, float, float] = (1.5, 0.05, 0.0005)
-    #: 螺栓专用的 (滑动, 扭转, 滚动),只写在螺栓的碰撞几何上。
+    #: 零件和台面的 (滑动, 扭转, 滚动)。**和钳口那组分开**,因为两者要的值相反。
     #:
-    #: 为什么只给螺栓:MuJoCo 对非 <pair> 接触取两边 friction 的**逐项最大**,
-    #: 所以写在螺栓这一侧,"螺栓碰钳口"就取到高值,而钳口、螺套、台面本身都
-    #: 保持 ``friction``。副作用是"螺栓碰台面"也一起变涩了 —— 同一个 max 规则,
-    #: 只给螺栓设就绕不开这条。
+    #: 钳口要涩(夹得住),而"杆在孔里"要滑 —— 孔的单边间隙只有 0.34mm,杆歪约
+    #: 1 度就楔住,μ 大了直接自锁,夹住了也拔不出来。实测纯轴向拉,拔出所需的力:
+    #:     μ      0.5N   1N    2N    3N    5N      (数字=上升 mm,>=25 为拔出)
+    #:     1.5     0.3   0.6   1.5   5.4  14.5     <- 旧值,5N 都拔不干净
+    #:     0.8     0.3   0.7  12.3   拔出  拔出
+    #:     0.5     0.3  11.9   拔出  拔出  拔出     <- 现值
+    #:     0.3     4.3   拔出  拔出  拔出  拔出
+    #: 带一点侧倾(手没对正)时差距更大:μ=1.5 给 5N 只上升 6.4mm,μ=0.5 给 3N 就出来。
     #:
-    #: **注意:这一组不影响夹爪的合拢速度**,那是关节的 damping/frictionloss
-    #: 管的(见 SceneConfig.gripper_damping)。实测把这一组从 4.0 退回 1.5,
-    #: 空载合拢时间 408ms 一位不差 —— 接触摩擦只在真的碰上之后才起作用。
+    #: 0.5 也更接近真实材料:两个零件和台面都是 PETG,PETG 对 PETG 大约 0.3~0.5。
+    #: 1.5 当初是为"夹得住"选的夹爪值,被连带套到了这些接触上。
     #:
-    #: **目前必须等于 ``friction``。** 这个钩子留着是为了将来能单独调螺栓的
-    #: 摩擦,但在当前的求解器配置(pyramidal cone + impratio=10)下调不上去。
-    #:
-    #: 试过一轮,结论是负面的。固定抓取位姿下合爪,量螺栓嵌进钳口多深:
-    #:   滑动 扭转   嵌进钳口
-    #:   1.5  0.05   -0.31 mm   <- 现值
-    #:   2.0  0.08   -5.63 mm
-    #:   2.5  0.10   -0.35 mm
-    #:   3.0  0.12   -6.65 mm
-    #:   3.5  0.15   -6.36 mm
-    #:   4.0  0.20   -7.19 mm
-    #:
-    #: 摩擦锥变陡时摩擦约束在求解里挤掉法向约束,合爪那一下螺栓直接嵌进钳口
-    #: 几毫米 —— 遥操里看到的就是"螺栓穿过夹爪"。而且**不是单调的**:2.0 穿、
-    #: 2.5 不穿、3.0 又穿。所以挑不出一个"安全的高值",2.5 只是在那个位姿下
-    #: 恰好没炸,换个位姿一样会穿。
-    #:
-    #: 真要提高夹持摩擦,得先换求解器配置(elliptic cone 对大摩擦稳得多),
-    #: 或者用 <pair> 显式给"螺栓×钳口"这一对单独设参数,而不是靠 max 规则。
-    #: 在那之前不要动这个值。
-    #:
-    #: 教训和 solref 那条一样:按滑移打分的扫描选不出这种失败 —— 4.0/0.2 的
-    #: 滑移是全场最小的(12.5mm),但它穿透 7mm。选值必须同时看穿透。
-    bolt_friction: tuple[float, float, float] = (1.5, 0.05, 0.0005)
+    #: 夹持不受影响:MuJoCo 取两边**逐项最大**,钳口 1.5 × 零件 0.5 仍然取 1.5。
+    part_friction: tuple[float, float, float] = (0.5, 0.017, 0.0005)
     #: 接触的 (时间常数, 阻尼比)。默认 0.02 偏软,轻零件会被压进去再弹出;
     #: 但**时间常数不能小于 2 倍步长**(见 validate),否则接触弹簧比积分器能
     #: 稳定处理的还硬,每次接触往系统里注入能量,零件被弹飞甚至穿过桌子。
     solref: tuple[float, float] = (0.01, 1.0)
+    #: 接触阻抗 (d0, dmax, width)。MuJoCo 默认 (0.9, 0.95, 0.001) —— dmax=0.95
+    #: 意味着约束**最硬也只有 95%**,剩下那点软度就是零件持续往里沉的量。
+    #:
+    #: 遥操实测(仿真器的穿透监视器打出来的,不是构造场景):零件被压住时穿透
+    #: 一路涨到 6~7mm 才停,18.5mm 的台面板陷进去三分之一。施力扫描对得上:
+    #:     力        0.5N   2N    5N   10N   28N
+    #:     默认      -0.4  -0.8  -1.4  -2.7  -10.2 mm
+    #:     现值      -0.1  -0.2  -0.4  -0.5   -0.8 mm
+    #:
+    #: 这同时是滑移的一部分来源:接触面一直在下陷,摩擦支撑就不稳。
+    #: 注意 dmax 不能取到 1.0 —— 那是完全刚性,求解器会病态。
+    solimp: tuple[float, float, float] = (0.98, 0.999, 0.0005)
     #: 摩擦阻抗与法向阻抗之比。1 时摩擦相对法向力太"软",锥形约束下必滑。
     impratio: float = 10.0
     #: 夹爪关节的力矩上限(N·m)。取 Follower 舵机的**额定**力矩,不是堵转。
@@ -242,7 +245,7 @@ class GraspConfig:
         raw = json.loads(path.read_text())
         fields = {f.name for f in dataclass_fields(cls)}
         kwargs = {k: v for k, v in raw.items() if k in fields}
-        for key in ("friction", "bolt_friction", "solref"):
+        for key in ("friction", "part_friction", "solref", "solimp"):
             if key in kwargs:
                 kwargs[key] = tuple(kwargs[key])
         cfg = cls(**kwargs)
@@ -270,29 +273,32 @@ class GraspConfig:
             raise AssetBuildError(f"condim 只能是 1/3/4/6,给的是 {self.condim}")
         if min(self.friction) < 0:
             raise AssetBuildError(f"friction 不能为负: {self.friction}")
-        if min(self.bolt_friction) < 0:
-            raise AssetBuildError(f"bolt_friction 不能为负: {self.bolt_friction}")
-        # 见 bolt_friction 的说明:抬高它会让合爪时螺栓嵌进钳口几毫米,而且
-        # 不单调(2.0 穿、2.5 不穿、3.0 又穿),挑不出安全值。护栏卡死在
-        # "不得高于 friction",要放开必须先换求解器配置或改用 <pair>。
-        if tuple(self.bolt_friction) != tuple(self.friction):
+        if not 0.0 < self.solimp[0] <= self.solimp[1] < 1.0:
             raise AssetBuildError(
-                f"bolt_friction {self.bolt_friction} != friction {self.friction}。"
-                "当前求解器配置(pyramidal cone + impratio=10)下抬高螺栓摩擦会让"
-                "合爪时螺栓嵌进钳口(4.0/0.2 实测 -7.19mm,2.0/0.08 -5.63mm),"
-                "而且不单调、挑不出安全值。要放开先看 GraspConfig.bolt_friction 的说明。"
+                f"solimp 要满足 0 < d0 <= dmax < 1,给的是 {self.solimp}。"
+                "dmax=1.0 是完全刚性,求解器会病态。"
+            )
+        if min(self.part_friction) < 0:
+            raise AssetBuildError(f"part_friction 不能为负: {self.part_friction}")
+        # 只许比钳口低。调**高**过:摩擦锥变陡会让摩擦约束挤掉法向约束,合爪时
+        # 零件嵌进钳口(4.0/0.2 实测 -7.19mm),而且不单调、挑不出安全值。
+        if self.part_friction[0] > self.friction[0]:
+            raise AssetBuildError(
+                f"part_friction 的滑动摩擦 {self.part_friction[0]} 高于钳口的 "
+                f"{self.friction[0]}。调高会让合爪时零件嵌进钳口,见 part_friction 的说明。"
             )
 
     def contact_attrs(self, friction: tuple[float, float, float] | None = None
                       ) -> dict[str, str]:
         """可直接塞进 <geom> 的接触属性。
 
-        ``friction`` 留空时用通用那一组;螺栓传 ``bolt_friction``。
+        ``friction`` 留空时用钳口那一组;零件和台面传 ``part_friction``。
         """
         return {
             "condim": str(self.condim),
             "friction": " ".join(f"{v:g}" for v in (friction or self.friction)),
             "solref": " ".join(f"{v:g}" for v in self.solref),
+            "solimp": " ".join(f"{v:g}" for v in self.solimp),
         }
 
 
@@ -460,7 +466,9 @@ def _add_task_objects(root: ET.Element, worldbody: ET.Element, cfg_task: dict) -
     # 零件也要用夹持用的接触参数:MuJoCo 对非 <pair> 接触取两边 friction 的
     # 逐项最大、condim 的最大,所以只给钳口设是不够的,零件这边也得配上。
     grasp = GraspConfig.load()
-    contact = grasp.contact_attrs()
+    # 台面和零件用 part_friction(滑),钳口在 _substitute_jaw_collision 里用
+    # friction(涩)。两组分开的理由见 GraspConfig.part_friction。
+    contact = grasp.contact_attrs(grasp.part_friction)
 
     scale_attr = f"{MM_TO_M} {MM_TO_M} {MM_TO_M}"
     for i, hull in enumerate(hulls):
@@ -507,10 +515,8 @@ def _add_task_objects(root: ET.Element, worldbody: ET.Element, cfg_task: dict) -
         _body_attrs("bolt", bolt),
     )
     ET.SubElement(body, "freejoint", {"name": "bolt_free"})
-    # 只有螺栓用加大的摩擦(见 GraspConfig.bolt_friction)。MuJoCo 取两边逐项
-    # 最大,所以"螺栓碰钳口"取到高值,而钳口、螺套、台面本身都保持原值。
     _add_part_geoms(asset, body, "bolt", "task_bolt", "mat_bolt",
-                    bolt["mass"], grasp.contact_attrs(grasp.bolt_friction))
+                    bolt["mass"], contact)
 
 
 class AssetBuildError(RuntimeError):
@@ -1060,10 +1066,28 @@ def build_scene(cfg: SceneConfig | None = None) -> Path:
     ET.SubElement(root, "compiler", {"angle": "radian"})
     # impratio 抬高摩擦相对法向力的阻抗。默认 1 时摩擦太"软",夹住的零件会
     # 顺着钳口滑出去 —— 这是全局项,不能只对夹爪设,故放在这里。
+    # cone=elliptic:MuJoCo 默认的 pyramidal 是摩擦锥的**四边形内近似**,对角
+    # 方向的摩擦被系统性低估,夹持时零件就沿那个方向滑。换成准确的椭圆锥后,
+    # 固定抓取位姿下抬升滑移从 27.4mm 降到 10.0mm —— **摩擦系数一点没动**,
+    # 穿透也没变化(-0.45 vs -0.47mm)。
+    #
+    # 这比"把摩擦调大"好在两点:调大摩擦(4.0/0.2)虽然滑移也降到 9.2mm,但会让
+    # 摩擦约束挤掉法向约束,合爪时零件嵌进钳口(实测 -7.19mm,遥操里就是零件
+    # 穿过夹爪);而且那个失败是位姿相关的随机失败,挑不出安全值。
+    #
+    # 它是全局求解器选项、不是关节属性,所以对夹爪的开合阻力没有影响 ——
+    # 实测空载合拢 90% 用时两种锥都是 408ms,逐位相同。
     ET.SubElement(root, "option", {
         "timestep": f"{PHYSICS_TIMESTEP:g}", "integrator": "implicitfast",
+        "cone": "elliptic",
         "impratio": f"{GraspConfig.load().impratio:g}",
     })
+    # 求解器栈。MuJoCo 默认按"典型接触数"估一个值,而这个场景的零件是几百个
+    # 凸块(螺套 256、台面 255),诊断工具还会临时把 geom_margin 放大到 20mm 去
+    # 探间隙 —— 那一下接触数能到 5700、约束 23000,默认栈直接 mj_stackAlloc
+    # 溢出并**整个进程 FatalError 退出**,不是抛异常。正常遥操 margin 为 0 时
+    # 用不到这么多,留着纯粹是不想让工具把仿真器打死。
+    ET.SubElement(root, "size", {"memory": "256M"})
 
     asset = ET.SubElement(root, "asset")
     # 没有 skybox 时 MuJoCo 背景是纯黑,相机画面里天空一片死黑,既不像真实

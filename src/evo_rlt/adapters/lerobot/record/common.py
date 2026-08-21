@@ -126,10 +126,75 @@ class RunPaths:
     log_file: Path
 
 
-def load_robot_setup(setup_json: str | None) -> RobotSetup:
+def verify_manifest_ports(setup: dict[str, Any]) -> None:
+    """核对 manifest 里每条臂的端口确实是它自己的那块转接板。
+
+    四条臂的电机 ID 都是 1~6,认错了**不会报错** —— 只会把一条臂的标定套到
+    另一条身上,表现成"标定一团乱"。曾经真的发生过:manifest 写死 ttyACM 号,
+    而左右主臂是反的(说 left=ttyACM1,实际 ttyACM1 是右主臂 5AAF220248),
+    于是走录制管线和走 diagnostics/teleop_sim.py 拿到的标定不是同一份。
+
+    判据是端口解析出来的**序列号**,不是 ttyACM 序号 —— 后者按插入顺序分配,
+    重启或换插口就变。序列号是转接板固有的。
+    """
+    import os
+
+    expected = {}
+    arms_json = _REPO_ROOT / "configs" / "arms.json"
+    if arms_json.is_file():
+        expected = {
+            alias: spec.get("serial")
+            for alias, spec in json.loads(arms_json.read_text()).get("arms", {}).items()
+        }
+    if not expected:
+        return
+
+    problems = []
+    for arm in setup.get("arms", []):
+        alias, port = arm.get("alias"), arm.get("port")
+        want = expected.get(alias)
+        if not (alias and port and want):
+            continue
+        real = os.path.realpath(port)
+        # by-id 路径里带序列号;裸 ttyACM 号则要反查 by-id 才知道是谁
+        found = want in port
+        if not found:
+            by_id = Path("/dev/serial/by-id")
+            if by_id.is_dir():
+                for link in by_id.iterdir():
+                    if os.path.realpath(link) == real:
+                        found = want in link.name
+                        break
+                else:
+                    continue          # 设备不在线,没法核对,交给连接那一步报错
+            else:
+                continue
+        if not found:
+            problems.append(f"  {alias}: manifest 给的 {port} 不是序列号 {want} 那块板")
+    if problems:
+        raise ValueError(
+            "manifest 的端口和 configs/arms.json 的序列号对不上:\n"
+            + "\n".join(problems)
+            + "\n  四条臂的电机 ID 都一样,接错不会报错,只会把标定套到别的臂上。"
+            "\n  端口建议直接写 /dev/serial/by-id/... 的稳定路径。"
+        )
+
+
+def load_robot_setup(setup_json: str | None, *, sim: bool = False) -> RobotSetup:
+    """读 setup manifest。``sim=True`` 时机器人是仿真,不需要真机 follower。
+
+    仿真模式下 follower 那一侧完全不接真臂:``SimRobot`` 自己从
+    ``configs/calibration/robots/`` 读标定(见 ``SimRobotConfig.calibration_source_dir``),
+    不走这里 stage 出来的目录,也没有串口可解析。leader 仍然是真的 —— 人用主臂
+    遥操仿真,这正是要采的数据。
+    """
     setup = load_setup_json(setup_json)
+    verify_manifest_ports(setup)
     followers = get_sorted_followers(setup)
     leaders = get_sorted_leaders(setup)
+    if sim:
+        left_cameras, right_cameras = build_camera_configs(setup.get("cameras", []))
+        return RobotSetup(setup, [], leaders, left_cameras, right_cameras)
     if len(followers) == 1:
         # Single-arm: cameras are not split left/right, so they are all
         # stored under `left_cameras`; `right_cameras` stays empty and
@@ -215,21 +280,48 @@ def remove_existing_dataset(dataset_root: Path) -> None:
         shutil.rmtree(dataset_root)
 
 
+#: manifest 里的相对路径按仓库根解析,而不是按 cwd —— 这样 manifest 可以写
+#: ``configs/calibration/...`` 而不用写死 /home/xxx,换台机器也能用。
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+
+
+def _resolve_calibration_path(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else (_REPO_ROOT / path)
+
+
 def stage_arm_calibration(arm: dict[str, Any], dst: Path) -> None:
+    """把 manifest 指定的标定文件拷到 LeRobot 认的位置和文件名。
+
+    找不到就**报错**,不是警告。LeRobot 拿不到标定文件不会停 —— 它会当场
+    进入"请把手臂推到行程两端"的重标流程,把整个采集会话废掉,而且录出来的
+    新标定通常是错的(操作者没料到要标,随手动两下就回车)。这个后果比一条
+    滚过去的 warning 严重得多。
+    """
     calibration_file = arm.get("calibration_file")
     if calibration_file:
-        src = Path(calibration_file).expanduser()
+        src = _resolve_calibration_path(calibration_file)
     else:
         serial = Path(arm["calibration_dir"]).name
-        src = Path(arm["calibration_dir"]).expanduser() / f"{serial}.json"
+        src = _resolve_calibration_path(arm["calibration_dir"]) / f"{serial}.json"
     if src.exists():
         shutil.copy2(src, dst)
         log.info("Calibration staged: %s -> %s", src, dst)
         return
-    log.warning("Calibration file not found: %s", src)
+    raise FileNotFoundError(
+        f"{arm.get('alias', '?')} 的标定文件不存在: {src}\n"
+        f"  (来自 manifest 的 calibration_file/calibration_dir)\n"
+        f"  本项目的标定在 configs/calibration/ 下,由 diagnostics/calibration.py 写入;\n"
+        f"  manifest 里若指向 ~/.cache/huggingface/... 那是另一份,可能从没标过。\n"
+        f"  用 diagnostics/calibration.py --status 看当前各臂用的是哪个文件。"
+    )
 
 
 def stage_follower_calibrations(followers: list[dict[str, Any]], cal_dir: str) -> None:
+    if not followers:
+        # 仿真模式:没有真机 follower 可 stage。SimRobot 自己去
+        # configs/calibration/robots/ 读,不看这个目录。
+        return
     if len(followers) == 1:
         stage_arm_calibration(followers[0], Path(cal_dir) / f"{FOLLOWER_ID_SINGLE}.json")
         return
@@ -285,7 +377,22 @@ def build_robot_argv(
     left_cameras: dict[str, Any],
     right_cameras: dict[str, Any],
     cal_dir: str,
+    *,
+    sim_endpoint: str | None = None,
 ) -> list[str]:
+    """拼给 LeRobot 的 ``--robot.*`` 参数。
+
+    ``sim_endpoint`` 非空时改用仿真:类型是 ``sim_bi_so_follower``(注册在
+    ``evo_rlt.sim.sim_robot``,由 ``evo_rlt.sim`` 导出给 LeRobot 的注册表找)。
+    仿真不需要 port,也不需要 calibration_dir —— 它直接读项目里的
+    ``configs/calibration/robots/``,相机是渲染出来的,不占 /dev/video*。
+    """
+    if sim_endpoint is not None:
+        return [
+            "--robot.type=sim_bi_so_follower",
+            "--robot.id=bimanual",
+            f"--robot.endpoint={sim_endpoint}",
+        ]
     if len(followers) == 1:
         return [
             "--robot.type=so101_follower",

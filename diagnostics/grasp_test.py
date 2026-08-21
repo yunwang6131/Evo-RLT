@@ -266,18 +266,19 @@ def apply_contact(model, cfg: dict) -> None:
         if model.geom_contype[i]
         and ("wrist_roll_follower" in name(i) or "moving_jaw" in name(i))
     ]
-    generic.extend(_part_geoms(model, "socket"))
-    bolt = list(_part_geoms(model, "bolt"))
-    # 螺栓的 friction 是单独一组(见 assets.GraspConfig.bolt_friction)。
-    # 这里若都写 cfg["friction"],扫参就会把螺栓那组悄悄覆盖掉,扫出来的
-    # 结论和 build 出的场景对不上。
+    # 钳口用 friction(涩,夹得住),零件和台面用 part_friction(滑,杆能从孔里
+    # 拔出来)。见 assets.GraspConfig.part_friction。这里若都写 cfg["friction"],
+    # 扫参就会把零件那组悄悄覆盖掉,扫出来的结论和 build 出的场景对不上。
+    parts = list(_part_geoms(model, "socket")) + list(_part_geoms(model, "bolt"))
+    name_ = name
+    parts += [i for i in range(model.ngeom) if name_(i).startswith("worktable_col")]
     for i in generic:
         model.geom_condim[i] = cfg["condim"]
         model.geom_friction[i] = cfg["friction"]
         model.geom_solref[i][:2] = cfg["solref"]
-    for i in bolt:
+    for i in parts:
         model.geom_condim[i] = cfg["condim"]
-        model.geom_friction[i] = cfg["bolt_friction"]
+        model.geom_friction[i] = cfg["part_friction"]
         model.geom_solref[i][:2] = cfg["solref"]
     model.opt.impratio = cfg["impratio"]
 
@@ -608,7 +609,11 @@ def run(model, data, side: str, obj: str, render_to: Path | None = None,
     gravity = model.opt.gravity.copy()
     model.opt.gravity[:] = 0
 
-    hold = int(0.6 / model.opt.timestep)
+    # 合爪速度必须和 _ramp_closed 用同一个常量。这里曾经写死 0.6 秒走完全行程
+    # (3.97 rad/s),比真机峰值还快 40% —— 接触调硬之后它会在两片钳口碰上之前
+    # 就把零件弹开,于是整套测试报"摆位不对",而摆位其实是好的(搜索阶段同一个
+    # 位姿量到 48.8 N 残余夹持力)。
+    hold = int(abs(GRIPPER_OPEN - GRIPPER_CLOSED) / GRIPPER_CLOSE_SPEED / model.opt.timestep)
     gripped = False
     for k in range(hold):
         data.ctrl[ga] = GRIPPER_OPEN + (GRIPPER_CLOSED - GRIPPER_OPEN) * (k + 1) / hold
@@ -688,7 +693,7 @@ def _render(model, data, lookat, path: Path) -> None:
 
 def load_config() -> dict:
     cfg = {"condim": 4, "friction": [1.5, 0.05, 0.0005],
-           "bolt_friction": [1.5, 0.05, 0.0005], "solref": [0.01, 1.0],
+           "part_friction": [0.5, 0.017, 0.0005], "solref": [0.01, 1.0],
            "impratio": 10.0, "gripper_force_limit": 0.981}
     if GRASP_CONFIG.is_file():
         cfg.update({k: v for k, v in json.loads(GRASP_CONFIG.read_text()).items()
@@ -702,10 +707,9 @@ SWEEP = {
     "condim": [3, 4, 6],
     "friction": [[0.6, 0.005, 0.0001], [1.0, 0.02, 0.0002],
                  [1.5, 0.05, 0.0005], [2.5, 0.1, 0.001]],
-    # bolt_friction 不扫:当前求解器配置下抬高它会让合爪时螺栓嵌进钳口
-    # (4.0/0.2 实测 -7.19mm),而且不单调 —— 2.0 穿、2.5 不穿、3.0 又穿。
-    # **这个扫描按滑移打分,发现不了穿透**(4.0/0.2 的滑移恰恰是最小的),
-    # 所以它进网格只会把坏值选出来。见 assets.GraspConfig.bolt_friction。
+    # part_friction 不扫:它由"杆能不能从孔里拔出来"定,而这个扫描只看夹持,
+    # 完全测不到。抬高它还会让合爪时零件嵌进钳口(4.0/0.2 实测 -7.19mm),
+    # 而且不单调 —— 2.0 穿、2.5 不穿、3.0 又穿。见 assets.GraspConfig.part_friction。
     # 时间常数下限是 2 倍步长(0.004)。曾经把 0.002 放进来过,扫描只看滑移量
     # 不看稳定性,那个发散的配置在当次测试里恰好没炸就被选中了 —— 结果是遥操
     # 里零件被弹飞、还能穿过桌子。坏值不该进网格,GraspConfig.validate 兜底。

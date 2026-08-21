@@ -533,6 +533,15 @@ def _collect_rlt_phase_argv(args: argparse.Namespace) -> list[str]:
     ]
 
 
+def _sim_endpoint(args: argparse.Namespace) -> str | None:
+    """``--sim`` 时返回仿真器地址,否则 None(=用真机)。
+
+    只看一个开关,四个 run_* 入口共用 —— 分散判断的话总会漏掉一处,
+    表现是"某个子命令的 --sim 悄悄跑到真机上去了"。
+    """
+    return getattr(args, "sim", None) or None
+
+
 def run_collect(args: argparse.Namespace) -> None:
     set_offline_env()
     episode_outcome_key = _collect_external_episode_outcome_key(args)
@@ -546,7 +555,7 @@ def run_collect(args: argparse.Namespace) -> None:
     else:
         validation_keys["episode_outcome_key"] = episode_outcome_key
     _validate_distinct_keys(**validation_keys)
-    setup = load_robot_setup(args.setup_json)
+    setup = load_robot_setup(args.setup_json, sim=_sim_endpoint(args) is not None)
     paths = resolve_run_paths(setup.setup, args.dataset_tag, "eval_vla_rlt_vla")
     configure_logging(paths.log_file, args.log_level)
     remove_existing_dataset(paths.dataset_root)
@@ -591,7 +600,8 @@ def build_default_collect_record_argv(
 ) -> list[str]:
     argv = [
         "record_collect",
-        *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir),
+        *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir,
+                          sim_endpoint=_sim_endpoint(args)),
         *teleop_argv,
         *build_policy_overrides(
             policy_path=args.policy_path,
@@ -669,7 +679,7 @@ def print_collect_summary(args: argparse.Namespace, paths) -> None:
 
 def run_segment(args: argparse.Namespace) -> None:
     set_offline_env()
-    setup = load_robot_setup(args.setup_json)
+    setup = load_robot_setup(args.setup_json, sim=_sim_endpoint(args) is not None)
     paths = resolve_run_paths(setup.setup, args.dataset_tag, f"eval_{args.critical_source}_segment")
     configure_logging(paths.log_file, args.log_level)
     remove_existing_dataset(paths.dataset_root)
@@ -687,7 +697,8 @@ def run_segment(args: argparse.Namespace) -> None:
     with TemporaryDirectory(prefix="record-segment-") as cal_dir:
         stage_follower_calibrations(setup.followers, cal_dir)
         leader_cal_dir = stage_leader_calibrations(setup.leaders, teleop_argv)
-        if not args.dry_run and args.preflight:
+        # 仿真没有舵机可预检,真机那条路不受影响。
+        if not args.dry_run and args.preflight and _sim_endpoint(args) is None:
             preflight_motor_connections(
                 setup.followers,
                 setup.leaders if teleop_argv else [],
@@ -714,7 +725,8 @@ def run_segment(args: argparse.Namespace) -> None:
 def build_segment_record_argv(args, setup, paths, cal_dir: str, teleop_argv: list[str]) -> list[str]:
     argv = [
         "record_segment",
-        *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir),
+        *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir,
+                          sim_endpoint=_sim_endpoint(args)),
         *teleop_argv,
         *build_segment_policy_argv(args),
         *build_dataset_argv(
@@ -836,7 +848,7 @@ def run_full(args: argparse.Namespace) -> None:
         if args.rtc_action_queue_size_to_get_new_actions is None:
             args.rtc_action_queue_size_to_get_new_actions = 30
 
-    setup = load_robot_setup(args.setup_json)
+    setup = load_robot_setup(args.setup_json, sim=_sim_endpoint(args) is not None)
     # LeRobot reserves dataset names beginning with ``eval_`` for policy
     # rollouts.  A teleoperation-only recording has no policy, so using that
     # prefix makes LeRobot's dataset-name sanity check reject the run.
@@ -859,7 +871,8 @@ def run_full(args: argparse.Namespace) -> None:
         leader_cal_dir = stage_leader_calibrations(setup.leaders, teleop_argv)
         sys.argv = [
             "record_full",
-            *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir),
+            *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir,
+                          sim_endpoint=_sim_endpoint(args)),
             *teleop_argv,
             *build_policy_overrides(
                 policy_path=args.policy_path,
@@ -943,7 +956,7 @@ def run_full(args: argparse.Namespace) -> None:
 
 def run_live(args: argparse.Namespace) -> None:
     set_offline_env()
-    setup = load_robot_setup(args.setup_json)
+    setup = load_robot_setup(args.setup_json, sim=_sim_endpoint(args) is not None)
     eval_script = Path(args.eval_script).expanduser()
     if not eval_script.exists():
         raise FileNotFoundError(f"RTC eval script not found: {eval_script}")
@@ -965,7 +978,8 @@ def run_live(args: argparse.Namespace) -> None:
             f"--rtc.execution_horizon={args.rtc_execution_horizon}",
             f"--rtc.max_guidance_weight={args.rtc_max_guidance_weight}",
             f"--rtc.prefix_attention_schedule={args.rtc_prefix_attention_schedule}",
-            *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir),
+            *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir,
+                          sim_endpoint=_sim_endpoint(args)),
             f"--task={args.task}",
             f"--duration={args.duration}",
             f"--fps={args.fps}",

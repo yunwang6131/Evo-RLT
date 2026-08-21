@@ -16,6 +16,14 @@ def register() -> None:
     if _REGISTERED:
         return
 
+    # 仿真机器人。``@RobotConfig.register_subclass("sim_bi_so_follower")`` 是在
+    # **import 时**执行的,而 record 脚本的 ``--robot.type`` 选项列表是从注册表
+    # 现场构建的 —— 没在这里 import 过,``--robot.type=sim_bi_so_follower`` 就会
+    # 被 argparse 拒掉:"invalid choice"。
+    #
+    # 光在 ``evo_rlt.sim.__init__`` 里做惰性导出不够:那只在有人 getattr 的时候
+    # 才触发,而 argparse 建选项列表时不会去 getattr。
+    import evo_rlt.sim.sim_robot  # noqa: F401
     import lerobot.datasets.factory as dataset_factory
     import lerobot.policies.factory as factory
 

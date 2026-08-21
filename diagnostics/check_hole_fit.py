@@ -130,6 +130,57 @@ def scan(model, data, bottom: float, step: float) -> list[tuple[np.ndarray, floa
     return holes
 
 
+def socket_bore(model, data, shaft_mm: float, step: float) -> float:
+    """螺套内孔的通径(毫米)。
+
+    这是**盲孔**(底部有 2mm 实心底),所以不能像台面小孔那样用"射线穿到板底
+    以下"当判据 —— 那样一个点都穿不过,看起来像孔被填实了。改看**命中高度**:
+    打进孔里的射线停在孔底,打在环形端面上的停在顶面,两者差着 30mm。
+
+    把螺套单独吊到空中扫,免得台面和螺栓挡路。
+    """
+    import mujoco
+
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "socket_free")
+    if jid < 0:
+        return 0.0
+    adr = model.jnt_qposadr[jid]
+    saved = data.qpos[adr:adr + 7].copy()
+    data.qpos[adr:adr + 3] = [0.0, 0.0, 1.0]
+    data.qpos[adr + 3:adr + 7] = [1.0, 0.0, 0.0, 0.0]
+    mujoco.mj_forward(model, data)
+
+    group = np.zeros(6, np.uint8)
+    group[3] = 1
+    geomid = np.zeros(1, np.int32)
+    deep = []
+    span = 0.015
+    for x in np.arange(-span, span + step, step):
+        for y in np.arange(-span, span + step, step):
+            dist = mujoco.mj_ray(model, data, np.array([x, y, 1.10]),
+                                 np.array([0.0, 0.0, -1.0]), group, 1, -1, geomid)
+            if dist < 0:
+                continue
+            if (1.10 - dist - 1.0) < 0.010:      # 停在孔底那一档
+                deep.append((x, y))
+
+    data.qpos[adr:adr + 7] = saved
+    mujoco.mj_forward(model, data)
+    if not deep:
+        return 0.0
+
+    pts = np.array(deep)
+    best = 0.0
+    for rad in np.arange(step, 0.012, step):
+        ring = np.stack([rad * np.cos(np.linspace(0, 2 * np.pi, 72)),
+                         rad * np.sin(np.linspace(0, 2 * np.pi, 72))], axis=1)
+        if all(np.linalg.norm(pts - p, axis=1).min() < step * 0.9 for p in ring):
+            best = rad
+        else:
+            break
+    return best * 1000.0
+
+
 def main() -> int:
     import mujoco
 
@@ -161,6 +212,11 @@ def main() -> int:
     holes = scan(model, data, bottom, args.step_mm / 1000.0)
     # 大圆凹槽不是通孔,扫不出来;这里剩下的都是小孔
     holes = [h for h in holes if h[1] < 15.0]
+
+    bore = socket_bore(model, data, radius, args.step_mm / 1000.0)
+    print(f"螺套内孔通径 {bore:.2f} mm  单边间隙 {bore - radius:+.2f} mm  "
+          f"{'螺套套得上螺栓' if bore > radius else '** 套不上,螺套装不到螺栓上 **'}")
+    print("  (CAD 真值 5.00mm。凸分解会啃掉一点,靠 widen_holes.py --hole 0,0 补回来)\n")
     if not holes:
         print("台面上没扫到孔 —— 凸分解可能把孔全填平了")
         return 1

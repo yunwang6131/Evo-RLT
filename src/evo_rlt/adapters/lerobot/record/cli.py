@@ -31,6 +31,11 @@ def add_common_record_args(parser: argparse.ArgumentParser) -> None:
         default=False,
         help="Discard and rerecord an episode when it ends without an explicit success/failure key.",
     )
+    parser.add_argument(
+        "--sim", nargs="?", const="tcp://127.0.0.1:5555", default=None, metavar="ENDPOINT",
+        help="用仿真当 follower 采数据(主臂仍是真的)。先起 mj_server.py。"
+             "不带值时用 tcp://127.0.0.1:5555",
+    )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--dry-run", action="store_true", default=False)
 
@@ -70,6 +75,11 @@ def add_default_collect_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset-tag", default=DEFAULT_COLLECT_DATASET_TAG)
     parser.add_argument("--vcodec", default="h264")
     parser.add_argument("--no-teleop", action="store_true", default=False)
+    parser.add_argument(
+        "--sim", nargs="?", const="tcp://127.0.0.1:5555", default=None, metavar="ENDPOINT",
+        help="用仿真当 follower 采数据(主臂仍是真的)。先起 mj_server.py。"
+             "不带值时用 tcp://127.0.0.1:5555",
+    )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--vla-ref", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--play-sounds", action=argparse.BooleanOptionalAction, default=True)
@@ -169,6 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--duration", type=float, default=120.0)
     live.add_argument("--fps", type=float, default=30.0)
     live.add_argument("--setup-json", default=None)
+    live.add_argument(
+        "--sim", nargs="?", const="tcp://127.0.0.1:5555", default=None, metavar="ENDPOINT",
+        help="在仿真里跑策略,不碰真机。先起 mj_server.py。"
+             "不带值时用 tcp://127.0.0.1:5555",
+    )
     live.add_argument("--dry-run", action="store_true", default=False)
     add_rtc_args(live)
     live.set_defaults(func=run_live)

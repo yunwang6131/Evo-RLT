@@ -26,12 +26,17 @@ recorded episodes reproducible.
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
+import random
 import sys
 import time
 import traceback
 from collections import deque
 from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -61,6 +66,29 @@ def enable_gpu_offload() -> None:
     os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
 
 
+def _load_random_specs() -> dict[str, dict]:
+    """读 configs/task_scene.json 里各零件的 ``reset_random``。
+
+    直接读 JSON 而不是 import assets:这个进程刻意不依赖 ``evo_rlt``(见模块
+    开头),而 assets 只在 ``--build`` 那条路上才导入。缺文件就不随机化。
+    """
+    path = Path(__file__).resolve().parents[3] / "configs" / "task_scene.json"
+    if not path.is_file():
+        return {}
+    try:
+        task = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{path} 不是合法 JSON: {exc}") from exc
+    out = {}
+    for name, spec in task.items():
+        if not isinstance(spec, dict):
+            continue
+        rnd = spec.get("reset_random")
+        if isinstance(rnd, dict) and float(rnd.get("radius", 0.0)) > 0:
+            out[name] = rnd
+    return out
+
+
 class SimulatorState:
     """Owns the MuJoCo model, data and renderer."""
 
@@ -72,6 +100,8 @@ class SimulatorState:
         physics_hz: float,
         camera_keys: tuple[str, ...] = CAMERA_KEYS,
         action_delay_steps: int = 0,
+        random_seed: int | None = None,
+        penetration_warn_mm: float = 2.0,
     ) -> None:
         import mujoco
 
@@ -93,6 +123,21 @@ class SimulatorState:
         self.model.opt.timestep = 1.0 / physics_hz
         self.physics_hz = physics_hz
 
+        # 复位随机化。用**自己的** RNG 而不是全局 random:全局的会被其他代码
+        # (以及策略推理)重新播种,那样同一个 --random-seed 复现不出同一批位姿。
+        self._rng = random.Random(random_seed)
+        self._random_specs = _load_random_specs()
+
+        # 穿透监视。零件嵌进别的东西超过这个深度就打一行日志(见 _watch_penetration)。
+        self._pen_threshold = penetration_warn_mm / 1000.0
+        self._pen_seen: dict[tuple[int, int], float] = {}
+        self._free_bodies = {
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, nm)
+            for nm in self.free_objects()
+        }
+
+        self._scene_mtime = scene_path.stat().st_mtime
+        self._scene_path = scene_path
         self._verify_scene()
         self.renderer = mujoco.Renderer(self.model, height, width)
         self.viewer = None
@@ -232,8 +277,44 @@ class SimulatorState:
             dadr = self.model.jnt_dofadr[jid]
             self.data.qpos[adr : adr + 7] = key[adr : adr + 7]
             self.data.qvel[dadr : dadr + 6] = 0.0
+            self._randomize(name, adr)
         self._mujoco.mj_forward(self.model, self.data)
         return names
+
+    def _randomize(self, name: str, adr: int) -> None:
+        """按 configs/task_scene.json 的 ``reset_random`` 打散这个零件的初始位姿。
+
+        没配这一段的零件原样放回 keyframe。采 VLA 数据必须打散:每条 episode
+        的起点都一样的话,策略学到的是"走到那个固定位置",不是"找到零件"。
+
+        只动 xy 和 yaw,z 和倾角沿用 keyframe —— 那个 z 是 settle_objects.py 跑
+        物理落稳得到的,凹槽底是平的,同一个 z 在整个可放区域都成立;而重新
+        采样倾角会让零件初始就嵌进凹槽壁。
+        """
+        spec = self._random_specs.get(name)
+        if not spec:
+            return
+        cx, cy = spec["center"]
+        radius = float(spec.get("radius", 0.0))
+        # 均匀采样圆盘要对半径开方,直接均匀采 r 会让点堆在圆心
+        r = radius * math.sqrt(self._rng.random())
+        theta = self._rng.uniform(0.0, 2.0 * math.pi)
+        self.data.qpos[adr] = cx + r * math.cos(theta)
+        self.data.qpos[adr + 1] = cy + r * math.sin(theta)
+
+        yaw_deg = float(spec.get("yaw_deg", 0.0))
+        if yaw_deg:
+            yaw = math.radians(self._rng.uniform(-yaw_deg / 2.0, yaw_deg / 2.0))
+            half = yaw / 2.0
+            # 绕 z 转 yaw,叠加到 keyframe 里那个落稳姿态上(四元数左乘)
+            qz = [math.cos(half), 0.0, 0.0, math.sin(half)]
+            w, x, y, z = self.data.qpos[adr + 3 : adr + 7]
+            self.data.qpos[adr + 3 : adr + 7] = [
+                qz[0] * w - qz[3] * z,
+                qz[0] * x - qz[3] * y,
+                qz[0] * y + qz[3] * x,
+                qz[0] * z + qz[3] * w,
+            ]
 
     def step(self, targets: list[float], duration_s: float) -> int:
         """Apply joint targets and advance physics by ``duration_s``。
@@ -251,7 +332,50 @@ class SimulatorState:
         n = max(1, int(round(duration_s * self.physics_hz)))
         for _ in range(n):
             self._mujoco.mj_step(self.model, self.data)
+            self._watch_penetration()
         return n
+
+    def _watch_penetration(self) -> None:
+        """零件嵌进别的东西太深就记一笔。遥操时不用人盯着看。
+
+        为什么要这个:脚本能构造的失败场景我都试过了(自由落体、有界推力、
+        定点合爪),全都过;而操作者在遥操里能做出脚本造不出的动作序列。与其
+        继续猜他手怎么动的,不如让仿真自己在事发那一刻把证据留下来。
+
+        只扫涉及自由零件的接触,开销可以忽略(接触总数里这类只占几十个)。
+        """
+        if self._pen_threshold <= 0:
+            return
+        mj = self._mujoco
+        # 零件和台面都是几十上百个凸块,同一次事件会命中几十对几何。按**物体对**
+        # 聚合成一行,否则一次穿透刷满屏幕,反而看不出发生了什么。
+        worst: dict[tuple[int, int], tuple[float, float]] = {}
+        force = np.zeros(6)
+        for c in range(self.data.ncon):
+            con = self.data.contact[c]
+            depth = -con.dist
+            if depth < self._pen_threshold:
+                continue
+            b1 = int(self.model.geom_bodyid[con.geom1])
+            b2 = int(self.model.geom_bodyid[con.geom2])
+            if b1 not in self._free_bodies and b2 not in self._free_bodies:
+                continue
+            mj.mj_contactForce(self.model, self.data, c, force)
+            key = (b1, b2) if b1 <= b2 else (b2, b1)
+            prev = worst.get(key, (0.0, 0.0))
+            # 力要**求和**不是取最大:两个物体都是几十个凸块,载荷分摊在几十个
+            # 接触点上,单点的峰值只有合力的零头。报单点会让"其实压了 30N"
+            # 看起来像"才 3N",把诊断带偏。
+            worst[key] = (max(prev[0], depth), prev[1] + abs(float(force[0])))
+
+        for key, (depth, fn) in worst.items():
+            # 只在比这对物体历史最深还深 1mm 时才再报,免得持续嵌着刷屏
+            if depth <= self._pen_seen.get(key, 0.0) + 0.001:
+                continue
+            self._pen_seen[key] = depth
+            nm = lambda b: mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_BODY, b) or f"body{b}"
+            print(f"[sim] 穿透 {depth*1000:6.2f}mm  t={self.data.time:7.3f}s  "
+                  f"{nm(key[0])} × {nm(key[1])}  峰值法向力 {fn:.2f}N", flush=True)
 
     # -- observation --------------------------------------------------------
 
@@ -341,10 +465,32 @@ class SimServer:
             self.sim.render_all(),
         )
 
+    def _warn_if_scene_stale(self) -> None:
+        """磁盘上的 scene.xml 比本进程加载的新就喊一声。
+
+        ``--build`` 只重写文件,**已经在跑的服务器不会重新加载** —— 场景是启动
+        那一刻读进内存的。这个坑真实发生过好几次:改完接触参数、重建、然后对着
+        一个旧场景调半天,而所有症状都指向"改动没生效"。
+        客户端每次连上都会握手,所以这里查一次就够,不占步进的开销。
+        """
+        try:
+            now = self.sim._scene_path.stat().st_mtime
+        except OSError:
+            return
+        if now > self.sim._scene_mtime + 1.0:
+            import datetime as _dt
+
+            fmt = lambda t: _dt.datetime.fromtimestamp(t).strftime("%m-%d %H:%M:%S")
+            print(f"\n[sim] ** 场景已过期 ** 本进程加载于 {fmt(self.sim._scene_mtime)},"
+                  f"而 scene.xml 在 {fmt(now)} 被重建过。\n"
+                  f"[sim]    你正在跑的是旧场景,重建的改动没有生效。"
+                  f"Ctrl-C 重启本进程。\n", flush=True)
+
     def _handle(self, request: dict) -> tuple[dict, list[bytes]]:
         command = request.get("command")
 
         if command == Command.HANDSHAKE:
+            self._warn_if_scene_stale()
             return self._describe(), []
 
         if command == Command.OBSERVE:
@@ -451,6 +597,12 @@ def main() -> int:
     parser.add_argument("--action-delay-steps", type=int, default=DEFAULT_ACTION_DELAY_STEPS,
                         help="指令纯延迟步数,匹配真机通信+舵机启动时间")
     parser.add_argument("--control-hz", type=float, default=DEFAULT_CONTROL_HZ)
+    parser.add_argument("--penetration-warn-mm", type=float, default=2.0,
+                        help="零件嵌进别的东西超过这么深就打日志(0=关掉)。"
+                             "查\"零件穿桌/穿钳口\"用,正常遥操时几乎不会触发")
+    parser.add_argument("--random-seed", type=int, default=None,
+                        help="复位随机化的种子。不给就每次不同(采数据要的就是这个);"
+                             "给了同一个数就能复现同一批初始位姿,便于对照实验")
     parser.add_argument("--no-gpu-offload", action="store_true", help="do not force GL onto the NVIDIA GPU")
     parser.add_argument("--benchmark", action="store_true", help="report timing and exit")
     parser.add_argument("--viewer", action="store_true", help="开仿真场景窗口(看机械臂姿态)")
@@ -473,6 +625,8 @@ def main() -> int:
         print(f"[sim] built scene {scene_path}", flush=True)
 
     sim = SimulatorState(scene_path, args.width, args.height, args.physics_hz,
+                         random_seed=args.random_seed,
+                         penetration_warn_mm=args.penetration_warn_mm,
                          action_delay_steps=args.action_delay_steps)
 
     if args.benchmark:

@@ -333,7 +333,15 @@ class SimRobot(Robot):
         }
 
     def reset(self, qpos: list[float] | None = None) -> dict:
-        """Reset the scene. Not part of `Robot`, but the loop calls it if present."""
+        """整体复位场景 —— **会把手臂一起弹回复位姿态**。
+
+        项目规则:遥操和采集途中任何时候都不复位手臂,仿真和真机都一样。手臂只
+        跟随主臂。这里一动,操作者手上的主臂不会跟着动,两者错开之后下一帧指令
+        会让从臂猛地窜回去。
+
+        所以这个方法只给两类调用者:进程启动时的初始化,和 check_sim_loopback
+        那种不接主臂的独立诊断。采集/遥操途中要摆零件,用 `reset_objects`。
+        """
         payload: dict = {"command": Command.RESET}
         if qpos is not None:
             payload["qpos"] = qpos

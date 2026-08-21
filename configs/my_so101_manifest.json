@@ -7,35 +7,67 @@
     {
       "alias": "left_follower",
       "type": "follower",
-      "port": "/dev/ttyACM3",
-      "calibration_dir": "~/.cache/huggingface/lerobot/calibration/robots/so_follower",
-      "calibration_file": "~/.cache/huggingface/lerobot/calibration/robots/so_follower/left_follower_arm.json"
+      "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AB9065103-if00",
+      "calibration_dir": "configs/calibration/robots",
+      "calibration_file": "configs/calibration/robots/evosim_left_follower.json",
+      "serial": "5AB9065103"
     },
     {
       "alias": "right_follower",
       "type": "follower",
-      "port": "/dev/ttyACM2",
-      "calibration_dir": "~/.cache/huggingface/lerobot/calibration/robots/so_follower",
-      "calibration_file": "~/.cache/huggingface/lerobot/calibration/robots/so_follower/right_follower_arm.json"
+      "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AB9065574-if00",
+      "calibration_dir": "configs/calibration/robots",
+      "calibration_file": "configs/calibration/robots/evosim_right_follower.json",
+      "serial": "5AB9065574"
     },
     {
       "alias": "left_leader",
       "type": "leader",
-      "port": "/dev/ttyACM1",
-      "calibration_dir": "~/.cache/huggingface/lerobot/calibration/teleoperators/so_leader",
-      "calibration_file": "~/.cache/huggingface/lerobot/calibration/teleoperators/so_leader/left_leader_arm.json"
+      "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B41533735-if00",
+      "calibration_dir": "configs/calibration/teleoperators",
+      "calibration_file": "configs/calibration/teleoperators/evosim_left_leader.json",
+      "serial": "5B41533735"
     },
     {
       "alias": "right_leader",
       "type": "leader",
-      "port": "/dev/ttyACM0",
-      "calibration_dir": "~/.cache/huggingface/lerobot/calibration/teleoperators/so_leader",
-      "calibration_file": "~/.cache/huggingface/lerobot/calibration/teleoperators/so_leader/right_leader_arm.json"
+      "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AAF220248-if00",
+      "calibration_dir": "configs/calibration/teleoperators",
+      "calibration_file": "configs/calibration/teleoperators/evosim_right_leader.json",
+      "serial": "5AAF220248"
     }
   ],
   "cameras": [
-    {"alias": "left_wrist",  "port": 6, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"},
-    {"alias": "right_wrist", "port": 4, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"},
-    {"alias": "right_front", "port": 2, "width": 640, "height": 480, "fps": 30, "fourcc": "YUYV"}
+    {
+      "alias": "left_wrist",
+      "port": 6,
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "fourcc": "YUYV"
+    },
+    {
+      "alias": "right_wrist",
+      "port": 4,
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "fourcc": "YUYV"
+    },
+    {
+      "alias": "right_front",
+      "port": 2,
+      "width": 640,
+      "height": 480,
+      "fps": 30,
+      "fourcc": "YUYV"
+    }
+  ],
+  "_comment": [
+    "端口用 /dev/serial/by-id/ 的稳定路径,不用 /dev/ttyACM* 序号。",
+    "序号按插入顺序分配,重启或换插口就变。曾经这里写死过 ttyACM 号,而且左右",
+    "主臂是反的(manifest 说 left=ttyACM1,实际 ttyACM1 是右主臂 5AAF220248)——",
+    "结果是走录制管线时把右臂的标定套在左臂上,而且不报错。序列号见 arms.json,",
+    "换了转接板跑 diagnostics/probe_arms.py --identify。"
   ]
 }

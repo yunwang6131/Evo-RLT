@@ -72,16 +72,28 @@ def main() -> int:
     parser.add_argument("--search-mm", type=float, default=9.0,
                         help="孔心多大范围内的顶点算孔壁")
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--hole", action="append", metavar="X,Y", default=None,
+                        help="孔心(毫米,原始 STL 坐标),可给多次。"
+                             "不给就用桌子那两个小孔。螺套内孔在原点,用 --hole 0,0")
     args = parser.parse_args()
+
+    holes = DEFAULT_HOLES
+    if args.hole:
+        try:
+            holes = [tuple(float(v) for v in h.split(",")) for h in args.hole]
+        except ValueError:
+            raise SystemExit("--hole 要写成 X,Y,例如 --hole 0,0")
+        if any(len(h) != 2 for h in holes):
+            raise SystemExit("--hole 要写成 X,Y,例如 --hole 0,0")
 
     header, normals, tris = read_binary_stl(args.src)
     before = tris.copy()
-    moved = widen(tris, DEFAULT_HOLES, args.extra_mm, args.search_mm)
+    moved = widen(tris, holes, args.extra_mm, args.search_mm)
 
     out = args.out or args.src.with_name(f"{args.src.stem}_wide.STL")
     write_binary_stl(out, header, normals, tris)
 
-    for cx, cy in DEFAULT_HOLES:
+    for cx, cy in holes:
         for label, arr in (("原", before), ("新", tris)):
             flat = arr.reshape(-1, 3)
             d = np.linalg.norm(flat[:, :2] - np.array([cx, cy]), axis=1)
@@ -90,7 +102,7 @@ def main() -> int:
                 print(f"  孔({cx:6.1f},{cy:5.1f}) {label}: 壁半径 {wall.min():.2f} ~ {wall.max():.2f} mm")
     print(f"\n移动 {moved} 个顶点,写入 {out}")
     print("接着重新凸分解:")
-    print(f"  python diagnostics/decompose_mesh.py {out}")
+    print(f"  python diagnostics/decompose_mesh.py {out} --threshold 0.005 --max-hulls 256")
     return 0
 
 
