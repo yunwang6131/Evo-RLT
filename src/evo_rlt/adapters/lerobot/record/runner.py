@@ -259,6 +259,9 @@ def _patch_record_keyboard_listener() -> None:
             kwargs.pop("end_success_key", None): "end_phase_success",
             kwargs.pop("end_failure_key", None): "end_phase_failure",
             kwargs.pop("milestone_key", None): "mark_rl_milestone",
+            # 冻结右臂(单人采双臂数据用)。和 critical_phase_toggle_key 默认
+            # 同为 p —— 只在 rlt.enable 时才都激活,backend 的 __post_init__ 会拦。
+            kwargs.pop("arm_freeze_key", None): "toggle_arm_freeze",
         }
         keyboard_listener, events = original_init_keyboard_listener(*args, **kwargs)
         _ensure_record_events(events)

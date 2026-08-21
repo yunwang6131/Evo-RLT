@@ -23,31 +23,31 @@ lerobot-calibrate --teleop.type=so101_leader --teleop.port=/dev/ttyACM0 --teleop
 # 标定 right_leader
 lerobot-calibrate --teleop.type=so101_leader --teleop.port=/dev/ttyACM0 --teleop.id=right_leader_arm
 
-# 采集数据(写到暂存区 ~/lerobot_data,不直接落到 data)
+# 采集数据(直接落到 data/bimanual/<MMDD>_<dataset-tag>/<prefix>_<HHMMSS>,data/ 在 .gitignore 里)
 evo-rlt-record full   --initial-source teleop   --setup-json configs/my_so101_manifest.json   --dataset-tag screw_demo_v1   --task "Pick up the small white object and the black object from the yellow area, insert the white object into the black object, and place the assembly in the yellow square area."   --num-episodes 70   --episode-time-s 300   --reset-time-s 6  --fps 30   --vcodec h264   --discard-unlabeled-episodes
 
 # 删除某条（先确认目录，再将实际绝对路径直接写入命令）
-ls -td ~/lerobot_data/bimanual/*/record_teleop_full_*/
+ls -td data/bimanual/*/record_teleop_full_*/
 
 ~/anaconda3/envs/evo-rlt/bin/lerobot-edit-dataset \
-  --repo_id local/record_teleop_full_172817 --root ~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817 \
-  --new_repo_id local/record_teleop_full_172817 --new_root ~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817 \
+  --repo_id local/record_teleop_full_172817 --root data/bimanual/0716_screw_demo_v1/record_teleop_full_172817 \
+  --new_repo_id local/record_teleop_full_172817 --new_root data/bimanual/0716_screw_demo_v1/record_teleop_full_172817 \
   --operation.type delete_episodes \
   --operation.episode_indices "[5]"
 
-jq '{total_episodes, total_frames}' ~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817/meta/info.json
+jq '{total_episodes, total_frames}' data/bimanual/0716_screw_demo_v1/record_teleop_full_172817/meta/info.json
 
 # 查看保存了多少条(当前这一次 session)
-jq '{total_episodes, total_frames, total_videos, fps}' ~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817/meta/info.json
+jq '{total_episodes, total_frames, total_videos, fps}' data/bimanual/0716_screw_demo_v1/record_teleop_full_172817/meta/info.json
 
-# 查看暂存区目前为止所有 session 累计采集了多少条(跨多次 --dataset-tag)
-jq -s 'map(.total_episodes) | add' ~/lerobot_data/bimanual/*/record_teleop_full_*/meta/info.json
+# 目前为止所有 session 累计采集了多少条(跨多次 --dataset-tag)
+jq -s 'map(.total_episodes) | add' data/bimanual/*/record_teleop_full_*/meta/info.json
 
 # 确认没问题后,可以删掉自动生成的备份目录(可选)
-# rm -rf ~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817_old
+# rm -rf data/bimanual/0716_screw_demo_v1/record_teleop_full_172817_old
 
 
-## 回放(从暂存区回看,确认没问题再决定要不要挪进统一训练目录)
+## 回放(采完直接回看)
 # 真机物理重放:
 mkdir -p /tmp/evo-rlt-bimanual-calibration
 
@@ -57,7 +57,7 @@ cp ~/.cache/huggingface/lerobot/calibration/robots/so_follower/left_follower_arm
 cp ~/.cache/huggingface/lerobot/calibration/robots/so_follower/right_follower_arm.json \
    /tmp/evo-rlt-bimanual-calibration/bimanual_follower_right.json
 
-ls -td ~/lerobot_data/bimanual/*/record_teleop_full_*/
+ls -td data/bimanual/*/record_teleop_full_*/
 
 lerobot-replay \
   --robot.type=bi_so_follower \
@@ -67,27 +67,14 @@ lerobot-replay \
   --robot.right_arm_config.port=/dev/ttyACM2 \
   --robot.left_arm_config.use_degrees=true \
   --robot.right_arm_config.use_degrees=true \
-  --dataset.root=~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817 \
+  --dataset.root=data/bimanual/0716_screw_demo_v1/record_teleop_full_172817 \
   --dataset.repo_id=local/record_teleop_full_172817 \
   --dataset.episode=0
 
 # 只看录像不动机械臂:
-lerobot-dataset-viz --root ~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817 --repo-id local/record_teleop_full_172817 --episode-index 0
+lerobot-dataset-viz --root data/bimanual/0716_screw_demo_v1/record_teleop_full_172817 --repo-id local/record_teleop_full_172817 --episode-index 0
 
-# data里面的回放视频
-lerobot-dataset-viz \
-  --root data/bimanual/0715_screw_demo_v1/record_teleop_full_163740 \
-  --repo-id local/record_teleop_full_163740 \
-  --episode-index 0
-## 确认这次采集没问题后,手动挪进统一训练目录(不会自动执行,自己看着跑)
-ls -td ~/lerobot_data/bimanual/*/record_teleop_full_*/
-mkdir -p data/bimanual/0716_screw_demo_v1
-cp -r ~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817 data/bimanual/0716_screw_demo_v1/
-
-# 确认统一训练目录里数据没问题后,可以清掉暂存区对应这次的记录(可选,自己决定)
-rm -rf ~/lerobot_data/bimanual/0716_screw_demo_v1/record_teleop_full_172817
-
-## 以下训练数据全部指向统一训练目录 data/bimanual,不是暂存区
+## 以下训练数据全部指向 data/bimanual
 ls -td data/bimanual/*/record_teleop_full_*/
 
 # 合并 data/bimanual 下现在有的全部12个session数据集

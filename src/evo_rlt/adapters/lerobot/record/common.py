@@ -11,7 +11,16 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 DEFAULT_SETUP_PATH = Path.home() / ".roboclaw/workspace/embodied/manifest.json"
-DEFAULT_DATASET_ROOT = Path.home() / ".roboclaw/workspace/embodied/datasets"
+
+#: manifest 里的相对路径按仓库根解析,而不是按 cwd —— 这样 manifest 可以写
+#: ``configs/calibration/...`` 或 ``data/bimanual`` 而不用写死 /home/xxx,
+#: 换台机器也能用。
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+
+#: 采集直接落到仓库内的训练目录。以前先写 ~/lerobot_data 暂存区、确认没问题再
+#: 手动 ``cp -r`` 进 data/ 并 ``rm -rf`` 暂存区 —— 那一步只是把几十 G 视频搬来
+#: 搬去,数据本身一个字节都不变。``data/`` 在 .gitignore 里,不会进 git。
+DEFAULT_DATASET_ROOT = _REPO_ROOT / "data" / "bimanual"
 
 
 def load_setup_json(path: str | None = None) -> dict[str, Any]:
@@ -20,11 +29,14 @@ def load_setup_json(path: str | None = None) -> dict[str, Any]:
         return json.load(fh)
 
 
+def _resolve_repo_path(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    return path if path.is_absolute() else (_REPO_ROOT / path)
+
+
 def resolve_dataset_root(setup: dict[str, Any]) -> Path:
     dataset_root = setup.get("datasets", {}).get("root", "")
-    if not dataset_root:
-        return DEFAULT_DATASET_ROOT
-    return Path(dataset_root).expanduser()
+    return _resolve_repo_path(dataset_root) if dataset_root else DEFAULT_DATASET_ROOT
 
 
 def get_sorted_followers(setup: dict[str, Any]) -> list[dict[str, Any]]:
@@ -107,6 +119,113 @@ def install_safe_follower_torque_enable(robot: Any) -> None:
 
         bus.enable_torque = safe_enable_torque
         bus._evo_rlt_safe_torque_enable = True
+
+
+#: 冻结/解冻一条臂的按键。单人采双臂数据时,一只手当夹具、另一只手操作。
+ARM_FREEZE_KEY = "p"
+
+#: 解冻时从"冻结位姿"过渡回"主臂当前位姿"的时间(秒)。
+#: **不能为 0**:冻结期间操作者的手一直在动,解冻那一刻两者可能差几十度,
+#: 直接切过去从臂会猛窜一下 —— 既危险,也会在数据里留下一个非物理的跳变。
+ARM_UNFREEZE_BLEND_S = 0.6
+
+
+class ArmFreeze:
+    """把一条臂钉在按下按键那一刻的位姿上,另一条臂照常跟随主臂。
+
+    为什么要它:双臂任务单人采数据时,一只手不够用。冻结一条臂当夹具(比如
+    举着螺套),就能腾出手专心操作另一条。
+
+    **对数据的影响**:动作流仍是完整的 12 维,冻结那条臂的值是常数 —— 这是
+    合法的动作序列,策略会学到"这条臂稳住不动"。但要清楚代价:这样采的数据里
+    **不存在"两臂同时微调"的样本**,需要真正双臂协同的动作学不出来。
+    顺序式任务(一只手固定、另一只手对准)则完全合适。
+
+    RLT 那边本来就只对左臂做 RL(``rl_action_arms=left``,右臂掩到冻结的 VLA
+    参考),所以冻结右臂和现有架构是一致的。
+
+    三个状态:跟随 / 冻结 / 解冻过渡。过渡这一段不能省 —— 冻结期间操作者的手
+    一直在动,解冻那一刻主臂可能已经和从臂差几十度,直接交回去从臂会猛窜一下。
+    """
+
+    FOLLOW, FROZEN, BLENDING = "follow", "frozen", "blending"
+
+    def __init__(self, side: str = "right", blend_s: float = ARM_UNFREEZE_BLEND_S,
+                 fps: float = 30.0, leader_lock: Any | None = None) -> None:
+        #: `sim.feedback.LeaderLock`。给了就在冻结时把对应的**主臂**也锁住,
+        #: 这样操作者的手带不走它,解冻时两者本来就一致,平滑过渡只是兜底。
+        #: 不给也能用,只是解冻要靠过渡把差值滑掉。
+        self.leader_lock = leader_lock
+        self.side = side
+        self.prefix = f"{side}_"
+        self._blend_steps = max(1, int(round(blend_s * fps)))
+        self._state = self.FOLLOW
+        self._held: dict[str, float] = {}
+        self._blend_left = 0
+        #: 统计,跑完打印。全 0 说明这个功能没被用上,和"用了但没效果"要分得开。
+        self.frozen_frames = 0
+        self.toggles = 0
+        #: 上次加锁时各舵机读回的力矩上限,排查"主臂锁不住"用。
+        self._lock_readback: dict[str, int] = {}
+
+    @property
+    def frozen(self) -> bool:
+        return self._state == self.FROZEN
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def toggle(self, action: dict[str, Any]) -> str:
+        """按键时调用,返回切换后的状态。过渡途中再按会重新冻结在当前位姿。"""
+        self.toggles += 1
+        if self._state == self.FROZEN:
+            self._state = self.BLENDING
+            self._blend_left = self._blend_steps
+            if self.leader_lock is not None:
+                self.leader_lock.unlock()
+        else:
+            self._held = {k: float(v) for k, v in action.items()
+                          if k.startswith(self.prefix)}
+            self._state = self.FROZEN
+            self._blend_left = 0
+            if self.leader_lock is not None:
+                # 锁在**读到这条指令的位姿**上,和 _held 是同一时刻,两者不会错开
+                self._lock_readback = self.leader_lock.lock()
+        return self._state
+
+    def apply(self, action: dict[str, Any]) -> dict[str, Any]:
+        """每帧调用,返回实际要下发的动作。跟随状态下原样返回,不复制。"""
+        if self._state == self.FOLLOW:
+            return action
+        out = dict(action)
+        if self._state == self.FROZEN:
+            for key, value in self._held.items():
+                if key in out:
+                    out[key] = value
+            self.frozen_frames += 1
+            return out
+        # BLENDING:从冻结位姿线性滑回主臂位姿
+        alpha = 1.0 - self._blend_left / self._blend_steps
+        for key, value in self._held.items():
+            if key in out:
+                out[key] = value + (float(action[key]) - value) * alpha
+        self._blend_left -= 1
+        if self._blend_left <= 0:
+            self._state = self.FOLLOW
+            self._held = {}
+        return out
+
+    def release(self) -> None:
+        """退出时调用:确保主臂不会带着力矩留在原地。"""
+        if self.leader_lock is not None:
+            self.leader_lock.unlock()
+
+    def summary(self) -> str:
+        if not self.toggles:
+            return f"  {self.side} 臂冻结: 没用过"
+        return (f"  {self.side} 臂冻结: 切换 {self.toggles} 次, "
+                f"冻结 {self.frozen_frames} 帧")
 
 
 @dataclass(frozen=True)
@@ -280,16 +399,6 @@ def remove_existing_dataset(dataset_root: Path) -> None:
         shutil.rmtree(dataset_root)
 
 
-#: manifest 里的相对路径按仓库根解析,而不是按 cwd —— 这样 manifest 可以写
-#: ``configs/calibration/...`` 而不用写死 /home/xxx,换台机器也能用。
-_REPO_ROOT = Path(__file__).resolve().parents[5]
-
-
-def _resolve_calibration_path(raw: str) -> Path:
-    path = Path(raw).expanduser()
-    return path if path.is_absolute() else (_REPO_ROOT / path)
-
-
 def stage_arm_calibration(arm: dict[str, Any], dst: Path) -> None:
     """把 manifest 指定的标定文件拷到 LeRobot 认的位置和文件名。
 
@@ -300,10 +409,10 @@ def stage_arm_calibration(arm: dict[str, Any], dst: Path) -> None:
     """
     calibration_file = arm.get("calibration_file")
     if calibration_file:
-        src = _resolve_calibration_path(calibration_file)
+        src = _resolve_repo_path(calibration_file)
     else:
         serial = Path(arm["calibration_dir"]).name
-        src = _resolve_calibration_path(arm["calibration_dir"]) / f"{serial}.json"
+        src = _resolve_repo_path(arm["calibration_dir"]) / f"{serial}.json"
     if src.exists():
         shutil.copy2(src, dst)
         log.info("Calibration staged: %s -> %s", src, dst)

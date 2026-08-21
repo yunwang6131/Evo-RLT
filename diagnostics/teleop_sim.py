@@ -45,6 +45,8 @@ import numpy as np  # noqa: E402
 # leader driving the simulator is set up exactly like a leader driving a
 # recording session.
 from evo_rlt.adapters.lerobot.record.common import (  # noqa: E402
+    ARM_FREEZE_KEY,
+    ArmFreeze,
     install_safe_follower_torque_enable,
 )
 from evo_rlt.sim.arms import (  # noqa: E402
@@ -54,7 +56,7 @@ from evo_rlt.sim.arms import (  # noqa: E402
     resolve_all,
 )
 from evo_rlt.sim.calib import MOTOR_NAMES  # noqa: E402
-from evo_rlt.sim.feedback import FeedbackGains, LeaderForceFeedback  # noqa: E402
+from evo_rlt.sim.feedback import FeedbackGains, LeaderForceFeedback, LeaderLock  # noqa: E402
 from evo_rlt.sim.protocol import ARM_SIDES, DEFAULT_ENDPOINT  # noqa: E402
 from evo_rlt.sim.sim_robot import make_sim_robot  # noqa: E402
 
@@ -395,6 +397,14 @@ def run(args) -> int:
 
     # 力反馈在 ramp **之后**才通电。ramp 期间从臂离主臂还很远,这时候把从臂的
     # 位置写给主臂,主臂会朝那个远处的位姿猛拽操作者的手。
+    # 冻结右臂:双臂任务单人采数据时,一只手当夹具腾出另一只手。
+    # 只做右臂 —— 左臂是主操作臂,而且 RLT 的 rl_action_arms=left 也只管左臂。
+    # 冻结时把**右主臂**也锁住(通电顶住),否则操作者的手会在冻结期间把主臂
+    # 带到别处,解冻那一刻两者差几十度。锁住之后解冻是无缝的。
+    freeze = ArmFreeze("right", fps=args.fps,
+                       leader_lock=(None if args.no_arm_lock
+                                    else LeaderLock(teleop.right, args.lock_torque or 80.0)))
+
     feedback: LeaderForceFeedback | None = None
     if args.force_feedback:
         feedback = LeaderForceFeedback(teleop, FeedbackGains(
@@ -430,7 +440,8 @@ def run(args) -> int:
             print("改在仿真进程开窗口: mj_server.py --show-cameras\n")
     keyboard = KeyWatcher().open()
     if keyboard.enabled:
-        print(f"按 {RESET_KEY} 复位全部零件。Ctrl-C 停止。\n")
+        print(f"按 {RESET_KEY} 复位全部零件,按 {ARM_FREEZE_KEY} 冻结/解冻右臂(绿)。"
+              f"Ctrl-C 停止。\n")
     else:
         print("(stdin 不是终端,按键已关闭;复位改用 diagnostics/reset_objects.py)")
         print("Ctrl-C 停止。\n")
@@ -439,13 +450,25 @@ def run(args) -> int:
         while time.perf_counter() - started < args.duration:
             loop_start = time.perf_counter()
 
-            if any(ch.lower() == RESET_KEY for ch in keyboard.pressed()):
+            keys = [ch.lower() for ch in keyboard.pressed()]
+            if RESET_KEY in keys:
                 # 只动零件,手臂不受影响 —— 遥操的手感不会断
                 done = robot.reset_objects()
                 print(f"\n  [{ticks}] 已复位 {' '.join(done)}")
 
             action = teleop.get_action()
             action = {k: v for k, v in action.items() if k in commanded}
+            if ARM_FREEZE_KEY in keys:
+                state = freeze.toggle(action)
+                label = {"frozen": "已冻结", "blending": "解冻中(平滑交回)"}[state]
+                extra = ""
+                if state == "frozen" and freeze._lock_readback:
+                    vals = sorted(set(freeze._lock_readback.values()))
+                    extra = f"  主臂力矩上限读回 {vals}"
+                print(f"\n  [{ticks}] 右臂{label}{extra}")
+            # 冻结要在钳位**之前**:钳位是按 follower 行程做的,而冻结值本身就是
+            # 钳过的,再钳一次无害;反过来先钳后冻则会把过渡段的插值算错。
+            action = freeze.apply(action)
             # Clip before anything is sent, and record the clipped values, so
             # commanded and measured stay comparable at the limits.
             action = clip_action(action, bounds, clip_hits)
@@ -504,11 +527,13 @@ def run(args) -> int:
         keyboard.close()
         # 断力矩排在 disconnect **之前**:总线关掉之后就写不进寄存器了,
         # 主臂会带着力矩留在原地,手一推就顶。
+        freeze.release()
         if feedback is not None:
             feedback.release()
             print("  力反馈已关闭,主臂恢复自由拖动。")
             for line in feedback.summary():
                 print(line)
+        print(freeze.summary())
         if args.show:
             try:
                 import cv2
@@ -641,6 +666,12 @@ def main() -> int:
                         help="(已废弃)改用 mj_server.py --show-cameras")
     parser.add_argument("--save", type=Path, default=None,
                         help="把逐步原始数据存成 JSON,便于事后复查或让人代为分析")
+    parser.add_argument("--lock-torque", type=float, default=None,
+                        help="按 p 锁住右主臂时的力矩上限(占满量程%%)。"
+                             "默认 80。塌下去就调高,拧不动就调低")
+    parser.add_argument("--no-arm-lock", action="store_true",
+                        help="按 p 冻结右臂时,不锁住右主臂。默认会锁(通电顶住),"
+                             "免得解冻时主从差太多")
     parser.add_argument("--force-feedback", action="store_true",
                         help="从臂被挡住时让主臂给手阻力。**主臂会通电主动出力**,"
                              "默认关闭,开之前先看 sim/feedback.py 的说明")

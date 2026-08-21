@@ -308,3 +308,78 @@ class LeaderForceFeedback:
             hits = self.engaged_steps.get(name, 0)
             lines.append(f"  {name:<26}{hits:>9}{self.max_error[name]:>10.1f}")
         return lines
+
+#: 锁住主臂时的力矩上限,占满量程百分比。
+#:
+#: 30% 试过,**顶不住自重,主臂会塌下去**。主臂的舵机比从臂弱得多:按 Feetech
+#: 的标称,Leader 的 shoulder_lift 是 C001(额定 0.490 / 堵转 1.912 N·m)、
+#: wrist 三轴是 C046(0.471 / 1.412),而且 Leader 按 SO-101 设计跑 **5V**,
+#: 实际出力还低于这些标称值。30% 之后只剩零点几 N·m,举不动自己。
+#:
+#: 现在取 80%。锁住时目标就是当前位姿,不会有运动,所以不像"跟随"那样有窜出去
+#: 的风险;但**长时间保持高力矩会发热**,STS3215 堵转电流很大。冻结几十秒没事,
+#: 挂几分钟不动要留意。人仍然能拧过去,只是要用点力。
+LOCK_TORQUE_PERCENT = 80.0
+
+
+class LeaderLock:
+    """把一条主臂钉在当前位姿,让操作者推不动它。
+
+    配合 `record.common.ArmFreeze` 用:从臂冻结时,对应的主臂也锁住。不锁的话
+    操作者的手会在冻结期间把主臂带到别处,解冻那一刻两者差几十度 —— 从臂要么
+    猛窜过去,要么(靠 ArmFreeze 的平滑过渡)慢慢滑过去,两种都不是操作者想要的。
+    锁住之后两者始终一致,解冻就是无缝的。
+
+    人仍然能拧过去(力矩上限只有 30%),所以 ArmFreeze 的平滑过渡要留着兜底。
+
+    **安全**:主臂会通电。``unlock()`` 必须在任何退出路径上跑到 —— 用 ``with``,
+    或者把它放进 finally。
+    """
+
+    def __init__(self, dev, torque_percent: float = LOCK_TORQUE_PERCENT) -> None:
+        self.bus = getattr(dev, "bus", dev)
+        if not 0.0 < torque_percent <= 100.0:
+            raise ValueError(f"torque_percent 应在 (0, 100],给的是 {torque_percent}")
+        self.torque_percent = torque_percent
+        self.locked = False
+
+    def lock(self) -> dict[str, int]:
+        """钉在当前位姿。已经锁着就不重复写总线。
+
+        返回各舵机**读回**的力矩上限。读回是刻意的:"写了但没生效"和"写了、
+        生效了、可就是不够顶住自重"在现象上都是"主臂塌下去",光看代码分不出来。
+        """
+        if self.locked:
+            return {}
+        limit = int(round(self.torque_percent / 100.0 * TORQUE_LIMIT_FULL))
+        readback: dict[str, int] = {}
+        for motor in self.bus.motors:
+            self.bus.write("Torque_Limit", motor, limit, normalize=False)
+            try:
+                readback[motor] = int(self.bus.read("Torque_Limit", motor, normalize=False))
+            except Exception:  # pragma: no cover - 读不回来不该挡住加锁
+                readback[motor] = -1
+        # 先把目标设成当前位置再通电,否则舵机会朝上次断电前的旧目标弹一下
+        self.bus.sync_write("Goal_Position", self.bus.sync_read("Present_Position"))
+        self.bus.enable_torque()
+        self.locked = True
+        bad = {m: v for m, v in readback.items() if v != limit}
+        if bad:
+            print(f"[lock] ** 力矩上限没写进去 ** 想写 {limit},读回 {bad}", flush=True)
+        return readback
+
+    def unlock(self) -> None:
+        """断电,恢复自由拖动。异常路径上也必须跑到。"""
+        if not self.locked:
+            return
+        try:
+            self.bus.disable_torque()
+        except Exception:  # pragma: no cover - 拔线/断电时尽力而为
+            pass
+        self.locked = False
+
+    def __enter__(self) -> "LeaderLock":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.unlock()

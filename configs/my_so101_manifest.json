@@ -1,8 +1,5 @@
 {
   "robot_id": "my_bimanual_so101",
-  "datasets": {
-    "root": "~/lerobot_data/bimanual"
-  },
   "arms": [
     {
       "alias": "left_follower",
@@ -68,6 +65,8 @@
     "序号按插入顺序分配,重启或换插口就变。曾经这里写死过 ttyACM 号,而且左右",
     "主臂是反的(manifest 说 left=ttyACM1,实际 ttyACM1 是右主臂 5AAF220248)——",
     "结果是走录制管线时把右臂的标定套在左臂上,而且不报错。序列号见 arms.json,",
-    "换了转接板跑 diagnostics/probe_arms.py --identify。"
+    "换了转接板跑 diagnostics/probe_arms.py --identify。",
+    "采集数据直接落到仓库内的 data/bimanual/<MMDD_tag>/<prefix_HHMMSS>(见 record/common.py",
+    "的 DEFAULT_DATASET_ROOT)。想换盘再加回 \"datasets\": {\"root\": \"...\"},相对路径按仓库根解析。"
   ]
 }

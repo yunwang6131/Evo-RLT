@@ -264,6 +264,8 @@ def record_loop(
     rl_phase_key_toggles_critical_phase: bool = False,
     start_in_teleop: bool = False,
     intervention_action_blend_time_s: float = 0.0,
+    #: `common.ArmFreeze`。给 None 就没有冻结功能,双臂照常跟随。
+    arm_freeze: Any | None = None,
 ):
     if intervention_action_blend_time_s < 0:
         raise ValueError("intervention_action_blend_time_s must be >= 0")
@@ -922,6 +924,18 @@ def record_loop(
                 "The robot won't be at its rest position at the start of the next episode."
             )
             continue
+
+        # 冻结右臂:单人采双臂数据时,一只手当夹具腾出另一只手(按 p 切换)。
+        # 放在这里 —— 已经过完 teleop_action_processor、还没进 dataset,所以
+        # 冻结值会**如实录进数据集**,策略学到的就是"这条臂稳住不动"。
+        # 放在更早会被处理器改写,放在更晚则录的是主臂的值而机器人执行的是
+        # 冻结值,两者对不上,那种数据训出来必然错位。
+        if arm_freeze is not None and act_processed_teleop is not None:
+            if events.get("toggle_arm_freeze"):
+                events["toggle_arm_freeze"] = False
+                state = arm_freeze.toggle(act_processed_teleop)
+                logging.info("right arm freeze -> %s", state)
+            act_processed_teleop = arm_freeze.apply(act_processed_teleop)
 
         if act_processed_teleop is not None:
             last_teleop_action = act_processed_teleop

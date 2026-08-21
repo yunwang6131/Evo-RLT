@@ -99,6 +99,7 @@ from lerobot.robots import (  # noqa: F401
     unitree_g1 as unitree_g1_robot,
 )
 from evo_rlt.adapters.lerobot.record.common import (
+    ArmFreeze,
     install_safe_follower_torque_enable,
     load_dataset_stats_from_pretrained,
 )
@@ -457,6 +458,11 @@ class RecordConfig:
     # per-frame, not per-arm), so it still lands in the replay buffer's
     # "intervention" bucket rather than "autonomous success/failure".
     right_intervention_key: str = "o"
+    # 冻结/解冻右臂(绿)。单人采双臂数据:一只手当夹具举着零件,腾出另一只手
+    # 专心操作。冻结值会如实录进数据集,策略学到"这条臂稳住不动"。
+    # 代价见 common.ArmFreeze:这样采的数据里没有"两臂同时微调"的样本。
+    # 空字符串关闭。
+    arm_freeze_key: str = "p"
     # Pure-teleop mode: r key starts an episode (entering critical phase),
     # second r press ends the episode and marks it success; u marks it as
     # failure. No VLA,
@@ -555,6 +561,13 @@ class RecordConfig:
             raise ValueError("`right_intervention_key` must be a single character.")
         if self.right_intervention_key.lower() == self.intervention_toggle_key.lower():
             raise ValueError("`right_intervention_key` must differ from `intervention_toggle_key`.")
+        if self.arm_freeze_key and self.rlt.enable and (
+            self.arm_freeze_key.lower() == self.rlt.critical_phase_toggle_key.lower()
+        ):
+            raise ValueError(
+                f"`arm_freeze_key`({self.arm_freeze_key}) 和 "
+                f"`rlt.critical_phase_toggle_key` 撞了,开着 RLT 时一按会同时触发两件事。"
+            )
         if self.right_intervention_key.lower() == self.left_intervention_key.lower():
             raise ValueError("`right_intervention_key` must differ from `left_intervention_key`.")
 
@@ -1061,6 +1074,21 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         # unbind s/f so the user cannot accidentally end an episode out of
         # the r/u outcome state machine.
         bind_ep_outcome_keys = cfg.enable_episode_outcome_labeling and not teleop_r_key_mode
+        # 冻结右臂:单人采双臂数据。见 common.ArmFreeze 的说明和代价。
+        # 同时锁住右**主臂**(通电顶住),否则操作者的手会在冻结期间把主臂带走,
+        # 解冻那一刻主从差几十度。teleop 是 BiSOLeader 时才有 right_arm 可锁。
+        arm_freeze = None
+        if cfg.arm_freeze_key:
+            right_leader = getattr(teleop, "right_arm", None)
+            lock = None
+            if right_leader is not None and getattr(right_leader, "bus", None) is not None:
+                from evo_rlt.sim.feedback import LeaderLock
+
+                lock = LeaderLock(right_leader)
+            else:
+                logging.info("teleop 没有可锁的右主臂,冻结时只冻从臂(解冻靠平滑过渡)")
+            arm_freeze = ArmFreeze("right", fps=cfg.dataset.fps, leader_lock=lock)
+
         listener, events = init_keyboard_listener(
             intervention_toggle_key=cfg.intervention_toggle_key if policy is not None else None,
             left_intervention_key=cfg.left_intervention_key if rlt_hil_mode else None,
@@ -1070,6 +1098,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             episode_failure_key=cfg.episode_failure_key if bind_ep_outcome_keys else None,
             cp_success_key="s" if cfg.enable_critical_phase_labeling and not rlt_active else None,
             cp_failure_key="f" if cfg.enable_critical_phase_labeling and not rlt_active else None,
+            arm_freeze_key=cfg.arm_freeze_key or None,
             rl_phase_key=rl_phase_key_binding,
             rl_phase_failure_key=rl_phase_failure_key_binding,
             end_success_key=cfg.rlt.end_success_key if rlt_active else None,
@@ -1181,6 +1210,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 rl_phase_key_toggles_critical_phase=cfg.rlt.rl_phase_key_toggles_critical_phase,
                 start_in_teleop=cfg.rlt.start_in_teleop,
                 intervention_action_blend_time_s=cfg.rlt.intervention_action_blend_time_s,
+                arm_freeze=arm_freeze,
                 rlt_online_collector=online_collector,
             )
 
@@ -1309,6 +1339,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 acp_inference=cfg.acp_inference,
                 communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                 communication_retry_interval_s=cfg.communication_retry_interval_s,
+                # 复位窗口里也要保持冻结状态。不传的话右臂会突然脱离冻结跟着
+                # 主臂窜过去 —— 而操作者此刻正拿它举着零件。
+                arm_freeze=arm_freeze,
             )
 
         def _discard_rerecord_episode() -> bool:
@@ -1463,6 +1496,16 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 recorded_episodes = _finish_recorded_episode(recorded_episodes, episode_success)
                 _save_online_rl_latest_state(recorded_episodes)
     finally:
+        # 主臂断电排在最前:后面任何一步抛异常,都不能把通着电的主臂留在
+        # 操作者手里。arm_freeze 可能还没建出来(早期就异常了),所以用 locals。
+        _freeze = locals().get("arm_freeze")
+        if _freeze is not None:
+            try:
+                _freeze.release()
+                logging.info("%s", _freeze.summary())
+            except Exception:
+                logging.exception("释放主臂锁失败")
+
         def _save_critical_phase_intervals() -> None:
             if critical_phase_tracker is None or len(critical_phase_tracker) == 0:
                 return

@@ -122,13 +122,13 @@ This repository only differs at the recording/deployment configuration layer:
 - Arm entries point to per-device `calibration_dir` folders. The wrapper looks for `<calibration_dir>/<folder-name>.json`, then stages those files into temporary LeRobot-compatible names at runtime.
 - Follower calibrations are staged as `bimanual_left.json` and `bimanual_right.json` under a temporary robot calibration directory.
 - Leader calibrations are staged as `bimanual_leader_left.json` and `bimanual_leader_right.json` under a temporary teleop calibration directory.
-- Dataset paths are created under `<datasets.root>/<MMDD>_<dataset-tag>/<prefix>_<HHMMSS>`. If `datasets.root` is omitted, the default is `~/.roboclaw/workspace/embodied/datasets`.
+- Recordings are written straight into the repo at `data/bimanual/<MMDD>_<dataset-tag>/<prefix>_<HHMMSS>` (`data/` is gitignored) — there is no staging directory to copy out of afterwards. Set `datasets.root` in the manifest to write somewhere else; relative paths resolve against the repo root.
 
 Example setup manifest:
 
 ```json
 {
-  "datasets": {"root": "/path/to/lerobot_datasets"},
+  "datasets": {"root": "data/bimanual"},
   "arms": [
     {
       "alias": "left_follower",

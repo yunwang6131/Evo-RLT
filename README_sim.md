@@ -92,11 +92,18 @@ ls -l ~/.cache/evo_rlt/sim_assets/scene.xml   # 比服务器启动时间新 = �
 
 # 终端 2：和真机录制同一个入口，只多一个 --sim
 ~/anaconda3/envs/evo-rlt/bin/python -m evo_rlt.adapters.lerobot.record full \
-    --initial-source teleop --sim --setup-json configs/my_so101_manifest.json
+    --initial-source teleop --sim --setup-json configs/my_so101_manifest.json \
+    --num-episodes 25 \
+    --episode-time-s 300 \
+    --reset-time-s 5 \
+    --discard-unlabeled-episodes
 ```
 
 `--sim` 不带值时用 `tcp://127.0.0.1:5555`。`collect` / `segment` / `full` / `live`
 四个子命令都支持。加 `--dry-run` 只打印将要执行的命令，不动硬件。
+
+数据直接落在 `data/bimanual/<MMDD>_<dataset-tag>/<prefix>_<HHMMSS>`（`data/` 在
+`.gitignore` 里），采完就在训练目录里，不用再从暂存区往回拷。
 
 仿真模式下不解析 follower 串口、不做舵机预检、不 stage follower 标定 ——
 `SimRobot` 直接读 `configs/calibration/robots/`。leader 仍然是真机。
