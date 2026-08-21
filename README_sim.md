@@ -88,25 +88,38 @@ ls -l ~/.cache/evo_rlt/sim_assets/scene.xml   # 比服务器启动时间新 = �
 
 ```bash
 # 终端 1
-~/anaconda3/envs/rlt_sim/bin/python src/evo_rlt/sim/mj_server.py --viewer
+~/anaconda3/envs/rlt_sim/bin/python src/evo_rlt/sim/mj_server.py --viewer --show-cameras
 
 # 终端 2：和真机录制同一个入口，只多一个 --sim
 ~/anaconda3/envs/evo-rlt/bin/python -m evo_rlt.adapters.lerobot.record full \
     --initial-source teleop --sim --setup-json configs/my_so101_manifest.json \
-    --num-episodes 25 \
+    --task "Pick up the hexagonal part with the right arm, pull the pin out of the platform with the left arm, align the pin with the hole in the hexagonal part, and insert the pin into the hole." \
+    --num-episodes 50 \
     --episode-time-s 300 \
-    --reset-time-s 5 \
+    --reset-time-s 3 \
     --discard-unlabeled-episodes
 ```
+# 回放数据仿真
 
-`--sim` 不带值时用 `tcp://127.0.0.1:5555`。`collect` / `segment` / `full` / `live`
-四个子命令都支持。加 `--dry-run` 只打印将要执行的命令，不动硬件。
+# 终端 1：仿真器
+~/anaconda3/envs/rlt_sim/bin/python src/evo_rlt/sim/mj_server.py --viewer
 
-数据直接落在 `data/bimanual/<MMDD>_<dataset-tag>/<prefix>_<HHMMSS>`（`data/` 在
-`.gitignore` 里），采完就在训练目录里，不用再从暂存区往回拷。
+# 终端 2
+~/anaconda3/envs/evo-rlt/bin/python -c "
+from evo_rlt.adapters.lerobot.registry import register; register()
+from lerobot.scripts.lerobot_replay import replay
+replay()
+" --robot.type=sim_bi_so_follower \
+  --dataset.root=data/bimanual/0821_teleop_full/record_teleop_full_153426 \
+  --dataset.repo_id=local/record_teleop_full_153426 \
+  --dataset.episode=0
+# 回放数据视频
+PATH="$HOME/anaconda3/envs/evo-rlt/bin:$PATH" \
+~/anaconda3/envs/evo-rlt/bin/lerobot-dataset-viz \
+  --root data/bimanual/0821_teleop_full/record_teleop_full_153426 \
+  --repo-id local/record_teleop_full_153426 \
+  --episode-index 0
 
-仿真模式下不解析 follower 串口、不做舵机预检、不 stage follower 标定 ——
-`SimRobot` 直接读 `configs/calibration/robots/`。leader 仍然是真机。
 
 **复位时螺套会在圆形凹槽里随机摆放**（位置 + 朝向），这是 VLA 数据的初始位姿
 多样性来源；不随机的话策略学到的是「走到那个固定位置」而不是「找到零件」。
@@ -240,4 +253,3 @@ configs/calibration/                   项目快照，仿真读这里
 - 撞桌检测：遥操时提示 + 数据里打 flag
 
 交接说明见 `docs/SIM_HANDOFF.md`。
-还有一个我希望仿真中的关节角度能够影响到真机，意思就是在从臂是真机的时候，装到了桌子或者夹到了东西，不能够继续移动、闭合的时候，主臂也会感受到阻力。这个有办法实现吗

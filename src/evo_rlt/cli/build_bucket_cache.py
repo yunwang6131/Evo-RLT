@@ -19,6 +19,7 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
+from evo_rlt.adapters.lerobot.record.common import DEFAULT_TASK
 from evo_rlt.cli.common import configure_logging, load_training_config
 
 logger = configure_logging(__name__)
@@ -36,7 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mark-critical", action="store_true")
     parser.add_argument("--token-pool-size", type=int, default=64)
     parser.add_argument("--image-only", action="store_true", help="Drop language tokens before RL token encode.")
-    parser.add_argument("--task-instruction", default="Insert the copper screw into the black sleeve.")
+    # 必须和数据集里存的 task 一致 —— 这个字符串直接进 Pi05VLAAdapter 当 prompt,
+    # cache 里的 ref_chunk 就是用它编码的。采集/推理那边用的是 dataset.single_task
+    # (backend.py 的 `rlt.task_instruction or dataset.single_task`),两边不一致
+    # 会让 residual 目标(human - ref)锚在不同的 ref 上。
+    parser.add_argument("--task-instruction", default=DEFAULT_TASK)
     parser.add_argument("--frame-stride", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])

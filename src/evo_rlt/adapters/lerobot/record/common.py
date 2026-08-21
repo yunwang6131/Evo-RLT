@@ -12,6 +12,21 @@ from typing import Any
 
 DEFAULT_SETUP_PATH = Path.home() / ".roboclaw/workspace/embodied/manifest.json"
 
+#: 采集时写进数据集的任务描述(``--task`` 的默认值)。pi0.5 是语言条件的,这句话
+#: 就是 prompt —— 推理时必须和训练时一致,所以定义在这里一份,四个子命令共用。
+#: **刻意不带颜色词**:螺栓的颜色 0821 从灰改成了饱和蓝(理由见
+#: ``task_scene.json`` 里 ``bolt._color_note`` 那段实测),而 0821 之前采的 37 条
+#: episode 里它还是灰的 —— 不写颜色是唯一同时兼容两批数据的描述。而且螺套还有
+#: 个红色端面嵌片,prompt 里写 red 会指到它身上去。
+#: 描述**到插入为止**:仿真场景里没有目标放置区(``task_scene.json`` 只有
+#: table/socket/bolt),实采的动作序列也是插完两手一松就结束(37 条 episode 的
+#: 末帧夹爪值确认过)。prompt 里多一句没有对应动作的子目标,只会稀释语言条件。
+DEFAULT_TASK = (
+    "Pick up the hexagonal part with the right arm, pull the pin out of the platform "
+    "with the left arm, align the pin with the hole in the hexagonal part, and insert "
+    "the pin into the hole."
+)
+
 #: manifest 里的相对路径按仓库根解析,而不是按 cwd —— 这样 manifest 可以写
 #: ``configs/calibration/...`` 或 ``data/bimanual`` 而不用写死 /home/xxx,
 #: 换台机器也能用。

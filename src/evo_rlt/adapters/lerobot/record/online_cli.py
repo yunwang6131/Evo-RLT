@@ -19,6 +19,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from evo_rlt.adapters.lerobot.record.common import (
+    DEFAULT_TASK,
     build_dataset_argv,
     build_robot_argv,
     build_teleop_argv,
@@ -43,7 +44,6 @@ DEFAULT_DATASET_TAG = "online_rl"
 # pure evaluation. DEFAULT_DATASET_TAG above still names the per-run output
 # folder (via --dataset-tag) and is unaffected.
 DEFAULT_DATASET_NAME_PREFIX = "eval_online_rl"
-DEFAULT_TASK = "Insert the copper screw into the black sleeve."
 
 
 def build_online_train_argv(args: argparse.Namespace, setup, paths, cal_dir: str, teleop_argv: list[str]) -> list[str]:

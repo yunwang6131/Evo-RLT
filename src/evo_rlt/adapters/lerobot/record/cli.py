@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import sys
 
+from evo_rlt.adapters.lerobot.record.common import DEFAULT_TASK
 from evo_rlt.adapters.lerobot.record.runner import run_collect, run_full, run_live, run_segment
 
 
 DEFAULT_COLLECT_DATASET_TAG = "vla_rlt_vla_test"
-DEFAULT_COLLECT_TASK = "Insert the copper screw into the black sleeve."
 
 
 def add_common_record_args(parser: argparse.ArgumentParser) -> None:
@@ -15,7 +15,7 @@ def add_common_record_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--policy-path", default=None)
     parser.add_argument("--vla-path", default=None)
     parser.add_argument("--rl-token-path", default=None)
-    parser.add_argument("--task", default="Insert the copper screw into the black sleeve.")
+    parser.add_argument("--task", default=DEFAULT_TASK)
     parser.add_argument("--num-episodes", type=int, default=1)
     parser.add_argument("--episode-time-s", type=int, default=3000)
     parser.add_argument("--reset-time-s", type=int, default=None)
@@ -67,7 +67,7 @@ def add_default_collect_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--policy-path", required=True)
     parser.add_argument("--vla-path", default=None)
     parser.add_argument("--rl-token-path", default=None)
-    parser.add_argument("--task", default=DEFAULT_COLLECT_TASK)
+    parser.add_argument("--task", default=DEFAULT_TASK)
     parser.add_argument("--num-episodes", type=int, default=5)
     parser.add_argument("--episode-time-s", type=int, default=3000)
     parser.add_argument("--fps", type=int, default=30)
@@ -175,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--rl-token-path", default=None)
     live.add_argument("--phase-mode", default="always_vla")
     live.add_argument("--chunk-exec-steps", type=int, default=25)
-    live.add_argument("--task", default="Insert the copper screw into the black sleeve.")
+    live.add_argument("--task", default=DEFAULT_TASK)
     live.add_argument("--duration", type=float, default=120.0)
     live.add_argument("--fps", type=float, default=30.0)
     live.add_argument("--setup-json", default=None)
