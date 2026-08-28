@@ -76,7 +76,34 @@ DEFAULT_ACTION_DELAY_STEPS = 3
 #: surfaces as an error in the record loop instead of an indefinite hang.
 DEFAULT_TIMEOUT_S = 5.0
 
-PROTOCOL_VERSION = 1
+#: 位姿在线上的编码:``[x, y, z, qw, qx, qy, qz]``,世界系,米 + 单位四元数。
+#: 和 MuJoCo 的 ``qpos`` 里自由关节的排布一致,两边都不必再换序。
+POSE_LEN = 7
+
+#: 各臂末端参考系。取 ``gripper_link`` 而不是钳口中点:它是 URDF 里真实存在的
+#: body,FK/IK 两边指的是同一个东西;抓取点相对它的偏移是任务侧的事,由调用者
+#: 自己带(见 ``evo_rlt.sim.grasp_frame``)。
+EE_BODIES: dict[str, str] = {side: f"{side}_gripper_link" for side in ARM_SIDES}
+
+#: IK 的姿态权重,**按世界坐标轴分开给**(位置权重固定为 1)。
+#:
+#: SO-101 只有 5 个本体关节,够不到任意 6D 位姿。缺的是哪一维不是玄学,是实测
+#: 出来的:对一个纯平移目标解 IK,姿态残差的转轴 z 分量恒为 0.94,大小随平移
+#: 线性增长(0.135 度/毫米)—— **缺的就是绕世界 z 轴的偏航**。
+#:
+#: 于是正确的提法是:位置 3 维 + 工具倾角 2 维 = 5,和自由度数正好相等,是一个
+#: 恰定问题;只把绕 z 的那一维放开。所以 x/y 分量给 1、z 分量给 0.02。
+#:
+#: 早先用的是各向同性的小权重(三个都 0.02),那等于"位置精确、姿态完全不管",
+#: 手腕的倾角会自己漂 —— 而插销任务最后失败的主因正是螺栓和螺套的轴线对不上,
+#: 不是横向偏移。另一个极端(三个都给 1)更糟:求解器会拿位置去换姿态,25mm 的
+#: 平移目标解出来位置就差 25mm。
+DEFAULT_IK_ROTATION_WEIGHT: tuple[float, float, float] = (1.0, 1.0, 0.02)
+DEFAULT_IK_ITERS = 250
+DEFAULT_IK_DAMPING = 1e-5
+
+#: v2 起 observation 带 ``object_poses`` / ``ee_poses``,并新增 FK / IK 两条命令。
+PROTOCOL_VERSION = 2
 
 
 class Command:
@@ -88,7 +115,15 @@ class Command:
     RESET = "reset"
     #: 只把任务零件放回初始位姿,手臂原地不动。采数据/调试时零件被碰歪了要重摆,
     #: 用整体 RESET 会连手臂一起弹回复位姿态,遥操的手感就断了。
+    #:
+    #: 带 ``poses`` 时改为把零件放到指定位姿,跳过随机化 —— 演示增广要能复现
+    #: 一个算好的初始位姿,靠随机种子碰是碰不到的。
     RESET_OBJECTS = "reset_objects"
+    #: 批量正运动学:关节角 -> 夹爪位姿。放在仿真器这边是因为只有它有模型;
+    #: 客户端那个环境里没有 MuJoCo(见模块开头)。
+    FK = "fk"
+    #: 批量逆运动学。同上,而且逐点用上一解做种子,单条轨迹一次往返即可。
+    IK = "ik"
     CLOSE = "close"
 
 

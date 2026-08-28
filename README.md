@@ -55,7 +55,7 @@
 | Getting Started | Training Pipeline | Project Info |
 | -------------------------------------- | -------------------------------------------- | ------------------------------------------- |
 | [⚡ Quick Start](#quick-start) | [🧪 Training Pipeline](#training-pipeline) | [🤗 Model & Dataset](#model-dataset) |
-| [1) Installation](#installation) | [3) Finetune VLA](#finetune-vla) | [🗂️ Repository Layout](#repository-layout) |
+| [1) Installation](#installation) | [3) Finetune VLA](#finetune-vla) | [ACT blue-screw workflow](README_ACT.md) |
 | [2) Hardware Setup](#hardware-setup) | [4) Train RL Token](#train-rl-token) | [✅ Development Checks](#development-checks) |
 | [🤖 Real-Robot Recording and Deployment](#real-robot-recording-and-deployment) | [5) Build Transition Cache](#build-transition-cache) | [🧭 Future TODO](#future-todo) |
 | | [6) Train Chunk Actor-Critic](#train-chunk-actor-critic) | [💬 Community Channels](#community-channels) / [🏫 Affiliations](#affiliations) / [📄 License](#license) |

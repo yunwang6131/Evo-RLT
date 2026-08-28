@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "name": "blue_screw_sim_v1",
+  "source_parent": "data/bimanual/0821_teleop_full",
+  "source_sessions": [
+    "record_teleop_full_162809",
+    "record_teleop_full_164357",
+    "record_teleop_full_164901",
+    "record_teleop_full_171228",
+    "record_teleop_full_173549",
+    "record_teleop_full_175338",
+    "record_teleop_full_182657",
+    "record_teleop_full_185410",
+    "record_teleop_full_185651"
+  ],
+  "merged_root": "data/bimanual/blue_screw_sim_v1",
+  "repo_id": "local/blue_screw_sim_v1",
+  "task": "Pick up the hexagonal part with the right arm, pull the pin out of the platform with the left arm, align the pin with the hole in the hexagonal part, and insert the pin into the hole.",
+  "expected": {
+    "robot_type": "sim_bi_so_follower",
+    "episodes": 122,
+    "frames": 83247,
+    "fps": 30,
+    "state_dim": 12,
+    "action_dim": 12,
+    "image_features": [
+      "observation.images.left_wrist",
+      "observation.images.right_wrist",
+      "observation.images.right_front"
+    ],
+    "image_shape": [
+      480,
+      640,
+      3
+    ],
+    "episode_success": "success"
+  }
+}

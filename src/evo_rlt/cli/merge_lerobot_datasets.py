@@ -35,6 +35,16 @@ def parse_args() -> argparse.Namespace:
         help="Prefix used to generate a unique local repo ID for each input.",
     )
     parser.add_argument(
+        "--include",
+        action="append",
+        default=None,
+        metavar="DIRECTORY",
+        help=(
+            "Merge only this exact child directory. Repeat for multiple sessions. "
+            "Missing or duplicate names are rejected."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Remove the exact output directory first if it already exists.",
@@ -42,12 +52,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def discover_datasets(input_parent: Path) -> list[Path]:
-    roots = sorted(
-        path
-        for path in input_parent.iterdir()
-        if path.is_dir() and (path / "meta" / "info.json").is_file()
-    )
+def discover_datasets(input_parent: Path, includes: list[str] | None = None) -> list[Path]:
+    if includes:
+        if len(includes) != len(set(includes)):
+            raise ValueError("--include contains duplicate directory names")
+        roots = [input_parent / name for name in includes]
+        invalid = [path for path in roots if not (path / "meta" / "info.json").is_file()]
+        if invalid:
+            raise FileNotFoundError(f"Included LeRobot datasets do not exist: {invalid}")
+    else:
+        roots = sorted(
+            path
+            for path in input_parent.iterdir()
+            if path.is_dir() and (path / "meta" / "info.json").is_file()
+        )
     if not roots:
         raise FileNotFoundError(f"No LeRobot datasets found under {input_parent}")
     return roots
@@ -69,7 +87,7 @@ def prepare_output(output_root: Path, input_parent: Path, overwrite: bool) -> No
 
 def main() -> None:
     args = parse_args()
-    roots = discover_datasets(args.input_parent)
+    roots = discover_datasets(args.input_parent, args.include)
     prepare_output(args.output_root, args.input_parent, args.overwrite)
 
     repo_ids = [f"{args.repo_id_prefix}{root.name.removeprefix('record_teleop_full_')}" for root in roots]

@@ -84,6 +84,18 @@ ls -l ~/.cache/evo_rlt/sim_assets/scene.xml   # 比服务器启动时间新 = �
 
 ## 用仿真采 VLA 数据
 
+当前蓝色螺栓数据对应的完整仿真环境已经封存为
+`snapshots/sim/blue_screw_v1`。修改场景前后可核对，误改后可恢复：
+
+```bash
+evo-rlt-sim-snapshot verify
+evo-rlt-sim-snapshot restore
+```
+
+恢复会先把现状备份到 `outputs/sim_snapshot_backups/`，然后只覆盖快照声明的
+仿真文件。恢复后仍需重新 `--build` 并重启 `mj_server.py`。ACT 的数据合并、
+训练和仿真评估命令见 `README_ACT.md`。
+
 主臂是真的，从臂是仿真。先起仿真器，再用 `--sim` 跑录制：
 
 ```bash
@@ -99,6 +111,103 @@ ls -l ~/.cache/evo_rlt/sim_assets/scene.xml   # 比服务器启动时间新 = �
     --reset-time-s 3 \
     --discard-unlabeled-episodes
 ```
+## 自动成功判据
+
+在此之前 `episode_success` 只有人按键一条路,122 条源数据就是这么标的。人标不了
+增广和脚本采集 —— 那些一次产出上千条,没有自动判据就只能全部当成功收下。
+
+判据只看零件真值位姿,不看接触:孔半径 5.20mm、杆半径 4.75mm,单边间隙 0.45mm,
+杆尖一旦越过孔口平面且横向偏移在间隙量级,几何上它就只能在孔里。参数在
+`configs/task_success.json`,几何常量是从场景网格量出来的。
+
+```python
+from evo_rlt.sim import task_success as ts
+config = ts.load_config()
+state = ts.evaluate(robot.object_poses, config)   # 逐帧
+ts.episode_succeeded(states)                       # 整条(要连续 10 帧成立)
+ts.furthest_stage(states)                          # idle/socket_lifted/bolt_pulled/aligned/inserted
+```
+
+**`furthest_stage` 是排错用的,别忽略它。** rollout 全失败时,"完全没学会"和
+"学会了但最后对不准"在成功率上都是 0%,该做的事却完全相反 —— 前者加多少数据
+都没用。分阶段判据是唯一能把这两种分开的东西。
+
+零件位姿现在跟着每一帧观测一起回来(协议 v2):
+
+```python
+robot.object_poses    # {"socket": [x,y,z,qw,qx,qy,qz], "bolt": [...]}
+robot.ee_poses        # 两只夹爪的 gripper_link 位姿
+robot.fk(qpos_batch)  # 批量正运动学
+robot.ik(side, targets, seed)   # 批量逆运动学
+```
+
+**协议版本从 1 涨到 2,旧的仿真器进程必须重启**,否则客户端握手就会拒绝。这是
+故意的:旧仿真器不回 `object_poses`,判据会静默地拿到空字典,那等于"每条都判
+失败",而不是一个能看见的错误。
+
+## 数据不够:用已有演示增广
+
+122 条演示里真正随机的只有一件事 —— 螺套复位时落在凹槽里的位置和朝向。螺栓的
+初始位姿是固定的。所以这 122 条是对一个三维随机量的 122 次采样,可以把每条搬到
+新的螺套位姿上重放:抓取前的末端轨迹整体平移,抓到之后连零件一起平移,插入因此
+发生在工作空间的另一处。最难的对准和插入那一段是逐帧照抄人的,不是脚本编的。
+
+```bash
+# 终端 1:仿真器(必须是重启过的,协议 v2)
+~/anaconda3/envs/rlt_sim/bin/python src/evo_rlt/sim/mj_server.py
+
+# 终端 2
+conda activate evo-rlt
+evo-rlt-sim-augment calibrate                      # 一次性,约 35 分钟
+evo-rlt-sim-augment run --out-root data/bimanual/blue_screw_aug_v1 --per-source 8
+```
+
+### calibrate 在做什么
+
+**源数据里没有记录螺套的初始位姿** —— 采集时零件坐标从没送出过仿真进程。这一步
+先由抓取那一帧的夹爪位姿反推一个估计,再拿重放本身把它验证:摆上去跑一遍,自动
+判据说成功才算数。跑不通的源演示不进标定文件,因为它的几何没被复现出来,拿去
+增广只会批量产出失败。
+
+反推靠的是"螺套在夹爪坐标系里的位置是个常量"(人每次都以同样的姿势去抓六棱柱)。
+这个常量用最小二乘拟合,自检指标是:推出来的螺套位置该像一个半径 25mm 的均匀
+圆盘。实测和理论分位数对得上(q50 16.0 / 17.7mm,86% 落在 25mm 内),说明抓取帧
+找对了。**只让 z 对上的一维拟合会秩亏** —— 那条弯路走过,解出来的螺套落在离凹槽
+106mm 的地方,数值上毫无异常。
+
+### 三个实测出来的关键约束
+
+**1. SO-101 只有 5 个本体关节,够不到任意 6D 位姿,缺的是绕世界 z 轴的偏航。**
+对纯平移目标解 IK,姿态残差的转轴 z 分量恒为 0.94,大小 0.135 度/毫米。所以位移
+只做平移;偏航残差在抓取后**反过来读回夹爪实际到达的位姿**,由它决定螺套摆在哪 ——
+螺套的偏航本来就是均匀随机的,被改掉几度不损失任何东西,而孔轴是它自己的 z 轴,
+绕 z 转多少都不动,插入完全不受影响。
+
+IK 的姿态权重因此按世界坐标轴分开给,默认 `(1, 1, 0.02)`:位置 3 维 + 倾角 2 维
+= 5,和自由度数正好相等。各向同性的小权重会让手腕倾角自己漂(同样平移下倾角
+误差 0.46~2.11 度),分轴之后是 0.00 度。
+
+**2. 钳口会把六角重新坐正,所以摆件误差和抓后位姿不是一一对应的。**
+只改摆件位姿去修对不准,重放成功率只能从 32% 推到 42%。改成平移**抓稳之后的
+右臂轨迹**才是精确的 —— 零件被刚性握着,手走多少它就走多少,横偏能收敛到 0.1mm,
+成功率到 58%。修正量由一次不录的重放量出来,存在标定文件的 `hold_correction`。
+
+**3. 剩下的失败几乎全是轴线夹角,不是横偏。** 典型是"横偏 0.11mm 夹角 19.1°"。
+根因是螺套在钳口里的倾斜和源演示当时那一次不同(成功那条插入瞬间螺套倾 12.6°、
+螺栓倾 12.7°、轴夹角 0.1°;失败那条螺套只倾 1.8° 而螺栓 13.3°)。**下一步就是把
+握持修正从"只平移"扩到"带一个绕水平轴的转动"**,分轴 IK 已经能精确跟随倾角了,
+缺的是测量与施加那一段。
+
+### run 的产出
+
+数据集的列、dtype、shape、names 逐字照抄源数据集的 `meta/info.json`,所以可以
+直接和源数据合并后一起训。每条跑完过一遍自动判据,只有成功的写进去;结尾会报
+保留率和失败都停在哪一级。
+
+`--max-delta` 是单次位移上限(默认 30mm)。越大多样性越好,IK 的偏航残差也越大
+(0.135 度/毫米),而摆件朝向虽然能吸收它,夹爪相对台面的姿态也跟着变,过大会蹭
+到台面。
+
 # 回放数据仿真
 
 # 终端 1：仿真器
@@ -125,6 +234,53 @@ PATH="$HOME/anaconda3/envs/evo-rlt/bin:$PATH" \
 多样性来源；不随机的话策略学到的是「走到那个固定位置」而不是「找到零件」。
 范围在 `configs/task_scene.json` 的 `socket.reset_random` 里，实测约束见那里的
 注释。要复现同一批位姿用 `mj_server.py --random-seed 0`；把 `radius` 设 0 即关闭。
+## ACT训练
+conda activate evo-rlt
+lerobot-train \
+  --dataset.repo_id=local/blue_screw_sim_v1 \
+  --dataset.root=/home/wangyun/Evo-RLT/data/bimanual/blue_screw_sim_v1 \
+  --policy.type=act \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --policy.chunk_size=100 \
+  --policy.n_action_steps=10 \
+  --output_dir=/home/wangyun/Evo-RLT/outputs/act_blue_screw_sim_v1 \
+  --job_name=act_blue_screw_sim_v1 \
+  --batch_size=8 \
+  --steps=60000 \
+  --save_freq=10000 \
+  --log_freq=100 \
+  --num_workers=4 \
+  --wandb.enable=false
+
+## ACT 评测
+cd /home/wangyun/Evo-RLT
+~/anaconda3/envs/rlt_sim/bin/python src/evo_rlt/sim/mj_server.py --viewer 
+
+conda activate evo-rlt
+cd /home/wangyun/Evo-RLT
+evo-rlt-act rollout \
+  --checkpoint outputs/act_blue_screw_sim_v1/checkpoints/060000_ensemble/pretrained_model \
+  --num-episodes 30 \
+  --episode-time-s 150
+
+## smolVLA指令
+
+conda activate evo-rlt
+cd /home/wangyun/Evo-RLT
+HF_HUB_OFFLINE=1 lerobot-train --config_path=configs/smolvla/train_config.json
+
+### 接着已有 checkpoint 继续训
+`--steps` 是从 0 算起的新总步数;`--scheduler.num_decay_steps` 必须一起改,
+否则学习率停在谷底,多训的步数等于白跑。别加 `--policy.path`,那会让 resume 失效、从头开始。
+
+HF_HUB_OFFLINE=1 lerobot-train --config_path=outputs/smolvla_blue_screw_sim_v1/checkpoints/last/pretrained_model/train_config.json --resume=true --steps=60000 --scheduler.num_decay_steps=60000
+
+## smolVLA评测
+conda activate evo-rlt
+evo-rlt-smolvla rollout \
+  --checkpoint outputs/smolvla_blue_screw_sim_v1/checkpoints/050000/pretrained_model \
+  --num-episodes 10
 
 ## 零件复位
 

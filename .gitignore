@@ -12,3 +12,5 @@ pretrained/
 cache/
 wandb/
 data/
+!snapshots/sim/blue_screw_v1/assets/data/
+!snapshots/sim/blue_screw_v1/assets/data/**

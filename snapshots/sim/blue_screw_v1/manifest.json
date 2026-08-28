@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "name": "blue_screw_v1",
+  "description": "Simulation environment used by the 122 blue-bolt demonstrations recorded on 2026-08-21.",
+  "source_commit": "387787a1fa6c82b597b60b7502405dd62c35ae6e",
+  "source_tag": "sim-blue-screw-v1",
+  "tracked_scopes": {
+    "configs/arms.json": "2122907c4e839237ebda8b8d375b8f96a5fd1f81",
+    "configs/calibration": "d1ce66552d8228aa3678f24e20e2b074c069d64c",
+    "configs/cameras.json": "bd6698382136d39d050fc332a4e967d18b6e9a56",
+    "configs/grasp.json": "3c5b27e010f570990edf87c6a09c97a0dd23a864",
+    "configs/home_pose.json": "6a1baf06d2b320cab59bf1bcd06b0228b8a10dbd",
+    "configs/my_so101_manifest.json": "c45a5e143c47d45105c3d0b2f92868ecbf329cbf",
+    "configs/task_scene.json": "01d4e79e9877aaeeda26cadc65725950b1faee9b",
+    "src/evo_rlt/sim": "4d286436846d172b3f547eeeb4e478fbb52556d8",
+    "third_party/SO101": "284741fb2c6fe45b25030febe15ad3bcbde1e441"
+  },
+  "archived_scopes": [
+    {
+      "source": "data/桌子_h119_wide.STL",
+      "archive": "snapshots/sim/blue_screw_v1/assets/data/桌子_h119_wide.STL",
+      "sha256": "748063c0478233a9a6da5e06a1fe6c18fe8324ab6de4df8c5c0cc70677bdd850"
+    },
+    {
+      "source": "data/桌子_h119_wide_hulls",
+      "archive": "snapshots/sim/blue_screw_v1/assets/data/桌子_h119_wide_hulls",
+      "sha256": "5402cf885cb7062336bc089f56228c8dda3afe8e3c71b94ad316159cbc58374a"
+    },
+    {
+      "source": "data/螺套_no_range_wide.STL",
+      "archive": "snapshots/sim/blue_screw_v1/assets/data/螺套_no_range_wide.STL",
+      "sha256": "5b6d9d18d047f9a3d98eb188a65d7ff6d8c84fd515adcd667d64af65c741da51"
+    },
+    {
+      "source": "data/螺套_no_range_wide_hulls",
+      "archive": "snapshots/sim/blue_screw_v1/assets/data/螺套_no_range_wide_hulls",
+      "sha256": "d1767270ea382a49703f83c7c2c753eba6afd154028b822102911e1e40046e52"
+    },
+    {
+      "source": "data/螺套_no_range_白色端面嵌片.STL",
+      "archive": "snapshots/sim/blue_screw_v1/assets/data/螺套_no_range_白色端面嵌片.STL",
+      "sha256": "c76908b2133a301ce5dd2a8b6d6498e665705419548c6abec7d7dabd3b6dcd70"
+    },
+    {
+      "source": "data/螺栓.SLDPRT.STL",
+      "archive": "snapshots/sim/blue_screw_v1/assets/data/螺栓.SLDPRT.STL",
+      "sha256": "f3b3705972d8aacac0e08758fddb5094b8313cadacb28698a60ae37daf064aa3"
+    },
+    {
+      "source": "data/螺栓.SLDPRT_hulls",
+      "archive": "snapshots/sim/blue_screw_v1/assets/data/螺栓.SLDPRT_hulls",
+      "sha256": "013e263f786ef75d363bba2fb269a8383203b37da3c23739a18072c5bd61f98a"
+    }
+  ]
+}

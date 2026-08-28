@@ -1,0 +1,36 @@
+{
+  "dataset": {
+    "repo_id": "local/blue_screw_sim_v1",
+    "root": "data/bimanual/blue_screw_sim_v1"
+  },
+  "rename_map": {
+    "observation.images.right_front": "observation.images.camera1",
+    "observation.images.left_wrist": "observation.images.camera2",
+    "observation.images.right_wrist": "observation.images.camera3"
+  },
+  "policy": {
+    "type": "smolvla",
+    "pretrained_path": "lerobot/smolvla_base",
+    "device": "cuda",
+    "push_to_hub": false,
+    "chunk_size": 50,
+    "n_action_steps": 10,
+    "freeze_vision_encoder": false,
+    "train_expert_only": false,
+    "load_vlm_weights": false,
+    "scheduler_decay_steps": 20000,
+    "num_expert_layers": 0,
+    "prefix_length": 0,
+    "pad_language_to": "max_length"
+  },
+  "output_dir": "outputs/smolvla_blue_screw_sim_v1",
+  "job_name": "smolvla_blue_screw_sim_v1",
+  "batch_size": 4,
+  "steps": 20000,
+  "save_freq": 5000,
+  "log_freq": 100,
+  "num_workers": 2,
+  "wandb": {
+    "enable": false
+  }
+}

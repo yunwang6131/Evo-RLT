@@ -36,6 +36,7 @@ from evo_rlt.sim.calib import ARM_SIDES, MOTOR_NAMES, BimanualCalibration
 from evo_rlt.sim.protocol import (
     CAMERA_KEYS,
     DEFAULT_ENDPOINT,
+    DEFAULT_IK_ROTATION_WEIGHT,
     DEFAULT_IMAGE_HEIGHT,
     DEFAULT_IMAGE_WIDTH,
     DEFAULT_TIMEOUT_S,
@@ -143,6 +144,11 @@ class SimRobot(Robot):
         # Last commanded angles, so a partial action leaves other joints held
         # rather than snapping them to zero.
         self._targets: dict[str, float] = {}
+        # 最近一帧的零件/夹爪真值位姿。缓存而不是按需再问一次:它们和这一帧的
+        # 图像来自同一次 mj_forward,再问一次拿到的是 step 之后的场景,成功判据
+        # 会和它判的那帧图像对不上。
+        self._object_poses: dict[str, list[float]] = {}
+        self._ee_poses: dict[str, list[float]] = {}
 
     # -- feature schema -----------------------------------------------------
 
@@ -285,6 +291,8 @@ class SimRobot(Robot):
     # -- observation / action ----------------------------------------------
 
     def _decode(self, reply: dict, frames: list[bytes]) -> dict:
+        self._object_poses = reply.get("object_poses", {})
+        self._ee_poses = reply.get("ee_poses", {})
         rads = dict(zip(JOINT_ORDER, reply["joint_positions"]))
         observation: dict = self.calibration_bridge.rad_to_observation(rads)
 
@@ -319,13 +327,15 @@ class SimRobot(Robot):
                 self._targets[name] = measured[name]
 
         targets = [self._targets[name] for name in JOINT_ORDER]
-        self._request(
+        reply, _ = self._request(
             {
                 "command": Command.STEP,
                 "joint_targets": targets,
                 "duration_s": 1.0 / self.config.fps,
             }
         )
+        self._object_poses = reply.get("object_poses", self._object_poses)
+        self._ee_poses = reply.get("ee_poses", self._ee_poses)
         return {
             key: value
             for key, value in self.calibration_bridge.rad_to_observation(self._targets).items()
@@ -349,18 +359,79 @@ class SimRobot(Robot):
         self._targets = {}
         return self._decode(reply, frames)
 
-    def reset_objects(self, objects: list[str] | None = None) -> list[str]:
+    def reset_objects(
+        self,
+        objects: list[str] | None = None,
+        poses: dict[str, list[float]] | None = None,
+    ) -> list[str]:
         """只把任务零件放回初始位姿,手臂保持不动。
 
         `reset()` 会把手臂一起弹回复位姿态 —— 遥操到一半这么来一下,手上的
         主臂和仿真里的从臂就对不上了。零件被碰歪时该用这个。
         `self._targets` 也刻意不清:手臂的指令还在生效。
+
+        `poses` 里点名的零件按给定位姿摆放并跳过随机化 —— 演示增广要复现一个
+        算出来的初始位姿。
         """
         payload: dict = {"command": Command.RESET_OBJECTS}
         if objects is not None:
             payload["objects"] = list(objects)
-        reply, _ = self._request(payload)
+        if poses:
+            payload["poses"] = {k: [float(v) for v in pose] for k, pose in poses.items()}
+        reply, frames = self._request(payload)
+        self._object_poses = reply.get("object_poses", self._object_poses)
+        self._ee_poses = reply.get("ee_poses", self._ee_poses)
         return reply.get("objects_reset", [])
+
+    # -- 真值位姿与运动学 ---------------------------------------------------
+
+    @property
+    def object_poses(self) -> dict[str, list[float]]:
+        """最近一帧各任务零件的世界位姿,``{name: [x,y,z,qw,qx,qy,qz]}``。
+
+        仿真独有:真机上没有这个信息。成功判据(`evo_rlt.sim.task_success`)和
+        演示增广都读这里。
+        """
+        return dict(self._object_poses)
+
+    @property
+    def ee_poses(self) -> dict[str, list[float]]:
+        """最近一帧两只夹爪 ``gripper_link`` 的世界位姿。"""
+        return dict(self._ee_poses)
+
+    def fk(self, qpos: list[list[float]]) -> list[dict[str, list[float]]]:
+        """批量正运动学。每项 12 个关节角(弧度,`JOINT_ORDER` 序)。"""
+        reply, _ = self._request({"command": Command.FK, "qpos": [list(q) for q in qpos]})
+        return reply["ee_poses"]
+
+    def ik(
+        self,
+        side: str,
+        targets: list[list[float]],
+        seed: list[float],
+        rotation_weight: float | tuple[float, float, float] = DEFAULT_IK_ROTATION_WEIGHT,
+    ) -> dict[str, list]:
+        """批量逆运动学,一次解一整条轨迹。
+
+        回 ``{"qpos": [[5 个本体关节角], ...], "pos_err": [...], "rot_err": [...],
+        "qpos_adr": [...]}``。**姿态误差不是失败**:SO-101 只有 5 个自由度,
+        默认权重(世界系 x/y 给 1、z 给 0.02)下解出来的是"位置和倾角都精确、
+        只有绕竖直轴的偏航有残差",残差由调用者处置。
+        """
+        reply, _ = self._request(
+            {
+                "command": Command.IK,
+                "side": side,
+                "targets": [list(t) for t in targets],
+                "seed": list(seed),
+                "rotation_weight": (
+                    float(rotation_weight)
+                    if np.isscalar(rotation_weight)
+                    else [float(v) for v in rotation_weight]
+                ),
+            }
+        )
+        return reply
 
 
 def make_sim_robot(

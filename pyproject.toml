@@ -28,7 +28,11 @@ wandb = ["wandb>=0.16"]
 # Client side of the simulation bridge. The simulator itself runs in a separate
 # interpreter (see README_sim.md) and is deliberately not declared here.
 sim = ["pyzmq>=25"]
-dev = ["evo-rlt[lerobot,test,wandb,sim]", "ruff>=0.6"]
+# SmolVLA 的额外依赖。lerobot 的 `pi` extra 不含这两个,但 SmolVLA 的
+# processor 在加载 tokenizer 时硬性要求 num2words,缺了会在训练启动时报
+# ImportError 而不是在安装期。
+smolvla = ["num2words>=0.5.14,<0.6.0", "accelerate>=1.7.0,<2.0.0"]
+dev = ["evo-rlt[lerobot,test,wandb,sim,smolvla]", "ruff>=0.6"]
 
 [project.scripts]
 evo-rlt-build-transition-cache = "evo_rlt.cli.build_transition_cache:main"
@@ -43,6 +47,10 @@ evo-rlt-collect-default = "evo_rlt.adapters.lerobot.record.cli:collect_default_m
 evo-rlt-record = "evo_rlt.adapters.lerobot.record.cli:main"
 evo-rlt-online-train = "evo_rlt.adapters.lerobot.record.online_cli:main"
 evo-rlt-prune-online-state = "evo_rlt.adapters.lerobot.record.prune_state_cli:main"
+evo-rlt-act = "evo_rlt.cli.act:main"
+evo-rlt-smolvla = "evo_rlt.cli.smolvla:main"
+evo-rlt-sim-snapshot = "evo_rlt.cli.sim_snapshot:main"
+evo-rlt-sim-augment = "evo_rlt.cli.augment:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

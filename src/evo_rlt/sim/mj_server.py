@@ -38,6 +38,8 @@ from pathlib import Path
 
 import numpy as np
 
+from collections.abc import Sequence
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from protocol import (  # noqa: E402
@@ -47,8 +49,13 @@ from protocol import (  # noqa: E402
     DEFAULT_IMAGE_HEIGHT,
     DEFAULT_IMAGE_WIDTH,
     DEFAULT_ACTION_DELAY_STEPS,
+    DEFAULT_IK_DAMPING,
+    DEFAULT_IK_ITERS,
+    DEFAULT_IK_ROTATION_WEIGHT,
     DEFAULT_PHYSICS_HZ,
+    EE_BODIES,
     JOINT_ORDER,
+    POSE_LEN,
     PROTOCOL_VERSION,
     Command,
     Status,
@@ -249,7 +256,9 @@ class SimulatorState:
                 names.append(name[: -len("_free")])
         return names
 
-    def reset_objects(self, names: list[str] | None = None) -> list[str]:
+    def reset_objects(
+        self, names: list[str] | None = None, poses: dict[str, list[float]] | None = None
+    ) -> list[str]:
         """把指定零件放回 home keyframe 里的位姿,手臂和其他零件都不动。
 
         采数据或调试时零件常被碰歪,而整体 reset 会把手臂一起弹回复位姿态 ——
@@ -257,16 +266,24 @@ class SimulatorState:
 
         位姿取自 keyframe(build 时按 configs/task_scene.json 写入),和整体
         reset 用的是同一份基准,不会出现两种"初始位置"。
+
+        ``poses`` 里点名的零件改为放到给定位姿(``[x,y,z,qw,qx,qy,qz]``,世界系),
+        并**跳过随机化**。演示增广要按算出来的位姿摆零件 —— 那个位姿是先解 IK
+        再反推出来的(见 ``evo_rlt.sim.augment``),用随机种子碰不出来。
         """
         if self.model.nkey == 0:
             raise RuntimeError("场景没有 home keyframe,无法复位零件;重建场景后再试")
 
         available = self.free_objects()
+        poses = dict(poses or {})
         if names is None:
             names = list(available)
-        unknown = [n for n in names if n not in available]
+        unknown = [n for n in list(names) + list(poses) if n not in available]
         if unknown:
-            raise ValueError(f"场景里没有零件 {unknown};可用的是 {available}")
+            raise ValueError(f"场景里没有零件 {sorted(set(unknown))};可用的是 {available}")
+        for name in poses:
+            if name not in names:
+                names.append(name)
 
         key = self.model.key_qpos[0]
         for name in names:
@@ -275,9 +292,20 @@ class SimulatorState:
             )
             adr = self.model.jnt_qposadr[jid]
             dadr = self.model.jnt_dofadr[jid]
-            self.data.qpos[adr : adr + 7] = key[adr : adr + 7]
             self.data.qvel[dadr : dadr + 6] = 0.0
-            self._randomize(name, adr)
+            explicit = poses.get(name)
+            if explicit is None:
+                self.data.qpos[adr : adr + 7] = key[adr : adr + 7]
+                self._randomize(name, adr)
+                continue
+            if len(explicit) != POSE_LEN:
+                raise ValueError(f"{name} 的位姿要 {POSE_LEN} 个数,给了 {len(explicit)}")
+            pose = np.asarray(explicit, dtype=float)
+            norm = float(np.linalg.norm(pose[3:]))
+            if norm < 1e-9:
+                raise ValueError(f"{name} 的四元数是零向量")
+            self.data.qpos[adr : adr + 3] = pose[:3]
+            self.data.qpos[adr + 3 : adr + 7] = pose[3:] / norm
         self._mujoco.mj_forward(self.model, self.data)
         return names
 
@@ -390,6 +418,167 @@ class SimulatorState:
     def joint_velocities(self) -> list[float]:
         return [float(v) for v in self.data.qvel[: self.model.nu]]
 
+    # -- 位姿读出与运动学 ---------------------------------------------------
+
+    def _body_pose(self, bid: int) -> list[float]:
+        return [*(float(v) for v in self.data.xpos[bid]), *(float(v) for v in self.data.xquat[bid])]
+
+    def object_poses(self) -> dict[str, list[float]]:
+        """每个任务零件在世界系的位姿。
+
+        零件坐标本来就在 ``data.qpos`` 里,只是从来没送到进程边界外面 —— 客户端
+        看得见关节角和相机,却看不见零件在哪。自动成功判据和演示增广都要它,
+        而且它必须和这一帧的图像来自同一次 ``mj_forward``,不能事后再问一遍。
+        """
+        return {
+            name: self._body_pose(
+                self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, name)
+            )
+            for name in self.free_objects()
+        }
+
+    def ee_poses(self) -> dict[str, list[float]]:
+        """两只夹爪的 ``gripper_link`` 位姿,世界系。"""
+        return {
+            side: self._body_pose(
+                self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_BODY, body)
+            )
+            for side, body in EE_BODIES.items()
+        }
+
+    def _arm_qpos_adr(self, side: str) -> "np.ndarray":
+        """某条臂 5 个本体关节的 qpos 下标(不含夹爪)。
+
+        夹爪排除在外:它不影响 ``gripper_link`` 的位姿,留在 IK 里只会给雅可比
+        添一列零,让阻尼最小二乘的条件数变差。
+
+        下标从 ``jnt_qposadr`` 查,不假设"关节顺序即 qpos 顺序" —— 场景是生成的,
+        真出现错位时这里会直接找不到关节而报错,而不是悄悄驱动隔壁那个关节。
+        """
+        adrs = []
+        for name in JOINT_ORDER:
+            if not name.startswith(f"{side}_") or name.endswith("_gripper"):
+                continue
+            jid = self._mujoco.mj_name2id(self.model, self._mujoco.mjtObj.mjOBJ_JOINT, name)
+            if jid < 0:
+                raise RuntimeError(f"场景里没有关节 {name}")
+            adrs.append(int(self.model.jnt_qposadr[jid]))
+        return np.array(adrs, dtype=int)
+
+    def fk(self, qpos_batch: list[list[float]]) -> list[dict[str, list[float]]]:
+        """一批 12 维关节角 -> 每帧两只夹爪的位姿。
+
+        用一份独立的 ``MjData``,绝不碰 ``self.data`` —— 采集途中客户端问 FK 不该
+        让正在跑的那条 episode 的状态动一下。
+        """
+        mujoco = self._mujoco
+        bids = {
+            side: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body)
+            for side, body in EE_BODIES.items()
+        }
+        scratch = mujoco.MjData(self.model)
+        out = []
+        for qpos in qpos_batch:
+            if len(qpos) != self.model.nu:
+                raise ValueError(f"fk expects {self.model.nu} joint angles, got {len(qpos)}")
+            scratch.qpos[: self.model.nu] = qpos
+            # 只求运动学。mj_forward 会连碰撞一起算,而这个场景光凸包就有 280
+            # 多块 —— 一条 700 帧的轨迹要解上万次,那部分开销是纯浪费。
+            mujoco.mj_kinematics(self.model, scratch)
+            out.append(
+                {
+                    side: [
+                        *(float(v) for v in scratch.xpos[bid]),
+                        *(float(v) for v in scratch.xquat[bid]),
+                    ]
+                    for side, bid in bids.items()
+                }
+            )
+        return out
+
+    def ik(
+        self,
+        side: str,
+        targets: list[list[float]],
+        seed: list[float],
+        rotation_weight: float | Sequence[float] = DEFAULT_IK_ROTATION_WEIGHT,
+        iters: int = DEFAULT_IK_ITERS,
+        damping: float = DEFAULT_IK_DAMPING,
+    ) -> dict[str, list]:
+        """阻尼最小二乘 IK,一次解一整条轨迹。
+
+        **SO-101 只有 5 个本体关节,够不到任意 6D 位姿。** 求解器因此是加权的:
+        位置权重 1,姿态误差按世界坐标轴分别乘 ``rotation_weight``(标量则三轴
+        同权)。默认 ``(1, 1, 0.02)`` —— 位置 3 维加倾角 2 维正好等于自由度数,
+        只放开绕世界 z 的偏航,那正是实测缺的那一维。偏航残差随 ``rot_err``
+        回给调用者(增广那边把零件的朝向按它反算回去,见 augment.py)。
+
+        逐点用上一帧的解做种子:轨迹是连续的,这样既快又不会在相邻两帧跳到
+        不同的 IK 分支上 —— 跳支在关节空间是一个大台阶,replay 时会甩臂。
+        """
+        if side not in EE_BODIES:
+            raise ValueError(f"unknown arm side {side!r}, expected one of {sorted(EE_BODIES)}")
+        if len(seed) != self.model.nu:
+            raise ValueError(f"ik seed expects {self.model.nu} joint angles, got {len(seed)}")
+        mujoco = self._mujoco
+        dofs = self._arm_qpos_adr(side)
+        bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, EE_BODIES[side])
+
+        scratch = mujoco.MjData(self.model)
+        mujoco.mj_resetDataKeyframe(self.model, scratch, 0)
+        scratch.qpos[: self.model.nu] = seed
+        # mj_jacBody 要的是 xpos/xquat 和 cdof,mj_kinematics + mj_comPos 就够;
+        # 走 mj_forward 会白算这个场景 280 多块凸包的碰撞,IK 的迭代次数一乘
+        # 就是几个数量级的差别。
+        q = np.array(seed, dtype=float)[dofs]
+        lo = np.array([self.model.jnt_range[j][0] for j in dofs])
+        hi = np.array([self.model.jnt_range[j][1] for j in dofs])
+
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+        rot_w = np.broadcast_to(np.asarray(rotation_weight, dtype=float), (3,))
+        weights = np.diag([1.0, 1.0, 1.0, *rot_w])
+        qc = np.zeros(4)
+        qe = np.zeros(4)
+        rot_err_vec = np.zeros(3)
+
+        solutions: list[list[float]] = []
+        pos_errs: list[float] = []
+        rot_errs: list[float] = []
+        for target in targets:
+            if len(target) != POSE_LEN:
+                raise ValueError(f"ik target expects {POSE_LEN} numbers, got {len(target)}")
+            tp = np.asarray(target[:3], dtype=float)
+            tq = np.asarray(target[3:], dtype=float)
+            tq = tq / max(float(np.linalg.norm(tq)), 1e-12)
+            pos_err = rot_err = float("inf")
+            for _ in range(iters):
+                scratch.qpos[dofs] = q
+                mujoco.mj_kinematics(self.model, scratch)
+                mujoco.mj_comPos(self.model, scratch)
+                e_pos = tp - scratch.xpos[bid]
+                mujoco.mju_negQuat(qc, scratch.xquat[bid])
+                mujoco.mju_mulQuat(qe, tq, qc)
+                mujoco.mju_quat2Vel(rot_err_vec, qe, 1.0)
+                pos_err = float(np.linalg.norm(e_pos))
+                rot_err = float(np.linalg.norm(rot_err_vec))
+                if pos_err < 5e-5 and rot_err < 1e-3:
+                    break
+                err = weights @ np.concatenate([e_pos, rot_err_vec])
+                mujoco.mj_jacBody(self.model, scratch, jacp, jacr, bid)
+                jac = weights @ np.vstack([jacp[:, dofs], jacr[:, dofs]])
+                step = np.linalg.solve(
+                    jac.T @ jac + damping * np.eye(len(dofs)), jac.T @ err
+                )
+                norm = float(np.linalg.norm(step))
+                if norm > 0.05:  # 限步,避免near-singular 时一步甩到限位上
+                    step *= 0.05 / norm
+                q = np.clip(q + step, lo, hi)
+            solutions.append([float(v) for v in q])
+            pos_errs.append(pos_err)
+            rot_errs.append(rot_err)
+        return {"qpos": solutions, "pos_err": pos_errs, "rot_err": rot_errs, "qpos_adr": dofs.tolist()}
+
     def render_all(self) -> list[bytes]:
         frames = []
         for key in self.camera_keys:
@@ -451,14 +640,24 @@ class SimServer:
             "control_hz": self.control_hz,
             "nq": int(self.sim.model.nq),
             "free_objects": self.sim.free_objects(),
+            "ee_bodies": dict(EE_BODIES),
         }
 
     def _observation(self) -> tuple[dict, list[bytes]]:
+        """一帧观测。
+
+        零件和夹爪位姿跟着每一帧一起回,不另开一条命令:成功判据要判的是"这一
+        帧"的状态,分两次问会拿到两个不同时刻的场景(中间可能已经 step 过),
+        而这种错位在数据里表现为偶发的误判,极难查。JSON 只多 ~30 个浮点数,
+        相对同一条消息里 2.7 MB 的图像可以忽略。
+        """
         return (
             {
                 "status": Status.OK,
                 "joint_positions": self.sim.joint_positions(),
                 "joint_velocities": self.sim.joint_velocities(),
+                "object_poses": self.sim.object_poses(),
+                "ee_poses": self.sim.ee_poses(),
                 "sim_time": float(self.sim.data.time),
                 "steps": self.steps,
             },
@@ -512,10 +711,26 @@ class SimServer:
 
         if command == Command.RESET_OBJECTS:
             # 不清 self.steps:手臂没动,回合还是同一个
-            done = self.sim.reset_objects(request.get("objects"))
+            done = self.sim.reset_objects(request.get("objects"), request.get("poses"))
             reply, frames = self._observation()
             reply["objects_reset"] = done
             return reply, frames
+
+        if command == Command.FK:
+            return {"status": Status.OK, "ee_poses": self.sim.fk(request["qpos"])}, []
+
+        if command == Command.IK:
+            solved = self.sim.ik(
+                request["side"],
+                request["targets"],
+                request["seed"],
+                rotation_weight=request.get(
+                    "rotation_weight", DEFAULT_IK_ROTATION_WEIGHT
+                ),
+                iters=int(request.get("iters", DEFAULT_IK_ITERS)),
+                damping=float(request.get("damping", DEFAULT_IK_DAMPING)),
+            )
+            return {"status": Status.OK, **solved}, []
 
         if command == Command.CLOSE:
             return {"status": Status.OK, "closing": True}, []

@@ -231,6 +231,7 @@ def _ensure_record_events(events: dict[str, Any]) -> None:
         "end_phase_success",
         "end_phase_failure",
         "mark_rl_milestone",
+        "reset_objects",
     ]:
         events.setdefault(event_name, False)
 
@@ -262,6 +263,8 @@ def _patch_record_keyboard_listener() -> None:
             # 冻结右臂(单人采双臂数据用)。和 critical_phase_toggle_key 默认
             # 同为 p —— 只在 rlt.enable 时才都激活,backend 的 __post_init__ 会拦。
             kwargs.pop("arm_freeze_key", None): "toggle_arm_freeze",
+            # 零件复位:rollout 没有主臂时唯一能摆正零件的手段。
+            kwargs.pop("reset_objects_key", None): "reset_objects",
         }
         keyboard_listener, events = original_init_keyboard_listener(*args, **kwargs)
         _ensure_record_events(events)
@@ -331,6 +334,7 @@ def _patch_episode_outcome_listener(
         end_success_key = kwargs.pop("end_success_key", None)
         end_failure_key = kwargs.pop("end_failure_key", None)
         milestone_key = kwargs.pop("milestone_key", None)
+        reset_objects_key = kwargs.pop("reset_objects_key", None)
         keyboard_listener, events = original_init_keyboard_listener()
         _ensure_record_events(events)
         router = _EpisodeOutcomeRouter(events, outcome_key, failure_key=failure_key)
@@ -346,6 +350,7 @@ def _patch_episode_outcome_listener(
             end_success_key: "end_phase_success",
             end_failure_key: "end_phase_failure",
             milestone_key: "mark_rl_milestone",
+            reset_objects_key: "reset_objects",
         }
         pedal_listener = _start_record_event_pedal_listener(events, record_key_bindings, router)
         extra_keyboard_listener = _start_episode_outcome_key_listener(outcome_key, router, failure_key=failure_key)
@@ -492,6 +497,28 @@ def _validate_distinct_keys(**keys: str | None) -> None:
         if normalized in seen:
             raise ValueError(f"{label} conflicts with {seen[normalized]} on key {normalized!r}")
         seen[normalized] = label
+
+
+def _parse_rename_map(raw: str | None) -> dict[str, str] | None:
+    """Parse --rename-map. Rejects anything that is not a flat str->str dict.
+
+    A silently ignored or half-parsed map is the worst failure here: training
+    and rollout would disagree about which camera feeds which policy input,
+    and the only symptom is a policy that acts as if it never learned.
+    """
+    if not raw:
+        return None
+    import json
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--rename-map is not valid JSON: {raw!r}") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+    ):
+        raise ValueError(f"--rename-map must be a JSON object of string->string, got {raw!r}")
+    return parsed
 
 
 def _collect_external_episode_outcome_key(args: argparse.Namespace) -> str | None:
@@ -892,6 +919,7 @@ def run_full(args: argparse.Namespace) -> None:
                 episode_time_s=args.episode_time_s,
                 fps=args.fps,
                 vcodec=args.vcodec,
+                rename_map=_parse_rename_map(getattr(args, "rename_map", None)),
             ),
             *build_reset_time_argv(args),
             *build_rtc_argv(

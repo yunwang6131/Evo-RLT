@@ -547,8 +547,18 @@ def build_dataset_argv(
     episode_time_s: int,
     fps: int,
     vcodec: str,
+    rename_map: dict[str, str] | None = None,
 ) -> list[str]:
-    return [
+    """Build the ``--dataset.*`` overrides for a record run.
+
+    ``rename_map`` renames observation keys before they reach the policy. It
+    exists for policies whose pretrained config fixes the camera names --
+    SmolVLA's base expects ``observation.images.camera{1,2,3}`` while this rig
+    records ``left_wrist``/``right_wrist``/``right_front``. The map used at
+    rollout **must** be the one used at training, or each camera feeds the
+    wrong input slot and the policy behaves like it was never trained.
+    """
+    argv = [
         f"--dataset.repo_id={dataset_name}",
         f"--dataset.root={dataset_root}",
         f"--dataset.single_task={task}",
@@ -560,6 +570,11 @@ def build_dataset_argv(
         f"--dataset.video_encoding_batch_size={num_episodes + 1}",
         "--dataset.streaming_encoding=true",
     ]
+    if rename_map:
+        import json as _json
+
+        argv.append(f"--dataset.rename_map={_json.dumps(rename_map, separators=(',', ':'))}")
+    return argv
 
 
 def build_policy_overrides(

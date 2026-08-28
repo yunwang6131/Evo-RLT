@@ -463,6 +463,11 @@ class RecordConfig:
     # 代价见 common.ArmFreeze:这样采的数据里没有"两臂同时微调"的样本。
     # 空字符串关闭。
     arm_freeze_key: str = "p"
+    # 把任务零件放回初始位姿,手臂不动 —— 遥操里 `b` 的位置。rollout 时没有
+    # 主臂,零件被策略碰歪了人手上就没有别的手段摆回去;整体 reset 会把手臂
+    # 一起弹回复位姿态,正在跑的 episode 就断了,所以走 reset_objects。
+    # 空字符串关闭。
+    reset_objects_key: str = "b"
     # Pure-teleop mode: r key starts an episode (entering critical phase),
     # second r press ends the episode and marks it success; u marks it as
     # failure. No VLA,
@@ -617,6 +622,30 @@ class RecordConfig:
                     "RLT phase keys must not collide with intervention or episode outcome keys."
                 )
 
+        if self.reset_objects_key:
+            if len(self.reset_objects_key) != 1:
+                raise ValueError("`reset_objects_key` must be a single character.")
+            taken = {
+                self.intervention_toggle_key.lower(),
+                self.left_intervention_key.lower(),
+                self.right_intervention_key.lower(),
+            }
+            if self.arm_freeze_key:
+                taken.add(self.arm_freeze_key.lower())
+            if self.enable_episode_outcome_labeling:
+                taken |= {self.episode_success_key.lower(), self.episode_failure_key.lower()}
+            if self.rlt.enable:
+                taken |= {
+                    self.rlt.critical_phase_toggle_key.lower(),
+                    self.rlt.rl_phase_key.lower(),
+                    self.rlt.rl_phase_failure_key.lower(),
+                    self.rlt.milestone_key.lower(),
+                }
+            if self.reset_objects_key.lower() in taken:
+                raise ValueError(
+                    "`reset_objects_key` collides with another record key binding."
+                )
+
         if self.default_episode_success is not None:
             self.default_episode_success = normalize_episode_success_label(self.default_episode_success)
 
@@ -765,6 +794,69 @@ def _write_schema_metadata(
         }
     dataset.meta.info["recording_schema_version"] = 2
     write_info(dataset.meta.info, dataset.root)
+
+
+def _maybe_wrap_with_rtc(policy, cfg):
+    """Give RTC to a chunk policy that cannot reach it through select_action().
+
+    ChunkACPolicy has its own asynchronous RTC runtime and configures itself in
+    _configure_rlt_record_policy() -- leave it alone. SmolVLA (and any other
+    flow/diffusion policy with an rtc_config) implements RTC inside its denoiser
+    but refuses it in select_action(), so it needs the queue driven from
+    outside. Policies with nothing to inpaint, ACT among them, pass through.
+    """
+    if policy is None or not cfg.rlt.rtc_enabled:
+        return policy
+
+    from evo_rlt.adapters.lerobot.policies.modeling_rlt_ac import ChunkACPolicy
+
+    if isinstance(policy, ChunkACPolicy):
+        return policy
+
+    from evo_rlt.adapters.lerobot.policies.rtc_chunk_runtime import (
+        SyncRTCPolicy,
+        policy_supports_rtc,
+    )
+
+    if not policy_supports_rtc(policy):
+        logging.info(
+            "RTC requested but %s does not support chunk-level RTC; running without it.",
+            type(policy).__name__,
+        )
+        return policy
+
+    from lerobot.configs.types import RTCAttentionSchedule
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+
+    # The horizon RTC weights the prefix over is the stretch that actually gets
+    # executed before the next chunk lands, which for a single-policy rollout is
+    # exactly n_action_steps -- read off the policy rather than taken from
+    # cfg.rlt, whose rtc/vla horizons describe the two-policy rlt_ac setup and
+    # default to a value sized for pi0.5's chunk length.
+    n_action_steps = int(policy.config.n_action_steps)
+    horizon = n_action_steps
+    rtc_config = RTCConfig(
+        enabled=True,
+        execution_horizon=horizon,
+        max_guidance_weight=cfg.rlt.rtc_max_guidance_weight,
+        prefix_attention_schedule=RTCAttentionSchedule(cfg.rlt.rtc_prefix_attention_schedule),
+    )
+    wrapped = SyncRTCPolicy(
+        policy,
+        rtc_config,
+        n_action_steps=n_action_steps,
+        refill_threshold=cfg.rlt.rtc_action_queue_size_to_get_new_actions,
+    )
+    logging.info(
+        "%s RTC enabled: chunk_size=%d replan_every=%d horizon=%d guidance=%.3f schedule=%s",
+        type(policy).__name__,
+        policy.config.chunk_size,
+        n_action_steps,
+        horizon,
+        cfg.rlt.rtc_max_guidance_weight,
+        cfg.rlt.rtc_prefix_attention_schedule,
+    )
+    return wrapped
 
 
 def _configure_rlt_record_policy(policy, cfg: RecordConfig) -> None:
@@ -965,8 +1057,22 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             include_rlt_episode_metadata=cfg.rlt.enable,
         )
 
-        # Load pretrained policy
-        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
+        # Load pretrained policy.
+        #
+        # rename_map must be passed here, not only to the preprocessor below.
+        # make_policy() runs validate_visual_features_consistency() against the
+        # dataset's *original* camera keys, which is exactly what a renaming
+        # policy (SmolVLA: camera1/2/3) does not have -- it aborts with
+        # "Feature mismatch" before the rollout ever starts. A non-empty
+        # rename_map skips that check; the actual renaming still happens in the
+        # preprocessor's rename_observations_processor. An empty map (ACT and
+        # every non-renaming policy) is falsy, so the check runs as before.
+        policy = (
+            None
+            if cfg.policy is None
+            else make_policy(cfg.policy, ds_meta=dataset.meta, rename_map=cfg.dataset.rename_map)
+        )
+        policy = _maybe_wrap_with_rtc(policy, cfg)
         _configure_rlt_record_policy(policy, cfg)
 
         online_collector = None
@@ -1099,6 +1205,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             cp_success_key="s" if cfg.enable_critical_phase_labeling and not rlt_active else None,
             cp_failure_key="f" if cfg.enable_critical_phase_labeling and not rlt_active else None,
             arm_freeze_key=cfg.arm_freeze_key or None,
+            reset_objects_key=cfg.reset_objects_key or None,
             rl_phase_key=rl_phase_key_binding,
             rl_phase_failure_key=rl_phase_failure_key_binding,
             end_success_key=cfg.rlt.end_success_key if rlt_active else None,
@@ -1191,6 +1298,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 policy=policy,
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
+                # The preprocessor renames observations before the policy sees
+                # them; record_loop needs the same map to validate features
+                # against the names the policy actually receives.
+                rename_map=cfg.dataset.rename_map,
                 dataset=dataset,
                 control_time_s=cfg.dataset.episode_time_s,
                 single_task=cfg.dataset.single_task,
@@ -1309,6 +1420,24 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             # 其他机器人:仿真要用的是下面的 reset_objects(只动零件)。
             if robot.name == "unitree_g1":
                 robot.reset()
+            # 没有主臂时(policy rollout / eval)手臂也要复位。上面那条"任何时候
+            # 都不复位手臂"的规则是**为遥操立的**:手里的主臂不会跟着弹回去,
+            # 一松手从臂就窜。没接主臂就没有这个问题,而不复位的代价是实打实的
+            # —— 策略上一条把手臂开到哪儿完全不受控(插失败时常卡在桌面里或
+            # 夹着空气),下一条就从那儿起步。那种位姿训练集里根本没有,而且每
+            # 条 rollout 的起点都不同,10 条之间的成功率就没法比。
+            #
+            # 用整体 reset 而不是逐关节 ramp:reset 走 home keyframe,手臂和零件
+            # 同时归位,不会出现"手臂弹回时还夹着零件"的穿透;它还会清空指令
+            # 延迟队列,否则上一条残留的 3 帧指令会在新回合开头下发。
+            # 复位后紧接着下面的 reset_objects 重新随机零件位姿 —— 顺序不能反,
+            # reset 用的是 keyframe 里的固定位姿,不带随机化。
+            elif teleop is None and callable(getattr(robot, "reset", None)):
+                try:
+                    robot.reset()
+                    logging.info("Arms reset to home pose (no teleop attached).")
+                except Exception:
+                    logging.exception("Arm reset failed; next episode starts where this one ended.")
             # 仿真:把零件摆回去(螺套在凹槽里重新随机),等同遥操里按 b。
             # **只动零件,手臂不碰** —— 整体 reset 会把手臂弹回复位姿态,而
             # 操作者手里的主臂不会跟着动,一松手从臂就窜回去。
@@ -1438,6 +1567,20 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             # --dataset.num_episodes is then a total target inclusive of the
             # resumed count, not "N more episodes".
             recorded_episodes = online_rl_resume_episodes if online_rl_resume_episodes is not None else 0
+            # 第一条 episode 也要从 home 起步。两条之间的复位在
+            # _run_reset_loop_if_needed 里,但 episode 0 之前没有那个窗口 ——
+            # 仿真器是长开的进程,上一轮 rollout(或崩掉的那次)把手臂停在
+            # 哪儿,这一轮第一条就从哪儿开始,而那正是最容易被当成"策略不会做"
+            # 的假象。同样只在没有主臂时做。
+            if teleop is None and callable(getattr(robot, "reset", None)):
+                try:
+                    robot.reset()
+                    reset_objects_fn = getattr(robot, "reset_objects", None)
+                    if callable(reset_objects_fn):
+                        reset_objects_fn()
+                    logging.info("Arms and objects reset to home before the first episode.")
+                except Exception:
+                    logging.exception("Initial reset failed; episode 0 starts from the current pose.")
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 events["episode_outcome"] = None
                 log_say(f"Recording episode {dataset.num_episodes}", cfg.play_sounds)

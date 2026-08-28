@@ -233,3 +233,49 @@ def test_scene_gains_match_the_fitted_values():
     cfg = SceneConfig()
     assert cfg.control_kp == 50.0
     assert cfg.control_dampratio == 1.0
+
+
+# -- v2:零件位姿与运动学 ---------------------------------------------------
+
+
+def test_protocol_version_is_two():
+    """v2 起 observation 带零件/夹爪位姿,并新增 FK / IK 两条命令。
+
+    版本号必须跟着涨:旧仿真器不回 ``object_poses``,自动成功判据会静默地拿到
+    空字典 —— 那是"每条 episode 都判失败",而不是一个错误。
+    """
+    assert protocol.PROTOCOL_VERSION == 2
+
+
+def test_pose_layout_matches_mujoco_free_joints():
+    """位姿用 ``[x,y,z,qw,qx,qy,qz]``,和 MuJoCo 自由关节的 qpos 排布一致。"""
+    assert protocol.POSE_LEN == 7
+
+
+def test_ee_bodies_cover_both_arms_and_name_real_links():
+    assert set(protocol.EE_BODIES) == set(protocol.ARM_SIDES)
+    for side, body in protocol.EE_BODIES.items():
+        assert body == f"{side}_gripper_link"
+
+
+def test_kinematics_commands_exist_and_are_distinct():
+    names = [
+        protocol.Command.HANDSHAKE, protocol.Command.OBSERVE, protocol.Command.STEP,
+        protocol.Command.RESET, protocol.Command.RESET_OBJECTS,
+        protocol.Command.FK, protocol.Command.IK, protocol.Command.CLOSE,
+    ]
+    assert len(set(names)) == len(names)
+
+
+def test_ik_rotation_weight_frees_only_the_vertical_yaw():
+    """位置 3 维 + 倾角 2 维 = 5,正好是 SO-101 的自由度数,只放开绕世界 z 的偏航。
+
+    三个分量都给大(各向同性 1.0)的话,求解器会拿位置去换姿态 —— 实测一个 25mm
+    的平移目标解出来位置就差 25mm。三个都给小(各向同性 0.02)则手腕的倾角自己
+    漂:同样的平移下倾角误差 0.46~2.11 度,而插销任务最后失败的主因正是螺栓和
+    螺套的轴线对不上。分轴之后倾角误差是 0.00 度,位置仍在 0.16mm 以内。
+    """
+    weight = protocol.DEFAULT_IK_ROTATION_WEIGHT
+    assert len(weight) == 3
+    assert weight[0] == weight[1] >= 1.0, "倾角必须严格跟随"
+    assert weight[2] <= 0.05, "绕竖直轴的偏航必须放开,那是这条臂做不到的一维"

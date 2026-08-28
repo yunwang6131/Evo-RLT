@@ -23,6 +23,16 @@ def add_common_record_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--setup-json", default=None)
     parser.add_argument("--dataset-tag", default=None)
     parser.add_argument("--vcodec", default="h264")
+    parser.add_argument(
+        "--rename-map",
+        default=None,
+        help=(
+            "JSON dict renaming observation keys before the policy sees them, e.g. "
+            '\'{"observation.images.right_front": "observation.images.camera1"}\'. '
+            "Required for policies whose pretrained config fixes the camera names "
+            "(SmolVLA); must match the map used at training time."
+        ),
+    )
     parser.add_argument("--no-teleop", action="store_true", default=False)
     parser.add_argument("--default-episode-success", choices=["success", "failure"], default=None)
     parser.add_argument(

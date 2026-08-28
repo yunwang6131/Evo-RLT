@@ -184,7 +184,9 @@ def _blend_robot_actions(
 
 
 def _validate_policy_image_features(
-    policy: PreTrainedPolicy, dataset_features: dict[str, dict]
+    policy: PreTrainedPolicy,
+    dataset_features: dict[str, dict],
+    rename_map: dict[str, str] | None = None,
 ) -> None:
     """Check that dataset features include all image features the policy expects.
 
@@ -192,6 +194,12 @@ def _validate_policy_image_features(
     `--dataset.video=false` which silently drops all image features from the
     dataset due to an upstream lerobot limitation in
     `aggregate_pipeline_dataset_features`.
+
+    `rename_map` is the same map the preprocessor's rename_observations_processor
+    applies, so compare against the names the policy will actually be handed.
+    Without it a renaming policy (SmolVLA expects camera1/2/3 while this rig
+    records left_wrist/right_wrist/right_front) fails this check on every
+    camera even though the rename would have made them match.
     """
     policy_image_keys = [
         k for k, ft in policy.config.input_features.items()
@@ -200,8 +208,9 @@ def _validate_policy_image_features(
     if not policy_image_keys:
         return
 
+    rename_map = rename_map or {}
     ds_image_keys = [
-        k for k, ft in dataset_features.items()
+        rename_map.get(k, k) for k, ft in dataset_features.items()
         if ft.get("dtype") in ("image", "video")
     ]
     missing = [k for k in policy_image_keys if k not in ds_image_keys]
@@ -245,6 +254,9 @@ def record_loop(
     policy: PreTrainedPolicy | None = None,
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
+    #: 送进 policy 前重命名观测键的映射,和 preprocessor 里那份是同一个。
+    #: 只用来做特征校验 —— 真正的改名由 preprocessor 完成。
+    rename_map: dict[str, str] | None = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
@@ -305,7 +317,7 @@ def record_loop(
 
     # Early check: verify dataset features include all image features the policy expects.
     if policy is not None and dataset is not None:
-        _validate_policy_image_features(policy, dataset.features)
+        _validate_policy_image_features(policy, dataset.features, rename_map)
 
     action_feature_names = dataset.features[ACTION]["names"] if dataset is not None else None
     if action_feature_names is None:
@@ -459,6 +471,7 @@ def record_loop(
 
     timestamp = 0
     start_episode_t = time.perf_counter()
+    _policyless_notice_logged = False
     prev_phase = PHASE_PREFIX
     rl_phase_started = False
     final_outcome: str | None = None
@@ -585,6 +598,34 @@ def record_loop(
             _start_intervention("right")
         else:
             logging.info("Right intervention key ignored while an intervention is already active; use Space to release.")
+
+    def _handle_reset_objects_event() -> None:
+        """按键把任务零件放回初始位姿,手臂原地不动。
+
+        rollout 时不接主臂,零件被策略推歪、掀翻之后人手上没有任何别的手段
+        摆正它 —— 这个键补的就是遥操里 `b` 的位置。
+
+        用 reset_objects 而不是 reset:后者会把手臂一起弹回复位姿态,正在跑
+        的 episode 当场就断了。零件瞬移回初始位姿,手臂的指令继续生效。
+
+        故意放在取观测之前、且在"没有 policy 也没有 teleop 就 continue"那个
+        分支之前 —— 两段 episode 之间的 reset 窗口正是最需要它的时候,而那个
+        窗口里循环每一帧都会走到 continue。
+        """
+        if not events.get("reset_objects", False):
+            return
+        events["reset_objects"] = False
+        reset_objects = getattr(robot, "reset_objects", None)
+        if not callable(reset_objects):
+            logging.info("%s 没有 reset_objects,复位键忽略", type(robot).__name__)
+            return
+        try:
+            done = reset_objects()
+        except Exception as exc:
+            # 仿真器没响应不该把录制打断:这个键是辅助手段,不是关键路径。
+            logging.warning("零件复位失败: %s", exc)
+            return
+        logging.info("零件复位: %s", ", ".join(done) if done else "(没有零件被移动)")
 
     def _handle_critical_phase_events() -> None:
         if events.get("toggle_critical_phase", False):
@@ -866,6 +907,7 @@ def record_loop(
         _handle_rl_milestone_event()
         _handle_end_phase_event("end_phase_success", EPISODE_SUCCESS)
         _handle_end_phase_event("end_phase_failure", EPISODE_FAILURE)
+        _handle_reset_objects_event()
 
         # Get robot observation
         _t0 = time.perf_counter()
@@ -918,11 +960,22 @@ def record_loop(
             act_processed_teleop = teleop_action_processor((act, obs))
 
         if act_processed_policy is None and act_processed_teleop is None:
-            logging.info(
-                "No policy or teleoperator provided, skipping action generation."
-                "This is likely to happen when resetting the environment without a teleop device."
-                "The robot won't be at its rest position at the start of the next episode."
-            )
+            # 两段 episode 之间的复位窗口:没有 policy 也没有 teleop,没有动作可
+            # 下发。但**必须在 continue 之前推进 timestamp 并按 fps 休眠** ——
+            # 循环条件是 `while timestamp < control_time_s`,而 timestamp 只在
+            # 循环体末尾更新,continue 会把那一行跳过。少了这两行,复位窗口就
+            # 永远退不出去:日志以几百 Hz 刷屏,而 --reset-time-s 形同虚设,只有
+            # 按键置 exit_early 才能脱身。
+            if not _policyless_notice_logged:
+                logging.info(
+                    "No policy or teleoperator provided, skipping action generation. "
+                    "This is the reset window between episodes; it ends after "
+                    "reset_time_s (%.1fs).",
+                    control_time_s,
+                )
+                _policyless_notice_logged = True
+            precise_sleep(max(1 / fps - (time.perf_counter() - start_loop_t), 0.0))
+            timestamp = time.perf_counter() - start_episode_t
             continue
 
         # 冻结右臂:单人采双臂数据时,一只手当夹具腾出另一只手(按 p 切换)。

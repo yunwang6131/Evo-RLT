@@ -1,0 +1,23 @@
+{
+  "dataset": {
+    "repo_id": "local/blue_screw_sim_v1",
+    "root": "data/bimanual/blue_screw_sim_v1"
+  },
+  "policy": {
+    "type": "act",
+    "device": "cuda",
+    "push_to_hub": false,
+    "chunk_size": 100,
+    "n_action_steps": 10
+  },
+  "output_dir": "outputs/act_blue_screw_sim_v1",
+  "job_name": "act_blue_screw_sim_v1",
+  "batch_size": 8,
+  "steps": 60000,
+  "save_freq": 10000,
+  "log_freq": 100,
+  "num_workers": 4,
+  "wandb": {
+    "enable": false
+  }
+}
